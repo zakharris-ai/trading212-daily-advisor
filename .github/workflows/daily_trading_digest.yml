@@ -1,0 +1,98 @@
+name: Daily Trading Intelligence Digest
+
+on:
+  schedule:
+    # BST Window (09:00 - 10:00 BST = 08:00 - 09:00 UTC)
+    # Multi-tick 15-minute retry intervals to eliminate GitHub runner queue delays:
+    - cron: '5 8 * * *'    # 09:05 BST (Primary target)
+    - cron: '20 8 * * *'   # 09:20 BST (Fallback 1)
+    - cron: '35 8 * * *'   # 09:35 BST (Fallback 2)
+    - cron: '50 8 * * *'   # 09:50 BST (Fallback 3)
+    # GMT Window (09:00 - 10:00 GMT = 09:00 - 10:00 UTC)
+    - cron: '5 9 * * *'    # 09:05 GMT (Winter primary target)
+    - cron: '20 9 * * *'   # 09:20 GMT (Winter fallback 1)
+    - cron: '35 9 * * *'   # 09:35 GMT (Winter fallback 2)
+    - cron: '50 9 * * *'   # 09:50 GMT (Winter fallback 3)
+    # Late morning safety catch-all
+    - cron: '5 10 * * *'   # 11:05 BST / 10:05 GMT catch-all
+  workflow_dispatch: # Allows manual one-click execution from GitHub UI
+
+jobs:
+  run-digest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Timezone & Deduplication Gatekeeper (Ensure 09:00 London Time, exactly 1 run daily)
+        id: time_gate
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual execution: bypassing time gatekeeper."
+            echo "proceed=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          LONDON_HOUR=$(python -c 'from datetime import datetime; import zoneinfo; print(datetime.now(zoneinfo.ZoneInfo("Europe/London")).hour)')
+          echo "Current Europe/London hour: $LONDON_HOUR"
+
+          if [ "$LONDON_HOUR" -lt 9 ]; then
+            echo "Too early for morning run (London hour $LONDON_HOUR < 9). Skipping."
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          ALREADY_SENT=$(python -c "import json, os, datetime, zoneinfo; today = datetime.datetime.now(zoneinfo.ZoneInfo('Europe/London')).strftime('%Y-%m-%d'); d = json.load(open('data/last_email_sent.json')) if os.path.exists('data/last_email_sent.json') else {}; print('yes' if d.get('date') == today else 'no')")
+
+          if [ "$ALREADY_SENT" = "yes" ]; then
+            echo "Today digest has already been sent. Skipping duplicate run."
+            echo "proceed=false" >> $GITHUB_OUTPUT
+          else
+            echo "London hour $LONDON_HOUR >= 9 and no digest sent yet today. Proceeding with daily digest."
+            echo "proceed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Daily Portfolio Analysis & Dispatch Email
+        if: steps.time_gate.outputs.proceed == 'true'
+        env:
+          ACCOUNT_NAME: ${{ secrets.ACCOUNT_NAME }}
+          T212_KEY_ID: ${{ secrets.T212_KEY_ID }}
+          T212_SECRET: ${{ secrets.T212_SECRET }}
+          T212_ENV: ${{ secrets.T212_ENV }}
+          MIN_CASH_RESERVE_GBP: ${{ secrets.MIN_CASH_RESERVE_GBP }}
+          EXCLUDED_TICKERS: ${{ secrets.EXCLUDED_TICKERS }}
+          SECOND_ACCOUNT_NAME: ${{ secrets.SECOND_ACCOUNT_NAME }}
+          T212_KEY_ID_2: ${{ secrets.T212_KEY_ID_2 }}
+          T212_SECRET_2: ${{ secrets.T212_SECRET_2 }}
+          MIN_CASH_RESERVE_2: ${{ secrets.MIN_CASH_RESERVE_2 }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_EMAILS: ${{ secrets.ALERT_EMAILS }}
+        run: |
+          python main.py
+
+      - name: Commit updated snapshots, history, and dashboard
+        if: steps.time_gate.outputs.proceed == 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/ dashboard.html
+          git commit -m "chore: automated daily snapshot & dashboard update [skip ci]" || exit 0
+          git pull --rebase origin main
+          git push origin main

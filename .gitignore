@@ -1,0 +1,7 @@
+.env
+*.pyc
+__pycache__/
+latest_digest.html
+.venv/
+logs/
+# data/last_email_sent.json tracked for cloud deduplication

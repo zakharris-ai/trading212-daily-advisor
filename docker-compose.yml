@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  trading-engine:
+    build: .
+    container_name: trading212-notifier
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    command: python3 main.py --dry-run
