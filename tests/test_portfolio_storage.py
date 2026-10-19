@@ -4,8 +4,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Offline tests for portfolio_storage (trade detection, closed archive, read-only getters, deposit-adjusted
-# TWR, benchmark index, recommendation ledger) and scripts/cleanup_trade_log.py. Every test runs against a
-# temporary data directory (module paths are patched) and the VWRP.L benchmark fetch is mocked.
+# TWR, benchmark index, since-tracking-began summary vs VWRP, recommendation ledger) and
+# scripts/cleanup_trade_log.py. Every test runs against a temporary data directory (module paths are patched)
+# and the VWRP.L benchmark fetch is mocked.
 
 import contextlib  # noqa: E402
 import importlib.util  # noqa: E402
@@ -357,6 +358,134 @@ class PerformanceTrackingTests(_TempDataDirMixin, unittest.TestCase):
         )
         self.assertEqual(flows["by_account"], {"Main": 0.0})
 
+
+class TrackingPerformanceSummaryTests(unittest.TestCase):
+    """summarize_tracking_performance(): pure since-tracking-began portfolio vs VWRP comparison."""
+
+    NONE_FIELDS = ("portfolio_return_pct", "benchmark_return_pct", "difference_pp", "days")
+
+    def setUp(self):
+        super().setUp()
+        # Purity guard: the summary must never read files or fetch the benchmark itself.
+        for name in ("_load_json_file", "_fetch_benchmark_closes"):
+            patcher = mock.patch.object(ps, name, side_effect=AssertionError(f"{name} must not be called"))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _rec(day, twr, bench, **extra):
+        rec = {"date": day, "combined_total": 1000.0, "twr_index_total": twr, "benchmark_vwrp_index": bench}
+        rec.update(extra)
+        return rec
+
+    def _assert_unavailable(self, summary):
+        self.assertFalse(summary["available"])
+        for key in self.NONE_FIELDS:
+            self.assertIsNone(summary[key], key)
+
+    def test_no_usable_records(self):
+        for history in (None, [], "not a list", {"date": "2026-10-19"}, [self._rec("2026-10-19", 100.0, None)]):
+            summary = ps.summarize_tracking_performance(history)
+            self._assert_unavailable(summary)
+            self.assertIsNone(summary["start_date"])
+            self.assertIsNone(summary["end_date"])
+            self.assertEqual(summary["text"], "Performance tracking vs VWRP starts with the next daily snapshot.")
+
+    def test_single_usable_record_waits_for_the_second_snapshot(self):
+        history = [
+            {"date": "2026-10-18", "combined_total": 990.0},  # pre-tracking record: no indices
+            self._rec("2026-10-19", 100.0, 100.0),
+            self._rec("2026-10-20", 101.0, None),  # benchmark unavailable that day
+        ]
+        summary = ps.summarize_tracking_performance(history)
+        self._assert_unavailable(summary)
+        self.assertEqual((summary["start_date"], summary["end_date"]), ("2026-10-19", "2026-10-19"))
+        self.assertEqual(
+            summary["text"],
+            "Performance tracking vs VWRP started on 19 Oct 2026; the comparison appears after the second daily snapshot.",
+        )
+
+    def test_returns_are_latest_over_first(self):
+        history = [
+            self._rec("2026-10-19", 100.0, 100.0),
+            self._rec("2026-10-20", 101.5, 100.9),
+            self._rec("2026-10-23", 103.2, 102.1),
+        ]
+        summary = ps.summarize_tracking_performance(history)
+        self.assertTrue(summary["available"])
+        self.assertEqual((summary["start_date"], summary["end_date"]), ("2026-10-19", "2026-10-23"))
+        self.assertAlmostEqual(summary["portfolio_return_pct"], 3.2)
+        self.assertAlmostEqual(summary["benchmark_return_pct"], 2.1)
+        self.assertAlmostEqual(summary["difference_pp"], 1.1)
+        self.assertEqual(summary["days"], 4)
+        self.assertEqual(
+            summary["text"],
+            "Since tracking began (19 Oct 2026): your portfolio +3.2% vs VWRP +2.1% "
+            "(time-weighted, net of deposits and withdrawals).",
+        )
+
+    def test_window_starts_at_first_record_with_both_indices(self):
+        history = [
+            self._rec("2026-10-19", 100.0, None),  # benchmark missing on the first tracked day
+            self._rec("2026-10-20", 101.0, 100.5),
+            self._rec("2026-10-21", 103.02, 102.51),
+        ]
+        summary = ps.summarize_tracking_performance(history)
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["start_date"], "2026-10-20")
+        self.assertAlmostEqual(summary["portfolio_return_pct"], (103.02 / 101.0 - 1.0) * 100.0, places=2)
+        self.assertAlmostEqual(summary["benchmark_return_pct"], (102.51 / 100.5 - 1.0) * 100.0, places=2)
+        self.assertEqual(summary["days"], 1)
+        self.assertIn("Since tracking began (20 Oct 2026)", summary["text"])
+
+    def test_guards_against_zero_nan_and_garbage(self):
+        history = [
+            None,
+            "garbage",
+            42,
+            self._rec("2026-10-17", 0.0, 100.0),  # zero index: would divide by zero
+            self._rec("2026-10-18", 100.0, float("nan")),
+            self._rec("2026-10-19", float("inf"), 100.0),
+            self._rec("2026-10-20", -5.0, 100.0),
+            self._rec("2026-10-21", True, 100.0),  # bools are not index levels
+            self._rec("2026-10-22", "abc", 100.0),
+            self._rec("not-a-date", 100.0, 100.0),
+            self._rec(None, 100.0, 100.0),
+            self._rec("2026-10-23", 100.0, 100.0),
+            self._rec("2026-10-24", 98.5, 99.0),
+        ]
+        summary = ps.summarize_tracking_performance(history)
+        self.assertTrue(summary["available"])
+        self.assertEqual((summary["start_date"], summary["end_date"]), ("2026-10-23", "2026-10-24"))
+        self.assertAlmostEqual(summary["portfolio_return_pct"], -1.5)
+        self.assertAlmostEqual(summary["benchmark_return_pct"], -1.0)
+        self.assertAlmostEqual(summary["difference_pp"], -0.5)
+        self.assertIn("your portfolio -1.5% vs VWRP -1.0%", summary["text"])
+
+    def test_unsorted_input_and_duplicate_dates(self):
+        history = [
+            self._rec("2026-10-21", 102.0, 101.0),
+            self._rec("2026-10-19", 100.0, 100.0),
+            self._rec("2026-10-21", 104.0, 101.0),  # same-day re-run: the last record wins
+        ]
+        summary = ps.summarize_tracking_performance(history)
+        self.assertEqual((summary["start_date"], summary["end_date"]), ("2026-10-19", "2026-10-21"))
+        self.assertAlmostEqual(summary["portfolio_return_pct"], 4.0)
+        self.assertEqual(summary["days"], 2)
+
+    def test_two_records_on_one_date_are_not_a_comparison(self):
+        history = [self._rec("2026-10-19", 100.0, 100.0), self._rec("2026-10-19", 100.4, 100.1)]
+        summary = ps.summarize_tracking_performance(history)
+        self._assert_unavailable(summary)
+        self.assertIn("started on 19 Oct 2026", summary["text"])
+
+    def test_tiny_moves_never_read_minus_zero(self):
+        history = [self._rec("2026-10-01", 100.0, 100.0), self._rec("2026-10-02", 99.97, 100.02)]
+        summary = ps.summarize_tracking_performance(history)
+        self.assertIn("(1 Oct 2026)", summary["text"])  # no zero-padded day
+        self.assertIn("your portfolio +0.0% vs VWRP +0.0%", summary["text"])
+        self.assertNotIn("-0.0%", summary["text"])
+        json.dumps(summary, allow_nan=False)  # strictly JSON-safe for the dashboard payloads
 
 class RecommendationLedgerTests(_TempDataDirMixin, unittest.TestCase):
     RECORD = {

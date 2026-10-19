@@ -182,7 +182,48 @@ All optional settings are off by default. Set them in `.env` for local runs, or 
 | `MAX_LEVERAGED_ETF_PCT` | `0.08` | **Leverage policy:** maximum weight in 3x daily-leveraged ETFs (QQQ3, 3LUS, 3SEM, ...). Holdings above the cap are trimmed back to it and 3x ETFs are never bought. `0` means "exit 3x ETFs": any you hold is flagged as a full SELL. |
 | `EXCLUDED_TICKERS` | none | Tickers the engine must never recommend buying (e.g. `TSLA,COIN`). |
 
-Fixed limits in `config.py` (`REBALANCE_CONFIG`): `max_position_pct` 15% per holding (not applied to broad index ETFs unless `cap_applies_to_broad_etfs` is `True`), `max_cluster_pct` 24% per correlated macro cluster, `max_new_ideas_to_buy` 2, `target_crash_shield_pct` 15%. `MODEL_VERSION` is stamped on every snapshot and ledger record; bump it whenever you change the scoring rules.
+Fixed limits in `config.py` (`REBALANCE_CONFIG`):
+- `max_position_pct`: 15% per holding. Not applied to broad index ETFs unless `cap_applies_to_broad_etfs` is `True`.
+- `max_cluster_pct`: 24% per correlated macro cluster.
+- `max_new_ideas_to_buy`: 2.
+- `target_crash_shield_pct`: 15%. Crash protection counts **only real defensive assets**: cash, money-market funds, physical gold and short-dated gilts. Low-beta stocks and equity index funds do not count.
+
+`MODEL_VERSION` is stamped on every snapshot and ledger record; bump it whenever you change the scoring rules.
+
+**Household allocation (`ALLOCATION_CONFIG`).** All your accounts plus any vested outside holdings are treated as one portfolio, split into three buckets:
+- **Core**: All-World / S&P 500 index funds.
+- **Satellites**: single stocks, Nasdaq-100, sector and thematic funds.
+- **Defensive**: cash, money-market funds, gold and short gilts.
+
+The default target is **65 / 20 / 15**. New money goes to whichever bucket is furthest below target; buckets more than ±5pp below target go first. Nothing profitable is ever sold to rebalance.
+
+How new money is invested:
+- **Core money** buys `VWRP.L`.
+- **Defensive money** buys `SGLN.L` (gold) and/or `IGLS.L` (UK 0–5yr gilts).
+- **Satellite money** goes through the stock-selection engine, subject to:
+  - a 5% household cap per stock for new buys;
+  - a 30% cap on US big tech (AAPL, MSFT, GOOGL/GOOG, AMZN, META, NVDA, AVGO, TSLA) as a share of household wealth. This counts fund look-through, using approximate weights reviewed yearly, plus outside holdings.
+- **GBP-quoted lines** are used for new money, which avoids the 0.15% FX fee.
+
+**Buy cadence:** buys happen on the **first London business day of each month** (bank holidays respected), or on any day when deployable cash is at least £2,000. Sells and risk alerts stay daily.
+
+Optional env overrides (all parsed safely):
+
+| Variable | Default |
+|---|---|
+| `TARGET_CORE_PCT` | `0.65` |
+| `TARGET_SATELLITE_PCT` | `0.20` |
+| `TARGET_DEFENSIVE_PCT` | `0.15` |
+| `ALLOCATION_BAND_PP` | `5` |
+| `SATELLITE_MAX_SINGLE_PCT` | `0.05` |
+| `BIG_TECH_CAP_PCT` | `0.30` |
+| `BUY_CADENCE` | `monthly` (or `daily`) |
+| `OFF_CYCLE_MIN_DEPLOY_GBP` | `2000` |
+| `CORE_BUY_TICKER` | `VWRP.L` |
+| `GOLD_BUY_TICKER` | `SGLN.L` |
+| `SHORT_GILT_BUY_TICKER` | `IGLS.L` |
+
+Targets that don't sum to 1 are normalised. The research model's forward-CAGR estimate is shown for information only and never affects scores or sizes.
 
 All numeric environment values go through `_safe_float` / `_safe_int`, so blank, `true`, `false` or malformed values fall back to the defaults instead of crashing. If you add your own env mappings to the workflow, never use `${{ a || b }}` fallbacks (see [`GEMINI.md`](./GEMINI.md)).
 
@@ -190,14 +231,14 @@ All numeric environment values go through `_safe_float` / `_safe_int`, so blank,
 
 ## 📒 Recommendation Ledger & 📈 Benchmark Tracking
 
-**Recommendation ledger:** after every successful live send, `main.py` appends one record per recommended order (sells/trims not already pending in Trading 212, and all buys) to `data/recommendation_ledger.json` with `date`, `model_version`, `account`, `action`, `ticker`, `amount_gbp`, `price`, `currency` and `reason`. Records are deduped on `date|model_version|account|action|ticker`, and an unreadable ledger is never overwritten. It lets you check later whether a model version's recommendations actually added value.
+**Recommendation ledger:** after every successful live send, `main.py` appends one record per recommended order (sells/trims not already pending in Trading 212, and all buys) to `data/recommendation_ledger.json` with `date`, `model_version`, `account`, `action`, `ticker`, `bucket`, `amount_gbp`, `price`, `currency` and `reason`. Records are deduped on `date|model_version|account|action|ticker`, and an unreadable ledger is never overwritten. It lets you check later whether a model version's recommendations actually added value.
 
 **Benchmark & time-weighted return (TWR):** each daily snapshot (`data/snapshots/YYYY-MM-DD.json`, under `"performance"`) and each `data/portfolio_history.json` record carries:
 - `external_flows_gbp`: net deposits minus withdrawals since the previous snapshot (from Trading 212 `DEPOSIT` / `WITHDRAW` transactions, deduped by reference);
 - `twr_index_total` and `twr_index_<account>` (e.g. `twr_index_main`): time-weighted return indices based at 100 on the first tracked day, so new money is never counted as performance;
 - `benchmark_vwrp_index`: the VWRP.L close rebased to 100 on the same day ("everything in a global index fund"), or `null` when unavailable.
 
-The digest's day-over-day change also excludes deposits and withdrawals. Compare `twr_index_total` with `benchmark_vwrp_index` to see whether the engine is beating a plain global index fund.
+The digest's day-over-day change also excludes deposits and withdrawals. The email, dashboard and console show a "since tracking began: you vs VWRP" line built from these indices.
 
 `scripts/cleanup_trade_log.py` is an idempotent hygiene script for older data folders: it removes duplicate trade events and migrates stale ticker keys (e.g. `ASMLa_EQ` → `ASML.AS`). Preview with `./.venv/bin/python3 scripts/cleanup_trade_log.py --dry-run`.
 
@@ -211,6 +252,28 @@ The digest's day-over-day change also excludes deposits and withdrawals. Compare
 - **Fully offline:** stdlib `unittest` with all network access mocked (no Trading 212, Yahoo Finance or SMTP calls); storage tests use a temporary data directory, never `data/`.
 - **Independent of your `.env`:** behaviour is exercised through injected inputs, so your own settings never change the result.
 - **Runs in CI** before every digest; a failing test blocks the email. Python 3.9+.
+
+## 🔬 Evidence: Strategy Backtest
+
+```bash
+./.venv/bin/python3 scripts/backtest.py --out backtest_results.md [--json backtest_results.json]
+```
+
+The backtest is monthly, in GBP, after costs, with no look-ahead. It runs from 2008 to the last complete month and compares:
+- 100% global equity (≈ VWRP).
+- Core + 15% defensive, rebalanced within ±5pp bands.
+- Core + 20% momentum sector satellites + defensive, against a no-momentum control.
+- A 10-month SMA trend filter.
+- The engine's own weekly trend rule.
+
+It uses textbook parameters only (nothing fitted), needs network access (Yahoo Finance) and writes files only when asked. Its unit tests are offline.
+
+Results for Apr 2008 – Sep 2026:
+- Momentum sector selection added nothing over the control (t-stat −0.2).
+- A 15% defensive sleeve cut the worst fall from −33% to −23% for about 0.3 pp a year.
+- The weekly trend rule cost about 2.8 pp a year at index level, which is why core and defensive buys ignore trend signals.
+
+Past results on one historical path are not a forecast.
 
 ---
 

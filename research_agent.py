@@ -217,6 +217,9 @@ THEMATIC_CATEGORIES = {
     "SGLN.L": "Physical Gold & Crisis Alpha Shield",
     "IGLN.L": "Physical Gold & Crisis Alpha Shield",
     "CSH2.L": "SONIA Overnight Cash Vault & Protected Reserve",
+    # UK short-dated gilts / ultrashort GBP bonds (defensive bucket)
+    "IGLS.L": "UK Short-Dated Gilts (Defensive Ballast)",
+    "ERNS.L": "UK Short-Dated Gilts (Defensive Ballast)",
     # Diversified Index Foundations
     "VUAA.L": "US Large-Cap S&P 500 Secular Core",
     "VUSA.L": "US Large-Cap S&P 500 Secular Core",
@@ -260,6 +263,7 @@ THEME_MACRO_CLUSTER = {
     "Fortress Cash Ballast & Underwriting": "Defensive Ballast & Value",
     "Physical Gold & Crisis Alpha Shield": "Uncorrelated Crash Hedge & Gold",
     "SONIA Overnight Cash Vault & Protected Reserve": "Uncorrelated Crash Hedge & Gold",
+    "UK Short-Dated Gilts (Defensive Ballast)": "Defensive Gilts & Cash",
     "US Large-Cap S&P 500 Secular Core": "Diversified Index Core",
     "Global Equities Core Foundation": "Diversified Index Core",
     "Nasdaq-100 High-Beta Tech Leaders": "Diversified Index Core",
@@ -433,11 +437,12 @@ INSTITUTIONAL_DOSSIERS = {
 }
 
 
-# Broad index ETFs, physical commodity ETCs and cash funds that get the tailored ETF profile (substring match).
-# VUAG/CSPX (S&P 500), CNX1 (Nasdaq-100) and VWRA (FTSE All-World) are sister lines of VUAA/CNDX/VWRP.
+# Broad index ETFs, physical commodity ETCs, short-gilt funds and cash funds that get the tailored ETF profile (substring
+# match). VUAG/CSPX (S&P 500), CNX1 (Nasdaq-100) and VWRA (FTSE All-World) are sister lines of VUAA/CNDX/VWRP;
+# IGLS (UK gilts 0-5yr) and ERNS (GBP ultrashort bonds) are the defensive bond funds.
 KNOWN_ETF_TICKER_KEYS = (
     "VUAA", "VUSA", "VUAG", "CSPX", "VWRP", "VWRA", "SMGB", "CNDX", "CNX1",
-    "DFND", "QQQ3", "SGLN", "IGLN", "GLD", "CSH2",
+    "DFND", "QQQ3", "SGLN", "IGLN", "GLD", "CSH2", "IGLS", "ERNS",
 )
 
 # Core Yahoo fundamentals: a stock deep dive is only data_ok when at least _MIN_CORE_FUNDAMENTALS are present.
@@ -2205,6 +2210,12 @@ class DeepResearchAgent:
             bear = "Overnight yield adjusts dynamically with Bank of England base rate decisions."
             moat = "Sovereign GBP Overnight Rate Accrual (Zero Equity Crash Risk)"
             exp_5y_cagr = 4.3
+        elif "IGLS" in ticker or "ERNS" in ticker:
+            name = "iShares UK Gilts 0-5yr UCITS ETF" if "IGLS" in ticker else "iShares GBP Ultrashort Bond UCITS ETF"
+            bull = "Short-dated UK government bonds in GBP (no FX fee): low volatility, little sensitivity to equity crashes, and a yield close to Bank of England rates."
+            bear = "Returns roughly track short-term interest rates, so it lags shares in bull markets; prices dip modestly when rates rise quickly (as in 2022)."
+            moat = "UK Government Credit (Short Duration)"
+            exp_5y_cagr = 4.0  # yield-based display estimate only (forward CAGR never drives decisions)
         elif "SMGB" in ticker:
             name = "VanEck Semiconductor UCITS ETF"
             bull = "Monopoly exposure to the entire semiconductor value chain: foundry (TSMC), design (NVIDIA/AMD), lithography (ASML), and networking (Broadcom)."

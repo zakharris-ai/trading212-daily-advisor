@@ -392,7 +392,9 @@ REBALANCE_CONFIG = {
     "max_position_pct": 0.15,       # Maximum 15% of total portfolio in one asset
     "min_order_gbp": 300.0,         # Minimum tranche size in GBP
     "max_new_ideas_to_buy": 2,      # Limit concurrent new entries to keep portfolio focused
-    "target_crash_shield_pct": 0.15, # Target >=15% in uncorrelated / low-beta crash shields (Gold, Berkshire, Healthcare, Cash)
+    # Target >=15% in real defensive assets only: cash, money-market funds, physical gold and short-dated gilts
+    # (low-beta stocks and equity index funds do not count: they are shares and fall with the market in a crash)
+    "target_crash_shield_pct": 0.15,
     # Maximum cap on 3x daily leveraged instruments (0.0 = exit them entirely; see LEVERAGED-ETF POLICY above)
     "max_leveraged_etf_pct": _parse_fraction(
         os.getenv("MAX_LEVERAGED_ETF_PCT"), _DEFAULT_MAX_LEVERAGED_ETF_PCT, "MAX_LEVERAGED_ETF_PCT"
@@ -401,8 +403,73 @@ REBALANCE_CONFIG = {
     "cap_applies_to_broad_etfs": False,  # max_position_pct is not enforced on broad index ETFs (e.g. VWRP, VUAA)
 }
 
+
+def _build_allocation_config() -> Dict[str, Any]:
+    """Household strategic allocation, with safe env overrides.
+
+    The household = all configured Trading 212 accounts + vested outside holdings, treated as one portfolio.
+    New money is steered to the bucket furthest below target; profitable holdings are never sold to rebalance.
+    Targets that do not sum to 1.0 are normalised (with a warning); an all-zero/invalid set falls back to 65/20/15.
+    """
+    defaults = {"core": 0.65, "satellite": 0.20, "defensive": 0.15}
+    targets = {
+        "core": _safe_float(os.getenv("TARGET_CORE_PCT"), defaults["core"]),
+        "satellite": _safe_float(os.getenv("TARGET_SATELLITE_PCT"), defaults["satellite"]),
+        "defensive": _safe_float(os.getenv("TARGET_DEFENSIVE_PCT"), defaults["defensive"]),
+    }
+    targets = {k: max(0.0, v) for k, v in targets.items()}
+    total = sum(targets.values())
+    if total <= 0:
+        logger.warning("Household allocation targets are invalid (sum %.3f); using the 65/20/15 default.", total)
+        targets = dict(defaults)
+    elif abs(total - 1.0) > 1e-6:
+        logger.warning("Household allocation targets sum to %.3f, not 1.0; normalising them.", total)
+        targets = {k: v / total for k, v in targets.items()}
+
+    cadence = (os.getenv("BUY_CADENCE") or "monthly").strip().lower()
+    if cadence not in ("monthly", "daily"):
+        logger.warning("BUY_CADENCE=%r is not 'monthly' or 'daily'; using 'monthly'.", cadence)
+        cadence = "monthly"
+
+    return {
+        "targets": targets,
+        # Rebalancing band in percentage points: a bucket further than this from target is "out of band" and
+        # gets new money first
+        "band_pp": max(0.0, _safe_float(os.getenv("ALLOCATION_BAND_PP"), 5.0)),
+        # Max household weight for any single satellite stock (new buys only; existing positions are not trimmed by it)
+        "satellite_max_single_pct": max(0.0, _safe_float(os.getenv("SATELLITE_MAX_SINGLE_PCT"), 0.05)),
+        # Defensive sleeve split: cash and money-market funds count towards the short-gilt/cash half
+        "defensive_split": {"gold": 0.5, "short_gilts": 0.5},
+        # GBP-quoted lines for new money (no 0.15% FX fee)
+        "core_buy_ticker": (os.getenv("CORE_BUY_TICKER") or "VWRP.L").strip().upper(),
+        "gold_buy_ticker": (os.getenv("GOLD_BUY_TICKER") or "SGLN.L").strip().upper(),
+        "short_gilt_buy_ticker": (os.getenv("SHORT_GILT_BUY_TICKER") or "IGLS.L").strip().upper(),
+        # US big-tech cap as a fraction of household wealth (fund look-through + vested outside shares included)
+        "big_tech_cap_pct": max(0.0, _safe_float(os.getenv("BIG_TECH_CAP_PCT"), 0.30)),
+        # Buys only on the first London business day of the month, unless deployable cash >= off_cycle_min_deploy_gbp
+        # (sells and risk alerts are always daily). 'daily' restores daily buying.
+        "buy_cadence": cadence,
+        "off_cycle_min_deploy_gbp": max(0.0, _safe_float(os.getenv("OFF_CYCLE_MIN_DEPLOY_GBP"), 2000.0)),
+    }
+
+
+ALLOCATION_CONFIG: Dict[str, Any] = _build_allocation_config()
+
+# --- US BIG TECH (household concentration cap) ---
+BIG_TECH_TICKERS: Set[str] = {"AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "AVGO", "TSLA"}
+# Approximate share of each fund held in BIG_TECH_TICKERS (fund look-through), keyed by ticker root.
+# APPROXIMATIONS as of Oct 2026 from published index weights: review once a year.
+# QQQ3 is 3x daily-leveraged Nasdaq-100 exposure, hence 1.5.
+BIG_TECH_LOOKTHROUGH: Dict[str, float] = {
+    "VWRP": 0.22, "VWRA": 0.22, "VWRL": 0.22,                  # FTSE All-World
+    "VUAA": 0.35, "VUAG": 0.35, "VUSA": 0.35, "CSPX": 0.35,    # S&P 500
+    "CNDX": 0.50, "CNX1": 0.50, "EQQQ": 0.50,                  # Nasdaq-100
+    "SMGB": 0.30,                                              # VanEck Semiconductor
+    "QQQ3": 1.50,                                              # 3x Nasdaq-100
+}
+
 # --- MODEL VERSION (stamped on every recommendation-ledger record and snapshot) ---
-MODEL_VERSION = "2026.10.18-review-fixes"
+MODEL_VERSION = "2026.10.19-household-allocation"
 
 # --- OPTIONAL EXCLUDED TICKERS ---
 # Set EXCLUDED_TICKERS="TSLA,COIN" in .env if you want the engine to never buy specific tickers.
@@ -462,10 +529,12 @@ OUTSIDE_HOLDINGS: Dict[str, List[Dict[str, Any]]] = _parse_outside_holdings(
 WATCHLIST = [
     # Core All-Weather Foundations & Crisis Alpha Shields
     {"ticker": "SGLN.L", "name": "iShares Physical Gold ETC", "theme": "Physical Gold & Crisis Alpha Shield"},
+    {"ticker": "IGLS.L", "name": "iShares UK Gilts 0-5yr ETF", "theme": "UK Short-Dated Gilts (Defensive Ballast)"},
     {"ticker": "BRK-B", "name": "Berkshire Hathaway", "theme": "Fortress Cash Ballast & Underwriting"},
     {"ticker": "VWRP.L", "name": "Vanguard FTSE All-World ETF", "theme": "Global Equities Core Foundation"},
-    {"ticker": "VUAA.L", "name": "Vanguard S&P 500 UCITS ETF", "theme": "US Large-Cap Core ETF (London)"},
-    {"ticker": "CNDX.L", "name": "iShares Nasdaq 100", "theme": "US Large-Cap Core ETF (London)"},
+    # GBP-quoted lines (no 0.15% FX fee): VUAG.L = S&P 500 (sister of USD-line VUAA.L), CNX1.L = Nasdaq-100 (sister of CNDX.L)
+    {"ticker": "VUAG.L", "name": "Vanguard S&P 500 ETF (GBP)", "theme": "US Large-Cap S&P 500 Secular Core"},
+    {"ticker": "CNX1.L", "name": "iShares Nasdaq 100 (GBP)", "theme": "Nasdaq-100 High-Beta Tech Leaders"},
     # AI Compute, Foundry & Semiconductor Monopolies
     {"ticker": "NVDA", "name": "NVIDIA Corp.", "theme": "AI Compute & Full-Stack Data Center Monopoly"},
     {"ticker": "TSM", "name": "Taiwan Semi", "theme": "AI Foundry Monopoly"},

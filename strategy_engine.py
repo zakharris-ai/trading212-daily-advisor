@@ -3,7 +3,7 @@
 import logging
 import math
 import re
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
@@ -42,12 +42,33 @@ SCENARIO_RATES: Dict[str, Tuple[float, float, float]] = {
 
 # Instrument classification keys
 LEVERAGED_ETF_KEYS = ("QQQ3", "3LUS", "3SEM", "3X", "LQQ3", "3USL", "TQQQ")
-BROAD_INDEX_ETF_KEYS = ("VUAA", "VUSA", "VUAG", "CSPX", "VWRP", "VWRA", "CNDX", "CNX1")
-BROAD_INDEX_ETF_EXACT = {"SPY", "QQQ", "RSP"}
+BROAD_INDEX_ETF_KEYS = ("VUAA", "VUSA", "VUAG", "CSPX", "VWRP", "VWRA", "VWRL", "CNDX", "CNX1")
+BROAD_INDEX_ETF_EXACT = {"SPY", "QQQ", "RSP", "ACWI"}
+# Nasdaq-100 funds are broad index ETFs for cap purposes, but a concentrated tech tilt for the household mix (satellite)
+NASDAQ100_ETF_KEYS = ("CNDX", "CNX1", "EQQQ")
+NASDAQ100_ETF_EXACT = {"QQQ"}
+# USD-quoted London ETF lines with a GBP sister line (VUAA->VUAG, CNDX->CNX1, VWRA->VWRP, CSPX->CSP1): held lines are
+# kept, but new money always uses the GBP line (avoids Trading 212's 0.15% FX fee on each trade)
+USD_LINE_ETF_KEYS = ("VUAA", "CNDX", "VWRA", "CSPX")
 GOLD_ETC_KEYS = ("SGLN", "IGLN", "GLD")
 MONEY_MARKET_KEYS = ("CSH2",)
+# UK short-dated gilt / GBP ultrashort bond funds (defensive bucket)
+SHORT_GILT_KEYS = ("IGLS", "ERNS")
 SECTOR_ETF_KEYS = ("SMGB", "DFND")
-CLUSTER_CAP_EXEMPT = ("Diversified Index Core", "Uncorrelated Crash Hedge & Gold", "Defensive Ballast & Value")
+CLUSTER_CAP_EXEMPT = (
+    "Diversified Index Core", "Uncorrelated Crash Hedge & Gold", "Defensive Ballast & Value", "Defensive Gilts & Cash",
+)
+
+# Household strategic allocation buckets (see config.ALLOCATION_CONFIG)
+BUCKET_CORE = "core"
+BUCKET_SATELLITE = "satellite"
+BUCKET_DEFENSIVE = "defensive"
+BUCKETS: Tuple[str, str, str] = (BUCKET_CORE, BUCKET_SATELLITE, BUCKET_DEFENSIVE)
+BUCKET_LABELS: Dict[str, str] = {
+    BUCKET_CORE: "Core global index",
+    BUCKET_SATELLITE: "Satellites (single stocks & thematic funds)",
+    BUCKET_DEFENSIVE: "Defensive (cash, money-market, gold, short gilts)",
+}
 
 # Signal labels shared by analyze_position and build_rebalancing_plan
 EARMARKED_SIGNAL = "🔒 HOLD (EARMARKED — EXCLUDED FROM PORTFOLIO MATHS)"
@@ -113,6 +134,155 @@ def is_money_market_fund(yf_ticker: str) -> bool:
     return bool(sym) and any(k in sym for k in MONEY_MARKET_KEYS)
 
 
+def is_short_gilt_fund(yf_ticker: str) -> bool:
+    """Returns True for UK short-dated gilt / GBP ultrashort bond funds (IGLS, ERNS)."""
+    sym = _sym(yf_ticker)
+    return bool(sym) and any(k in sym for k in SHORT_GILT_KEYS)
+
+
+def is_nasdaq100_fund(yf_ticker: str) -> bool:
+    """Returns True for unleveraged Nasdaq-100 funds (CNDX, CNX1, EQQQ, QQQ)."""
+    sym = _sym(yf_ticker)
+    if not sym or is_leveraged_etf(sym):
+        return False
+    return sym.split(".")[0] in NASDAQ100_ETF_EXACT or any(k in sym for k in NASDAQ100_ETF_KEYS)
+
+
+def is_defensive_asset(yf_ticker: str) -> bool:
+    """Strict defensive definition: physical gold ETCs, money-market funds and short-dated gilt funds.
+
+    Uninvested cash is also defensive (callers add it separately). Low-beta stocks (e.g. BRK-B, LLY, ABBV) and
+    equity index funds (e.g. VWRP) are NOT defensive: they are shares and fall with the market in a crash.
+    """
+    sym = _sym(yf_ticker)
+    if not sym or is_leveraged_etf(sym):
+        return False
+    return is_gold_etc(sym) or is_money_market_fund(sym) or is_short_gilt_fund(sym)
+
+
+def classify_bucket(yf_ticker: str) -> str:
+    """Household-mix bucket for an instrument: 'defensive' (gold / money-market / short gilts), 'core' (All-World and
+    S&P 500 index funds) or 'satellite' (single stocks, Nasdaq-100, sector, thematic and leveraged funds)."""
+    if is_defensive_asset(yf_ticker):
+        return BUCKET_DEFENSIVE
+    if is_broad_index_etf(yf_ticker) and not is_nasdaq100_fund(yf_ticker):
+        return BUCKET_CORE
+    return BUCKET_SATELLITE
+
+
+def _allocation_cfg() -> Dict[str, Any]:
+    """Household allocation settings from config.ALLOCATION_CONFIG, read defensively (targets normalised to sum to 1)."""
+    raw = getattr(config, "ALLOCATION_CONFIG", None)
+    raw = raw if isinstance(raw, dict) else {}
+    raw_targets = raw.get("targets") if isinstance(raw.get("targets"), dict) else {}
+    defaults = {BUCKET_CORE: 0.65, BUCKET_SATELLITE: 0.20, BUCKET_DEFENSIVE: 0.15}
+    targets = {b: max(0.0, _num(raw_targets.get(b), d)) for b, d in defaults.items()}
+    t_sum = sum(targets.values())
+    targets = {b: v / t_sum for b, v in targets.items()} if t_sum > 0 else dict(defaults)
+    raw_split = raw.get("defensive_split") if isinstance(raw.get("defensive_split"), dict) else {}
+    gold_share = min(1.0, max(0.0, _num(raw_split.get("gold"), 0.5)))
+    cadence = str(raw.get("buy_cadence") or "monthly").strip().lower()
+    return {
+        "targets": targets,
+        "band_pp": max(0.0, _num(raw.get("band_pp"), 5.0)),
+        "satellite_max_single_pct": max(0.0, _num(raw.get("satellite_max_single_pct"), 0.05)),
+        "defensive_gold_share": gold_share,
+        "core_buy_ticker": _sym(raw.get("core_buy_ticker") or "VWRP.L"),
+        "gold_buy_ticker": _sym(raw.get("gold_buy_ticker") or "SGLN.L"),
+        "short_gilt_buy_ticker": _sym(raw.get("short_gilt_buy_ticker") or "IGLS.L"),
+        "big_tech_cap_pct": max(0.0, _num(raw.get("big_tech_cap_pct"), 0.30)),
+        "buy_cadence": cadence if cadence in ("monthly", "daily") else "monthly",
+        "off_cycle_min_deploy_gbp": max(0.0, _num(raw.get("off_cycle_min_deploy_gbp"), 2000.0)),
+    }
+
+
+def big_tech_weight(yf_ticker: str) -> float:
+    """Fraction of an instrument's value that is US big tech (config.BIG_TECH_TICKERS).
+
+    1.0 for the big-tech stocks themselves; the approximate fund look-through weight from config.BIG_TECH_LOOKTHROUGH
+    for funds (e.g. ~0.35 for an S&P 500 fund, 1.5 for 3x leveraged Nasdaq-100); 0.0 otherwise.
+    """
+    sym = _sym(yf_ticker)
+    if not sym:
+        return 0.0
+    tickers = {_sym(t) for t in (getattr(config, "BIG_TECH_TICKERS", None) or ())}
+    if sym.split(".")[0] in tickers or sym in tickers:
+        return 1.0
+    lookthrough = getattr(config, "BIG_TECH_LOOKTHROUGH", None) or {}
+    for key, weight in lookthrough.items():
+        k = _sym(key)
+        if k and k in sym:
+            return max(0.0, _num(weight, 0.0))
+    return 0.0
+
+
+def _easter_sunday(year: int) -> date:
+    """Gregorian Easter Sunday (anonymous Gregorian algorithm)."""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    wd = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * wd) // 451
+    month, day = divmod(h + wd - 7 * m + 114, 31)
+    return date(year, month, day + 1)
+
+
+def uk_bank_holidays(year: int) -> Set[date]:
+    """England & Wales bank holidays (LSE closed) for `year`, with weekend substitute days.
+
+    Standard rules only; one-off royal / jubilee holidays are not included.
+    """
+    hols: Set[date] = set()
+    ny = date(year, 1, 1)
+    hols.add(ny + timedelta(days={5: 2, 6: 1}.get(ny.weekday(), 0)))  # Sat -> Mon 3rd, Sun -> Mon 2nd
+    easter = _easter_sunday(year)
+    hols.add(easter - timedelta(days=2))  # Good Friday
+    hols.add(easter + timedelta(days=1))  # Easter Monday
+    may1 = date(year, 5, 1)
+    hols.add(may1 + timedelta(days=(7 - may1.weekday()) % 7))  # Early May: first Monday
+    may31 = date(year, 5, 31)
+    hols.add(may31 - timedelta(days=may31.weekday()))  # Spring: last Monday of May
+    aug31 = date(year, 8, 31)
+    hols.add(aug31 - timedelta(days=aug31.weekday()))  # Summer: last Monday of August
+    xmas, boxing = date(year, 12, 25), date(year, 12, 26)
+    if xmas.weekday() == 5:      # Sat: Christmas -> Mon 27, Boxing (Sun) -> Tue 28
+        hols.update({date(year, 12, 27), date(year, 12, 28)})
+    elif xmas.weekday() == 6:    # Sun: Boxing Mon 26, Christmas -> Tue 27
+        hols.update({boxing, date(year, 12, 27)})
+    elif xmas.weekday() == 4:    # Fri: Boxing (Sat) -> Mon 28
+        hols.update({xmas, date(year, 12, 28)})
+    else:
+        hols.update({xmas, boxing})
+    return hols
+
+
+def is_london_business_day(d: date) -> bool:
+    """True on London Stock Exchange trading days (Mon-Fri excluding England & Wales bank holidays)."""
+    return d.weekday() < 5 and d not in uk_bank_holidays(d.year)
+
+
+def first_london_business_day(year: int, month: int) -> date:
+    """First London business day of the given month."""
+    d = date(year, month, 1)
+    while not is_london_business_day(d):
+        d += timedelta(days=1)
+    return d
+
+
+def next_monthly_buy_day(today: date) -> date:
+    """The monthly buy day on or after `today`: this month's first London business day if not yet passed, else next
+    month's."""
+    first = first_london_business_day(today.year, today.month)
+    if today <= first:
+        return first
+    year, month = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
+    return first_london_business_day(year, month)
+
+
 def _rebalance_cfg_frac(key: str, default: float) -> float:
     """Reads a numeric limit from REBALANCE_CONFIG with a default. A configured 0.0 is honoured (never `or default`)."""
     try:
@@ -159,8 +329,11 @@ def _model_version() -> str:
 
 def _position_cap_applies(yf_ticker: str) -> bool:
     """The single-name cap (max_position_pct) applies to single stocks and sector/leveraged ETFs.
-    Broad index ETFs, physical gold and money-market funds are exempt unless cap_applies_to_broad_etfs is True."""
-    if is_broad_index_etf(yf_ticker) or is_gold_etc(yf_ticker) or is_money_market_fund(yf_ticker):
+    Broad index ETFs, physical gold, money-market and short-gilt funds are exempt unless cap_applies_to_broad_etfs is True."""
+    if (
+        is_broad_index_etf(yf_ticker) or is_gold_etc(yf_ticker)
+        or is_money_market_fund(yf_ticker) or is_short_gilt_fund(yf_ticker)
+    ):
         return _rebalance_cfg_bool("cap_applies_to_broad_etfs", False)
     return True
 
@@ -205,9 +378,9 @@ def is_core_asset(yf_ticker: str, company_name: str = "", macro_cluster: str = "
     core_symbols = {"VUAA.L", "VUSA.L", "VWRP.L", "CNDX.L", "SGLN.L", "IGLN.L", "GLD", "CSH2.L", "SPY", "QQQ", "RSP"}
     if clean_sym in core_symbols or any(k in clean_sym for k in ["VUAA", "VUSA", "VWRP", "CNDX", "SGLN", "IGLN", "CSH2"]):
         return True
-    if is_broad_index_etf(clean_sym) or is_gold_etc(clean_sym) or is_money_market_fund(clean_sym):
+    if is_broad_index_etf(clean_sym) or is_gold_etc(clean_sym) or is_money_market_fund(clean_sym) or is_short_gilt_fund(clean_sym):
         return True
-    if macro_cluster in ["Diversified Index Core", "Global Equities Core Foundation", "Uncorrelated Crash Hedge & Gold"]:
+    if macro_cluster in ["Diversified Index Core", "Global Equities Core Foundation", "Uncorrelated Crash Hedge & Gold", "Defensive Gilts & Cash"]:
         return True
     if "UCITS" in c_upper or "ETF" in c_upper or "ETC" in c_upper or "INDEX" in c_upper or "ALL-WORLD" in c_upper or "S&P 500" in c_upper or "PHYSICAL GOLD" in c_upper or "OVERNIGHT" in c_upper:
         return True
@@ -220,20 +393,13 @@ def is_crash_shield_asset(
     beta_5y: float = 1.0,
     crash_2022_ret_pct: float = -20.0
 ) -> bool:
-    """Returns True if the asset acts as a Crisis-Alpha Hedge, Cash Fortress, or Low-Beta Crash-Resistant Anchor."""
-    clean_sym = _sym(yf_ticker)
-    if is_leveraged_etf(clean_sym) or "SMGB" in clean_sym:
-        return False
-    shield_tickers = {"SGLN.L", "IGLN.L", "GLD", "CSH2.L", "BRK-B", "LLY", "ABBV", "VWRP.L"}
-    if clean_sym in shield_tickers or any(k in clean_sym for k in ["SGLN", "IGLN", "CSH2", "BRK-B", "ABBV"]):
-        return True
-    if macro_cluster in ["Uncorrelated Crash Hedge & Gold", "Defensive Ballast & Value"]:
-        return True
-    if macro_cluster == "Healthcare & Biopharma" and beta_5y <= 0.65 and crash_2022_ret_pct >= -5.0:
-        return True
-    if beta_5y <= 0.45 and crash_2022_ret_pct >= -3.0:
-        return True
-    return False
+    """Returns True only for real defensive assets: physical gold ETCs, money-market funds and short-dated gilt funds.
+
+    Strict definition since 2026-10-19 (same as is_defensive_asset). Low-beta or 'crash-resistant' stocks (BRK-B, LLY,
+    ABBV) and equity index funds (VWRP) no longer count: they are equities and can fall sharply in a crash. The
+    macro_cluster / beta_5y / crash_2022_ret_pct arguments are accepted for backward compatibility and ignored.
+    """
+    return is_defensive_asset(yf_ticker)
 
 
 def is_recent_entry(position_data: Optional[Dict[str, Any]], days_threshold: int = 28) -> Tuple[bool, Optional[int]]:
@@ -1605,12 +1771,8 @@ def analyze_position(
         elif is_leveraged or sortino_5y < 0.45:
             composite_conviction -= 8  # Severe 5-year volatility decay (e.g., 3x daily leveraged ETFs)
 
-        if exp_5y_cagr >= 16.0 and not is_leveraged:
-            composite_conviction += 5  # Elite forward 5Y intrinsic compounding power
-        elif exp_5y_cagr >= 13.0 and not is_leveraged:
-            composite_conviction += 3
-        elif exp_5y_cagr < 8.5 and not is_crash_shield and not is_core:
-            composite_conviction -= 6  # Sub-par 5-year expected return vs valuation multiple
+        # The forward 5Y CAGR model estimate is display-only (owner decision 2026-10-19): it no longer moves conviction,
+        # because it is an optimistic, untested heuristic (clamped 5.5-28.5%) rather than a measured edge.
 
         if crash_2022_ret >= 0.0 and cagr_5y >= 12.0:
             composite_conviction += 4  # Proven positive crisis alpha in 2022 bear market + strong 5Y growth
@@ -1634,7 +1796,7 @@ def analyze_position(
 
         # Risk-exit (SELL) conditions are evaluated BEFORE the trim lockout, anti-churn and core branches.
         # Broad diversified index ETFs, money-market funds and physical gold ETCs are never exited.
-        is_exit_exempt = is_broad_index_etf(yf_ticker) or is_money_market_fund(yf_ticker) or is_gold
+        is_exit_exempt = is_broad_index_etf(yf_ticker) or is_money_market_fund(yf_ticker) or is_gold or is_short_gilt_fund(yf_ticker)
         pct_vs_200 = ((latest_price / curr_ema_200) - 1.0) * 100.0 if curr_ema_200 > 0 else 0.0
         altman_z = _num(research.get("altman_z"), None)
         piotroski = _num(research.get("piotroski_score"), None)
@@ -2149,10 +2311,10 @@ def scan_watchlist_opportunities(
         else:
             _collect(analysis, f"not selected: conviction {conviction:.0f} below the forced-BUY threshold")
 
+    # Ranking: conviction plus a pullback-zone bonus. The forward 5Y CAGR model estimate is display-only (not ranked on).
     opportunities.sort(
         key=lambda x: (
             _num(x.get("conviction_score"), 0.0)
-            + 0.75 * _first_num(x.get("expected_5y_cagr_pct"), x.get("cagr_5y_pct"), default=14.0)
             + (8.0 if 30.0 <= _num(x.get("rsi"), 50.0) <= 48.0 else 0.0)
         ),
         reverse=True,
@@ -2192,7 +2354,8 @@ def compute_portfolio_5y_risk_profile(
     Earmarked tickers (config.EARMARKED_TICKERS) are excluded from the book and from the total. The post-plan book is
     simulated per (account, ticker), so the same ticker held in two accounts keeps both copies; with no orders the
     post metrics equal the current metrics exactly. Only free cash counts towards the crash shield (blocked cash is
-    committed to pending orders), and the true defensive metric is free cash + money-market (CSH2) + physical gold.
+    committed to pending orders), and the true defensive metric is free cash + money-market (CSH2) + physical gold +
+    short-dated gilt funds (IGLS/ERNS). The shield uses the same strict definition (is_crash_shield_asset).
     """
     earmarked_set = _earmarked_tickers()
     free_cash = max(0.0, _num(available_cash_gbp, 0.0))
@@ -2226,6 +2389,7 @@ def compute_portfolio_5y_risk_profile(
         lev_3x_gbp = 0.0
         gold_gbp = 0.0
         mmf_gbp = 0.0
+        short_gilt_gbp = 0.0
         equity_gbp = 0.0
 
         # Aggregate identical tickers (e.g. the same ETF held in two accounts) into one node: it is one asset
@@ -2261,7 +2425,7 @@ def compute_portfolio_5y_risk_profile(
 
             # Implied annualized downside semi-deviation (%)
             dd_i = max(5.5, abs(cagr_i - 3.5) / sort_i)
-            is_gold_or_cash = any(k in t_sym for k in ["SGLN", "IGLN", "GLD", "CSH2"])
+            is_gold_or_cash = is_defensive_asset(t_sym)
 
             cagr_sum += w * cagr_i
             beta_sum += w * beta_i
@@ -2273,6 +2437,9 @@ def compute_portfolio_5y_risk_profile(
                 lev_3x_gbp += v
             if is_money_market_fund(t_sym):
                 mmf_gbp += v
+                defensive_gbp += v
+            elif is_short_gilt_fund(t_sym):
+                short_gilt_gbp += v
                 defensive_gbp += v
             elif is_gold_etc(t_sym):
                 gold_gbp += v
@@ -2329,6 +2496,7 @@ def compute_portfolio_5y_risk_profile(
             "defensive_pct": defensive_pct,
             "cash_gbp": max(0.0, cash_val),
             "mmf_gbp": mmf_gbp,
+            "short_gilt_gbp": short_gilt_gbp,
             "gold_gbp": gold_gbp,
             "equity_gbp": equity_gbp,
         }
@@ -2393,7 +2561,7 @@ def compute_portfolio_5y_risk_profile(
     # 5-Year Wealth Projections: bear / base / bull scenario rates weighted by the post-plan book (no floors)
     horizon_yrs = int(_num(STRATEGY_CONFIG.get("investment_horizon_years", 5), 5))
     eq_gbp = post_metrics["equity_gbp"]
-    cash_bucket_gbp = post_metrics["cash_gbp"] + post_metrics["mmf_gbp"]
+    cash_bucket_gbp = post_metrics["cash_gbp"] + post_metrics["mmf_gbp"] + post_metrics["short_gilt_gbp"]
     gold_bucket_gbp = post_metrics["gold_gbp"]
     book_sum = eq_gbp + cash_bucket_gbp + gold_bucket_gbp
     projections: Dict[str, Tuple[float, float]] = {}
@@ -2471,6 +2639,250 @@ def compute_portfolio_5y_risk_profile(
         "earmarked_gbp": round(earmarked_gbp, 2),
         "investable_total_gbp": round(investable_total, 2),
     }
+
+
+def _defensive_kind(yf_ticker: str) -> str:
+    """Sub-sleeve of a defensive instrument: 'gold', 'money_market' or 'short_gilts'."""
+    if is_gold_etc(yf_ticker):
+        return "gold"
+    if is_money_market_fund(yf_ticker):
+        return "money_market"
+    return "short_gilts"
+
+
+def _bucket_status(current_pct: float, target_pct: float, band_pp: float) -> str:
+    """'under' / 'over' when outside the +/-band around target, otherwise 'in_band'."""
+    if current_pct < target_pct - band_pp - 1e-9:
+        return "under"
+    if current_pct > target_pct + band_pp + 1e-9:
+        return "over"
+    return "in_band"
+
+
+def compute_household_mix(
+    holdings: Optional[List[Dict[str, Any]]],
+    cash_gbp: float,
+    outside_rows: Optional[List[Dict[str, Any]]] = None,
+    excluded_cash_gbp: float = 0.0,
+    sell_orders: Optional[List[Dict[str, Any]]] = None,
+    buy_orders: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Household strategic mix (core / satellite / defensive) vs the targets in config.ALLOCATION_CONFIG.
+
+    Args:
+        holdings: NON-earmarked Trading 212 positions across accounts ({"ticker", "value_gbp", optional "account"}).
+        cash_gbp: uninvested cash counted as defensive (free + blocked, minus temporary reserve top-up cash).
+        outside_rows: valued outside holdings (e.g. vested RSUs); only 'vested_gbp' counts, unvested never does.
+        excluded_cash_gbp: temporary reserve top-up cash left out of the basis (reported for display only).
+        sell_orders / buy_orders: when given (even empty), post_trade_* simulate the plans: sells move value from
+            the sold instrument's bucket into cash (defensive); buys move cash into the order's 'bucket'.
+
+    Returns:
+        Dict with basis_gbp, band_pp, targets, values_gbp, defensive_detail_gbp, buckets (display rows with
+        current/post-trade/target %, gap_gbp, status 'under'/'over'/'in_band', out_of_band), outside_included_gbp,
+        excluded_cash_gbp, post_trade_available and a one-line summary.
+    """
+    cfg = _allocation_cfg()
+    targets, band = cfg["targets"], cfg["band_pp"]
+    values = {b: 0.0 for b in BUCKETS}
+    detail = {"gold": 0.0, "short_gilts": 0.0, "money_market": 0.0, "cash": max(0.0, _num(cash_gbp, 0.0))}
+
+    def _add(ticker: str, value: float) -> None:
+        bucket = classify_bucket(ticker)
+        values[bucket] += value
+        if bucket == BUCKET_DEFENSIVE:
+            detail[_defensive_kind(ticker)] += value
+
+    for row in holdings or []:
+        if isinstance(row, dict):
+            _add(str(row.get("ticker", "")), max(0.0, _num(row.get("value_gbp"), 0.0)))
+    outside_total = 0.0
+    for h in outside_rows or []:
+        if isinstance(h, dict):
+            v = max(0.0, _num(h.get("vested_gbp"), 0.0))
+            _add(str(h.get("ticker", "")), v)
+            outside_total += v
+    values[BUCKET_DEFENSIVE] += detail["cash"]
+    basis = sum(values.values())
+
+    post = dict(values)
+    post_detail = dict(detail)
+    post_available = sell_orders is not None or buy_orders is not None
+    for s in sell_orders or []:
+        if not isinstance(s, dict) or s.get("is_pending"):
+            continue
+        st = str(s.get("ticker", ""))
+        b = classify_bucket(st)
+        amt = min(max(0.0, _num(s.get("estimated_gbp"), 0.0)), post[b])
+        post[b] -= amt
+        post[BUCKET_DEFENSIVE] += amt
+        if b == BUCKET_DEFENSIVE:
+            kind = _defensive_kind(st)
+            post_detail[kind] = max(0.0, post_detail[kind] - amt)
+        post_detail["cash"] += amt
+    for o in buy_orders or []:
+        if not isinstance(o, dict) or o.get("is_pending"):
+            continue
+        ot = str(o.get("ticker", ""))
+        b = o.get("bucket") if o.get("bucket") in BUCKETS else classify_bucket(ot)
+        amt = max(0.0, _num(o.get("estimated_gbp"), 0.0))
+        post[BUCKET_DEFENSIVE] = max(0.0, post[BUCKET_DEFENSIVE] - amt)
+        post_detail["cash"] = max(0.0, post_detail["cash"] - amt)
+        post[b] += amt
+        if b == BUCKET_DEFENSIVE:
+            post_detail[_defensive_kind(ot)] += amt
+
+    def _pct(v: float) -> float:
+        return round(v / basis * 100.0, 1) if basis > 0 else 0.0
+
+    rows = []
+    for b in BUCKETS:
+        t_pct = targets[b] * 100.0
+        cur_pct = (values[b] / basis * 100.0) if basis > 0 else 0.0
+        status = _bucket_status(cur_pct, t_pct, band) if basis > 0 else "in_band"
+        rows.append({
+            "bucket": b,
+            "label": BUCKET_LABELS[b],
+            "target_pct": round(t_pct, 1),
+            "current_gbp": round(values[b], 2),
+            "current_pct": _pct(values[b]),
+            "post_trade_gbp": round(post[b], 2),
+            "post_trade_pct": _pct(post[b]),
+            "gap_gbp": round(targets[b] * basis - values[b], 2),
+            "status": status,
+            "out_of_band": status != "in_band",
+        })
+    short_names = {BUCKET_CORE: "Core", BUCKET_SATELLITE: "Satellites", BUCKET_DEFENSIVE: "Defensive"}
+    summary = " · ".join(
+        f"{short_names[r['bucket']]} {r['current_pct']:.0f}% (target {r['target_pct']:.0f}%)" for r in rows
+    )
+    return {
+        "basis_gbp": round(basis, 2),
+        "band_pp": band,
+        "targets": {b: round(targets[b], 4) for b in BUCKETS},
+        "values_gbp": {b: round(values[b], 2) for b in BUCKETS},
+        "defensive_detail_gbp": {k: round(v, 2) for k, v in detail.items()},
+        "post_trade_values_gbp": {b: round(post[b], 2) for b in BUCKETS},
+        "buckets": rows,
+        "outside_included_gbp": round(outside_total, 2),
+        "excluded_cash_gbp": round(max(0.0, _num(excluded_cash_gbp, 0.0)), 2),
+        "post_trade_available": post_available,
+        "summary": summary,
+    }
+
+
+def compute_big_tech_exposure(
+    holdings: Optional[List[Dict[str, Any]]],
+    outside_rows: Optional[List[Dict[str, Any]]],
+    basis_gbp: float,
+    sell_orders: Optional[List[Dict[str, Any]]] = None,
+    buy_orders: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """US big-tech exposure (config.BIG_TECH_TICKERS) as a share of household wealth, vs big_tech_cap_pct.
+
+    Direct holdings count in full, funds count through their approximate look-through weight
+    (config.BIG_TECH_LOOKTHROUGH), and vested outside holdings count in full. Post-trade exposure applies the
+    non-pending sell/buy orders at their look-through weights.
+    """
+    cfg = _allocation_cfg()
+    cap_pct = cfg["big_tech_cap_pct"] * 100.0
+    bt_tickers = {_sym(t) for t in (getattr(config, "BIG_TECH_TICKERS", None) or ())}
+    basis = max(0.0, _num(basis_gbp, 0.0))
+    agg: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+    def _add(account: Any, ticker: str, source: str, value: float) -> None:
+        w = big_tech_weight(ticker)
+        if w <= 0 or value <= 0:
+            return
+        key = (str(account or ""), _sym(ticker), source)
+        row = agg.setdefault(key, {
+            "account": account, "ticker": ticker, "source": source,
+            "value_gbp": 0.0, "lookthrough_weight": round(w, 3), "exposure_gbp": 0.0,
+        })
+        row["value_gbp"] += value
+        row["exposure_gbp"] += value * w
+
+    for h in holdings or []:
+        if isinstance(h, dict):
+            t = str(h.get("ticker", ""))
+            src = "direct" if _sym(t).split(".")[0] in bt_tickers else "fund"
+            _add(h.get("account"), t, src, max(0.0, _num(h.get("value_gbp"), 0.0)))
+    for h in outside_rows or []:
+        if isinstance(h, dict):
+            _add(h.get("account"), str(h.get("ticker", "")), "outside", max(0.0, _num(h.get("vested_gbp"), 0.0)))
+
+    exposure = sum(r["exposure_gbp"] for r in agg.values())
+    post = exposure
+    for s in sell_orders or []:
+        if isinstance(s, dict) and not s.get("is_pending"):
+            post -= big_tech_weight(s.get("ticker", "")) * max(0.0, _num(s.get("estimated_gbp"), 0.0))
+    for o in buy_orders or []:
+        if isinstance(o, dict) and not o.get("is_pending"):
+            post += big_tech_weight(o.get("ticker", "")) * max(0.0, _num(o.get("estimated_gbp"), 0.0))
+    post = max(0.0, post)
+
+    breakdown = sorted(agg.values(), key=lambda r: r["exposure_gbp"], reverse=True)
+    for r in breakdown:
+        r["value_gbp"] = round(r["value_gbp"], 2)
+        r["exposure_gbp"] = round(r["exposure_gbp"], 2)
+    exposure_pct = round(exposure / basis * 100.0, 1) if basis > 0 else 0.0
+    return {
+        "cap_pct": round(cap_pct, 1),
+        "exposure_gbp": round(exposure, 2),
+        "exposure_pct": exposure_pct,
+        "post_trade_exposure_gbp": round(post, 2),
+        "post_trade_exposure_pct": round(post / basis * 100.0, 1) if basis > 0 else 0.0,
+        "basis_gbp": round(basis, 2),
+        "over_cap": basis > 0 and exposure > cap_pct / 100.0 * basis + 0.005,
+        "tickers": sorted(bt_tickers),
+        "breakdown": breakdown,
+        "note": "Fund look-through weights are approximations, reviewed yearly.",
+    }
+
+
+def allocate_new_money(
+    budget_gbp: float,
+    values_gbp: Dict[str, float],
+    basis_gbp: float,
+    targets: Optional[Dict[str, float]] = None,
+    band_pp: Optional[float] = None,
+) -> Dict[str, float]:
+    """Splits new money across the household buckets in proportion to each bucket's shortfall vs target.
+
+    `values_gbp` must EXCLUDE the budget itself (it is cash awaiting allocation) while `basis_gbp` includes it, so the
+    shortfalls sum to at least the budget. Buckets more than band_pp below target are filled first; any remainder goes
+    to the other under-target buckets; anything still left (only possible with inconsistent inputs) follows the
+    target weights. Over-target buckets never receive new money while another bucket is short.
+    """
+    cfg = _allocation_cfg()
+    tg = targets or cfg["targets"]
+    band = cfg["band_pp"] if band_pp is None else max(0.0, _num(band_pp, 5.0))
+    budget = max(0.0, _num(budget_gbp, 0.0))
+    basis = max(0.0, _num(basis_gbp, 0.0))
+    alloc = {b: 0.0 for b in BUCKETS}
+    if budget <= 0:
+        return alloc
+    vals = {b: max(0.0, _num((values_gbp or {}).get(b), 0.0)) for b in BUCKETS}
+    gaps = {b: max(0.0, _num(tg.get(b), 0.0) * basis - vals[b]) for b in BUCKETS}
+    out_of_band = [
+        b for b in BUCKETS
+        if basis > 0 and (vals[b] / basis * 100.0) < _num(tg.get(b), 0.0) * 100.0 - band - 1e-9
+    ]
+    remaining = budget
+    for group in (out_of_band, [b for b in BUCKETS if gaps[b] > 0]):
+        rooms = {b: max(0.0, gaps[b] - alloc[b]) for b in group}
+        room_total = sum(rooms.values())
+        if remaining <= 0.005 or room_total <= 0.005:
+            continue
+        take = min(remaining, room_total)
+        for b, room in rooms.items():
+            alloc[b] += take * room / room_total
+        remaining -= take
+    if remaining > 0.005:
+        t_sum = sum(max(0.0, _num(tg.get(b), 0.0)) for b in BUCKETS) or 1.0
+        for b in BUCKETS:
+            alloc[b] += remaining * max(0.0, _num(tg.get(b), 0.0)) / t_sum
+    return alloc
 
 
 def build_consolidated_portfolio_view(
@@ -2687,6 +3099,39 @@ def build_consolidated_portfolio_view(
         buy_orders=sim_buys,
     )
 
+    # Household strategic mix & US big-tech exposure (both accounts + vested outside holdings as ONE portfolio).
+    # Temporary reserve top-up cash (money parked for withdrawal, e.g. the sold part of an earmarked fund) is left out
+    # of the basis like earmarked funds; the rest of the uninvested cash counts as defensive.
+    hh_cash = 0.0
+    hh_excluded_cash = 0.0
+    for acc_name, acc_info in accounts_data.items():
+        cash = acc_info.get("cash", {}) or {}
+        free_gbp = max(0.0, _first_num(cash.get("free_gbp"), cash.get("free"), default=0.0))
+        blocked_gbp = max(0.0, _first_num(cash.get("blocked_gbp"), cash.get("blocked"), default=0.0))
+        acc_cfg = acc_info.get("cfg") if isinstance(acc_info.get("cfg"), dict) else {}
+        topup_cash = min(free_gbp, max(0.0, _num(acc_cfg.get("reserve_topup_gbp"), 0.0)))
+        hh_excluded_cash += topup_cash
+        hh_cash += free_gbp - topup_cash + blocked_gbp
+    hh_holdings = [
+        {"account": p.get("account"), "ticker": p.get("ticker", ""), "value_gbp": p.get("value_gbp")}
+        for p in combined_analyses
+        if not is_earmarked(p.get("ticker", ""), earmarked_set)
+    ]
+    plans_given = account_plans is not None
+    household_mix = compute_household_mix(
+        hh_holdings, hh_cash, outside_rows, hh_excluded_cash,
+        sell_orders=sim_sells if plans_given else None,
+        buy_orders=sim_buys if plans_given else None,
+    )
+    # Shared same-day ledger: each account plan records the new money it allocated, so the next account's plan
+    # does not fill the same household shortfall twice (plans are built sequentially).
+    household_mix["ledger"] = {"core": 0.0, "satellite": 0.0, "gold": 0.0, "short_gilts": 0.0, "big_tech_gbp": 0.0}
+    big_tech = compute_big_tech_exposure(
+        hh_holdings, outside_rows, household_mix["basis_gbp"],
+        sell_orders=sim_sells if plans_given else None,
+        buy_orders=sim_buys if plans_given else None,
+    )
+
     return {
         "total_net_worth_gbp": total_net_worth_gbp,
         "total_invested_gbp": total_invested_gbp,
@@ -2718,6 +3163,8 @@ def build_consolidated_portfolio_view(
         "outside_unvested_gbp_total": round(outside_unvested_total, 2),
         "outside_single_name_weights": outside_single_name_weights,
         "post_trade_orders_simulated": {"sells": len(sim_sells), "buys": len(sim_buys)},
+        "household_mix": household_mix,
+        "big_tech": big_tech,
         "model_version": _model_version(),
     }
 
@@ -2739,6 +3186,8 @@ def build_rebalancing_plan(
     global_context: Optional[Dict[str, Any]] = None,
     official_total_gbp: Optional[float] = None,
     account_name: Optional[str] = None,
+    instrument_universe: Optional[List[Dict[str, Any]]] = None,
+    as_of: Optional[date] = None,
 ) -> Dict[str, Any]:
     """Builds an institutional 5-Year Horizon & Crash-Protected rebalancing plan with 100% harmonized table status, factoring in all pending transactions, blocked capital, and global unified portfolio context.
 
@@ -2748,6 +3197,15 @@ def build_rebalancing_plan(
     traded; outside holdings (account_name, or inferred from the analyses' 'account' tag) count towards cluster caps and
     single-name concentration only. If any held position has an invalid GBP valuation, data_degraded_reason is set and
     NO buy/sell orders are emitted.
+
+    Household allocation (config.ALLOCATION_CONFIG): deployable cash is split across the household buckets (core /
+    satellite / defensive) in proportion to their shortfall vs target (global_context['household_mix'], or this account
+    alone when absent). Core money buys the GBP-quoted core fund (VWRP.L), defensive money buys gold (SGLN.L) and/or
+    short gilts (IGLS.L), satellite money goes through the stock-selection pipeline, which applies the household
+    single-stock cap (satellite_max_single_pct) and the US big-tech cap. Unspent satellite money falls back to core.
+    Monthly cadence: buys only on the first London business day of the month (as_of, default today in London) unless
+    deployable cash >= off_cycle_min_deploy_gbp; sells and risk exits are never delayed. instrument_universe (e.g. the
+    watchlist scan collector) prices the core/defensive funds even when they failed the stock-picking gates.
     """
     degraded_reasons: List[str] = []
     if analyses is None:
@@ -3130,11 +3588,134 @@ def build_rebalancing_plan(
     reserve_funded_gbp = min(available_cash_gbp, reserve_floor_gbp)
     reserve_shortfall_gbp = max(0.0, reserve_floor_gbp - available_cash_gbp)
 
+    # 3b. Monthly buy cadence (sells / risk exits above are never delayed)
+    alloc_cfg = _allocation_cfg()
+    if as_of is None:
+        try:
+            as_of = config.london_date()
+        except Exception:  # pragma: no cover - config always provides london_date
+            as_of = datetime.now().date()
+    is_buy_day = as_of == first_london_business_day(as_of.year, as_of.month)
+    next_buy_day = as_of if is_buy_day else next_monthly_buy_day(as_of)
+    deployable_before_cadence = net_budget_to_deploy
+    off_cycle_min = alloc_cfg["off_cycle_min_deploy_gbp"]
+    buys_allowed = True
+    if data_degraded_reason:
+        cadence_note = "No buys today: data degraded."
+    elif net_budget_to_deploy <= 0:
+        cadence_note = (
+            f"No new money to invest: free cash (£{available_cash_gbp:,.0f}) is not at least £1,000 above the "
+            f"£{buffer_reserve:,.0f} protected reserve."
+        )
+    elif alloc_cfg["buy_cadence"] == "daily":
+        cadence_note = "Daily buy cadence: deploying new money."
+    elif is_buy_day:
+        cadence_note = "Monthly buy day: deploying new money."
+    elif net_budget_to_deploy >= off_cycle_min:
+        cadence_note = (
+            f"Off-cycle buy allowed: £{net_budget_to_deploy:,.0f} deployable is at least the £{off_cycle_min:,.0f} threshold."
+        )
+    else:
+        buys_allowed = False
+        cadence_note = (
+            f"Monthly buy cadence: £{net_budget_to_deploy:,.0f} deployable will be invested on the next buy day "
+            f"({next_buy_day.strftime('%a %d %b %Y')})."
+        )
+        net_budget_to_deploy = 0.0
+
+    # 3c. Household strategic allocation of today's new money (core / satellite / defensive)
+    hh_ctx = global_context.get("household_mix") if isinstance(global_context, dict) else None
+    if isinstance(hh_ctx, dict) and isinstance(hh_ctx.get("values_gbp"), dict) and _num(hh_ctx.get("basis_gbp"), 0.0) > 0:
+        household = hh_ctx
+        household_scope = "household"
+        big_tech_ctx = global_context.get("big_tech") if isinstance(global_context.get("big_tech"), dict) else None
+    else:
+        # No household view (e.g. a single-account call): this account plus its outside holdings is the household
+        local_rows = [
+            {"account": acc_name, "ticker": p.get("ticker", ""), "value_gbp": p.get("value_gbp")}
+            for p in analyses if not p.get("is_earmarked")
+        ]
+        household = compute_household_mix(local_rows, available_cash_gbp + blocked_cash_gbp, outside_rows)
+        household_scope = "account"
+        big_tech_ctx = compute_big_tech_exposure(local_rows, outside_rows, household["basis_gbp"])
+    hh_basis = max(0.0, _num(household.get("basis_gbp"), 0.0))
+    if not isinstance(big_tech_ctx, dict):
+        big_tech_ctx = {"basis_gbp": hh_basis, "exposure_gbp": 0.0, "exposure_pct": 0.0}
+    ledger = household.get("ledger")
+    if not isinstance(ledger, dict):
+        ledger = {"core": 0.0, "satellite": 0.0, "gold": 0.0, "short_gilts": 0.0, "big_tech_gbp": 0.0}
+        household["ledger"] = ledger
+    led = {k: max(0.0, _num(ledger.get(k), 0.0)) for k in ("core", "satellite", "gold", "short_gilts")}
+    hh_vals = household.get("values_gbp") or {}
+    hh_def = household.get("defensive_detail_gbp") or {}
+    # Effective household values for this plan: earlier account plans' allocations moved cash into their buckets, and
+    # this plan's own deployable cash is new money awaiting allocation (removed from the cash pile).
+    hh_gold_v = max(0.0, _num(hh_def.get("gold"), 0.0)) + led["gold"]
+    hh_cashlike_v = max(0.0, (
+        _num(hh_def.get("short_gilts"), 0.0) + _num(hh_def.get("money_market"), 0.0) + _num(hh_def.get("cash"), 0.0)
+        - led["core"] - led["satellite"] - led["gold"] - net_budget_to_deploy
+    ))
+    hh_eff_vals = {
+        BUCKET_CORE: max(0.0, _num(hh_vals.get(BUCKET_CORE), 0.0)) + led["core"],
+        BUCKET_SATELLITE: max(0.0, _num(hh_vals.get(BUCKET_SATELLITE), 0.0)) + led["satellite"],
+        BUCKET_DEFENSIVE: hh_gold_v + hh_cashlike_v,
+    }
+    bucket_budget = allocate_new_money(net_budget_to_deploy, hh_eff_vals, hh_basis, alloc_cfg["targets"], alloc_cfg["band_pp"])
+    min_ord_gbp = _rebalance_cfg_frac("min_order_gbp", 950.0)
+    if net_budget_to_deploy > 0:
+        # Slices below the minimum order size are merged into the largest slice (no token orders)
+        largest_bucket = max(BUCKETS, key=lambda b: bucket_budget[b])
+        for b in BUCKETS:
+            if b != largest_bucket and 0.0 < bucket_budget[b] < min_ord_gbp:
+                bucket_budget[largest_bucket] += bucket_budget[b]
+                bucket_budget[b] = 0.0
+    planned_bucket_budget = {b: round(bucket_budget[b], 2) for b in BUCKETS}
+
+    # US big-tech cap (household basis, fund look-through + vested outside shares). Instruments whose own big-tech
+    # weight is at or below the cap (e.g. VWRP ~22%, non-tech stocks 0%) are always allowed: a portfolio made only of
+    # them can never breach the cap. Heavier instruments (big-tech stocks, Nasdaq-100) only get the remaining headroom.
+    bt_cap = alloc_cfg["big_tech_cap_pct"]
+    bt_basis = max(0.0, _num(big_tech_ctx.get("basis_gbp"), hh_basis)) or hh_basis
+    bt_state = {"exposure": max(0.0, _num(big_tech_ctx.get("exposure_gbp"), 0.0)) + max(0.0, _num(ledger.get("big_tech_gbp"), 0.0))}
+
+    def _big_tech_room(t: str) -> float:
+        w = big_tech_weight(t)
+        if w <= bt_cap + 1e-9:
+            return float("inf")
+        return max(0.0, (bt_cap * bt_basis - bt_state["exposure"]) / w)
+
+    # Household single-stock cap for satellite buys (existing positions are never trimmed by it)
+    sat_single_cap = alloc_cfg["satellite_max_single_pct"]
+    hh_outside_rows = (
+        global_context.get("outside_holdings")
+        if household_scope == "household" and isinstance(global_context.get("outside_holdings"), list)
+        else outside_rows
+    )
+
+    def _household_value_of(t: str) -> float:
+        v = 0.0
+        if household_scope == "household" and isinstance(global_context.get("holdings"), dict):
+            for k, item in global_context["holdings"].items():
+                if isinstance(item, dict) and not item.get("is_earmarked") and tickers_match(k, t):
+                    v += max(0.0, _num(item.get("total_value_gbp"), 0.0))
+        else:
+            v += sum(
+                max(0.0, _num(p.get("value_gbp"), 0.0)) for p in analyses
+                if not p.get("is_earmarked") and tickers_match(p.get("ticker", ""), t)
+            )
+        v += sum(
+            max(0.0, _num(h.get("vested_gbp"), 0.0)) for h in (hh_outside_rows or [])
+            if isinstance(h, dict) and tickers_match(h.get("ticker", ""), t)
+        )
+        return v
+
+    def _satellite_single_room(t: str) -> float:
+        if classify_bucket(t) != BUCKET_SATELLITE or not _position_cap_applies(t) or any(k in _sym(t) for k in SECTOR_ETF_KEYS):
+            return float("inf")
+        return max(0.0, sat_single_cap * hh_basis - _household_value_of(t))
+
     # 4. Institutional 5-Year Horizon MPT, Sortino & Crash-Shield Scoring
     owned_account_tickers = {pos["ticker"] for pos in analyses}
-    owns_gold = any(any(g in t.upper() for g in ["SGLN", "IGLN", "GLD"]) for t in owned_account_tickers)
-    owns_brkb = any("BRK-B" in t.upper() for t in owned_account_tickers)
-    owns_vwrp = any("VWRP" in t.upper() for t in owned_account_tickers)
 
     # Check thematic cluster breakdown (both local account and global combined wealth)
     active_thematic_breakdown = global_context.get("thematic_breakdown", thematic_breakdown) if global_context else thematic_breakdown
@@ -3187,6 +3768,13 @@ def build_rebalancing_plan(
         # 2. Never add to 3x leveraged products or pure-play semiconductor ETFs
         if is_leveraged_etf(t) or "SMGB" in t.upper():
             continue
+        # 2b. Core / defensive funds are bought through their household buckets, never via stock selection
+        if classify_bucket(t) != BUCKET_SATELLITE:
+            continue
+        # 2c. USD-quoted London ETF lines with a GBP sister line never get adds (new money uses the GBP line: no FX fee)
+        if any(k in t.upper() for k in USD_LINE_ETF_KEYS):
+            logger.info("Skipping %s as add-on candidate: new money uses its GBP-quoted sister line (no FX fee).", t)
+            continue
         action = pos.get("action_short", "HOLD")
         if action in ["SELL", "TRIM"]:
             continue
@@ -3195,13 +3783,18 @@ def build_rebalancing_plan(
         w_local = _local_single_name_pct(pos)
         w_global = _global_single_name_pct(t, w_local)
 
-        # 3. Single-stock concentration cap: Once an individual company is >= 8% of portfolio, let it compound on its own
-        if (not is_broad_index) and (w_local >= 8.0 or w_global >= 8.0):
-            logger.info("Skipping %s as buy candidate: already full-sized position (%.1f%% local / %.1f%% global).", t, w_local, w_global)
+        # 3. Household single-stock cap (satellite_max_single_pct of household wealth, outside holdings included):
+        #    a full-sized position compounds on its own
+        if _satellite_single_room(t) < min_ord_gbp:
+            logger.info("Skipping %s as buy candidate: at/above the %.0f%% household single-stock cap.", t, sat_single_cap * 100.0)
             continue
         # 3b. Configured single-name cap (max_position_pct) for capped instruments
         if _position_cap_applies(t) and w_local >= pos_cap * 100.0:
             logger.info("Skipping %s as buy candidate: at/above the %.0f%% single-name cap.", t, pos_cap * 100.0)
+            continue
+        # 3c. US big-tech cap (household, fund look-through)
+        if _big_tech_room(t) < min_ord_gbp:
+            logger.info("Skipping %s as buy candidate: US big-tech exposure is at/above the %.0f%% cap.", t, bt_cap * 100.0)
             continue
 
         # 4. Sector saturation cap: Do not add to sectors already >= max_cluster_pct of portfolio (e.g. Semiconductors / Cloud Software)
@@ -3220,11 +3813,13 @@ def build_rebalancing_plan(
         if action == "BUY" or (is_stage_2 and not is_ext and (_num(pos.get("conviction_score"), 0) >= 70 or is_broad_index)):
             eligible_existing_holdings.append(pos)
 
-    # Filter out already-owned tickers BEFORE slicing so unowned Crash-Shield anchors (SGLN.L, BRK-B, VWRP.L, ABBV) are never truncated
+    # Filter out already-owned tickers BEFORE slicing so unowned satellite ideas are never truncated by owned ones
     unowned_opportunities = [
         opp for opp in new_opportunities
         if opp["ticker"] not in owned_account_tickers
         and not any(tickers_match(opp["ticker"], ot) for ot in owned_account_tickers)
+        and classify_bucket(opp["ticker"]) == BUCKET_SATELLITE
+        and not any(k in str(opp["ticker"]).upper() for k in USD_LINE_ETF_KEYS)
     ]
     top_new_ideas = unowned_opportunities[:max_new_ideas * 6]
 
@@ -3259,13 +3854,16 @@ def build_rebalancing_plan(
             continue
         if t in seen_tickers:
             continue
+        # Household single-stock cap and US big-tech cap (household basis)
+        if _satellite_single_room(t) < min_ord_gbp:
+            logger.info("Watchlist ticker %s skipped: at/above the %.0f%% household single-stock cap.", t, sat_single_cap * 100.0)
+            continue
+        if _big_tech_room(t) < min_ord_gbp:
+            logger.info("Watchlist ticker %s skipped: US big-tech exposure is at/above the %.0f%% cap.", t, bt_cap * 100.0)
+            continue
 
         base_conv = opp.get("conviction_score", 70)
-        gw = _global_single_name_pct(t, 0.0)
-
-        if (not is_broad_index) and gw >= 8.0:
-            continue
-        elif is_broad_index:
+        if is_broad_index:
             opp["rebalance_score"] = base_conv + 10  # Prioritise core index & crisis-shield foundations when unowned
         else:
             opp["rebalance_score"] = base_conv + 6
@@ -3428,29 +4026,15 @@ def build_rebalancing_plan(
         elif crash_22 <= -45.0:
             cand["rebalance_score"] -= 10
 
-        # 7h. Uncorrelated Crisis-Shield & All-Weather Portfolio Completion Boost
-        min_pass = _num(cand.get("minervini_pass"), 4)
+        # 7h. ETF data equivalence (satellite funds such as sector / Nasdaq-100 ETFs do not report single-stock
+        #     Piotroski / ROIC / EPS revisions). Core and defensive funds are bought through their household buckets,
+        #     so the old 'establish VWRP / gold / BRK-B' boosts no longer apply here.
         c_rsi = _num(cand.get("rsi"), 50.0)
         is_etf_cand = bool(c_research.get("is_etf")) and not is_lev_cand
         if is_etf_cand:
-            # Benchmark Quality Equivalence: Unleveraged index ETFs do not report single-stock Piotroski/ROIC/EPS-revisions
             cand["rebalance_score"] += 22
-        if "VWRP" in c_ticker_u and not owns_vwrp:
-            cand["rebalance_score"] += 16  # Establish All-World equity core
-        elif "BRK-B" in c_ticker_u and not owns_brkb and min_pass >= 3:
-            cand["rebalance_score"] += 14  # Establish $300B+ Cash Fortress ballast
-        elif any(g in c_ticker_u for g in ["SGLN", "IGLN", "GLD"]) and not owns_gold and (min_pass >= 3 or c_rsi <= 45.0):
-            cand["rebalance_score"] += 14  # Establish -0.03 beta Physical Gold crisis shield
 
-        # 7i. Forward 5-Year Intrinsic Compounding Engine (ROIC Reinvestment + FCF Yield + Multiple Normalization)
-        exp_cagr = _first_num(
-            cand.get("expected_5y_cagr_pct"),
-            c_research.get("expected_5y_cagr_pct"),
-            cand.get("cagr_5y_pct"),
-            default=14.0,
-        )
-        cagr_boost = int(round(max(-12.0, min(18.0, (exp_cagr - 12.0) * 1.5))))
-        cand["rebalance_score"] += cagr_boost
+        # 7i. The forward 5Y CAGR model estimate is display-only (owner decision 2026-10-19): no score boost or penalty.
 
         # 7j. Institutional Pullback-to-Value Timing Bonus (Buy wide-moat leaders on dips, don't chase spikes)
         if cand.get("is_weekly_stage_2", False):
@@ -3468,18 +4052,22 @@ def build_rebalancing_plan(
 
     scored_candidates.sort(key=lambda x: x.get("rebalance_score", 0), reverse=True)
 
-    # 5. Asset-Class Aware Capital Allocation (Fractional Kelly Edge/Downside-Risk Sizing with Cross-Cluster Diversity)
-    buy_orders = []
-    min_ord_gbp = _rebalance_cfg_frac("min_order_gbp", 950.0)
-    effective_floor_gbp = max(min_ord_gbp, 950.0 if net_budget_to_deploy >= 3000.0 else min_ord_gbp)
-    max_feasible_orders = int(net_budget_to_deploy // effective_floor_gbp) if effective_floor_gbp > 0 else 0
+    # 5. Capital allocation. Satellite slice: stock selection with fractional-Kelly sizing and cross-cluster diversity;
+    #    core / defensive slices: the GBP-quoted bucket funds (5c / 5d below).
+    buy_orders: List[Dict[str, Any]] = []
+    sat_budget = bucket_budget[BUCKET_SATELLITE] if buys_allowed else 0.0
+    selected_candidates: List[Dict[str, Any]] = []
+    candidate_weights: Dict[str, float] = {}
+    allocated_amounts: Dict[str, float] = {}
+    effective_floor_gbp = max(min_ord_gbp, 950.0 if sat_budget >= 3000.0 else min_ord_gbp)
+    max_feasible_orders = int(sat_budget // effective_floor_gbp) if effective_floor_gbp > 0 else 0
     target_count = min(
         len(scored_candidates),
         max_feasible_orders,
-        4 if net_budget_to_deploy > 7500 else (3 if net_budget_to_deploy >= 3100 else 2)
+        4 if sat_budget > 7500 else (3 if sat_budget >= 3100 else 2)
     )
 
-    if scored_candidates and target_count >= 1 and net_budget_to_deploy >= effective_floor_gbp:
+    if scored_candidates and target_count >= 1 and sat_budget >= effective_floor_gbp:
         # Select top candidates while enforcing cross-cluster diversity so we don't double-up on the same sector in one batch,
         # and never more than max_new_ideas_to_buy brand-new positions per plan (remaining slots may go to adds)
         selected_candidates = []
@@ -3514,73 +4102,31 @@ def build_rebalancing_plan(
                 if is_new_c:
                     new_count += 1
 
-        # All-Weather Crash-Shield Completion Rule:
-        # If an account lacks VWRP.L or has < target_crash_shield_pct invested in Crash Shield assets (investable basis,
-        # earmarked funds excluded), ensure at least 1 slot builds a low-beta Crash Shield anchor
-        curr_invested_shield_gbp = sum(
-            max(0.0, _num(p.get("value_gbp"), 0.0))
-            for p in analyses
-            if p.get("is_crash_shield") and not p.get("is_earmarked")
-        )
-        curr_invested_shield_pct = (curr_invested_shield_gbp / max(1.0, investable_total_gbp)) * 100.0
-        has_shield_in_selected = any(
-            c.get("is_crash_shield") or "VWRP" in c.get("ticker", "").upper()
-            for c in selected_candidates
-        )
-        if target_count >= 2 and selected_candidates and (not owns_vwrp or curr_invested_shield_pct < shield_target_pct) and not has_shield_in_selected:
-            selected_tickers = {c["ticker"] for c in selected_candidates}
-            best_shield_cand = next(
-                (
-                    c for c in scored_candidates
-                    if (c.get("is_crash_shield") or "VWRP" in c.get("ticker", "").upper())
-                    and _num(c.get("minervini_pass"), 0) >= 3
-                    and c["ticker"] not in selected_tickers
-                ),
-                None,
-            )
-            if best_shield_cand is not None:
-                replace_idx: Optional[int] = len(selected_candidates) - 1
-                if (
-                    best_shield_cand.get("is_new_addition")
-                    and not selected_candidates[replace_idx].get("is_new_addition")
-                    and new_count >= max_new_ideas
-                ):
-                    # Swap out the lowest-ranked NEW idea instead, so the new-idea cap still holds
-                    new_idxs = [i for i, c in enumerate(selected_candidates) if c.get("is_new_addition")]
-                    replace_idx = new_idxs[-1] if new_idxs else None
-                if replace_idx is not None:
-                    selected_candidates[replace_idx] = best_shield_cand
+        # (The old 'crash-shield completion' slot swap is gone: crash protection is now the defensive bucket's job.)
 
-        # Fractional Kelly Conviction + Expected 5Y Compounding Edge over Downside Volatility:
-        candidate_weights = {}
+        # Conviction over downside volatility (fractional-Kelly style). The forward 5Y CAGR estimate no longer scales sizes.
         for cand in selected_candidates:
             c_t = cand["ticker"]
             vcp = _num(cand.get("vcp_pct"), None)
             if vcp is None or vcp <= 0:
                 vcp = 2.0
-            vol_risk = max(1.2, float(vcp) * (0.85 if cand.get("is_crash_shield") else 1.0))
+            vol_risk = max(1.2, float(vcp))
             score_factor = max(15.0, float(cand.get("rebalance_score", 50)))
-            exp_c = _first_num(
-                cand.get("expected_5y_cagr_pct"),
-                (cand.get("research") or {}).get("expected_5y_cagr_pct"),
-                cand.get("cagr_5y_pct"),
-                default=14.0,
-            )
-            edge_mult = max(0.85, min(1.65, (exp_c - 3.8) / 10.0))
-            candidate_weights[c_t] = (score_factor * edge_mult) / vol_risk
+            candidate_weights[c_t] = score_factor / vol_risk
 
         total_w = sum(candidate_weights.values()) or 1.0
         # Guarantee every selected candidate meets effective_floor_gbp and distribute surplus by Kelly-adjusted weight
         base_floor_total = len(selected_candidates) * effective_floor_gbp
-        surplus_budget = max(0.0, net_budget_to_deploy - base_floor_total)
+        surplus_budget = max(0.0, sat_budget - base_floor_total)
         raw_allocations = {
             cand["ticker"]: effective_floor_gbp + ((candidate_weights[cand["ticker"]] / total_w) * surplus_budget)
             for cand in selected_candidates
         }
 
         # Single-name cap on the POST-TRADE weight for capped instruments (single stocks and sector ETFs; broad index
-        # ETFs / gold / money-market exempt unless cap_applies_to_broad_etfs). Leveraged ETFs are never bought.
-        # Capital above a cap spills over to candidates that still have room; anything left stays in cash.
+        # ETFs / gold / money-market exempt unless cap_applies_to_broad_etfs), and the household single-stock cap
+        # (satellite_max_single_pct). Leveraged ETFs are never bought. The big-tech cap is applied as orders are placed.
+        # Capital above a cap spills over to candidates that still have room; anything left goes to core/defensive.
         room_by_ticker: Dict[str, float] = {}
         for candidate in selected_candidates:
             c_ticker = candidate["ticker"]
@@ -3590,6 +4136,7 @@ def build_rebalancing_plan(
                 room_by_ticker[c_ticker] = max(0.0, pos_cap * (investable_total_gbp + o_c) - existing_val - o_c)
             else:
                 room_by_ticker[c_ticker] = float("inf")
+            room_by_ticker[c_ticker] = min(room_by_ticker[c_ticker], _satellite_single_room(c_ticker))
 
         allocated_amounts = {t: min(raw_allocations[t], room_by_ticker[t]) for t in raw_allocations}
         spillover_capital = sum(raw_allocations[t] - allocated_amounts[t] for t in raw_allocations)
@@ -3608,117 +4155,296 @@ def build_rebalancing_plan(
                 leftover += extra - take
             spillover_capital = leftover
 
-        for candidate in selected_candidates:
-            c_ticker = candidate["ticker"]
-            alloc_gbp = allocated_amounts.get(c_ticker, 0.0)
-            if alloc_gbp < min_ord_gbp * 0.95:
-                continue
+    # Every buy order (satellite, core, defensive) is built by one helper so all orders carry the same fields
+    def _make_buy_order(
+        candidate: Dict[str, Any], alloc_gbp: float, bucket: str, reason: Optional[str] = None,
+        instrument_why: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        c_ticker = candidate["ticker"]
+        if alloc_gbp < min_ord_gbp * 0.95:
+            return None
+        p_gbp = _num(candidate.get("price_gbp"), 0.0)
+        if p_gbp <= 0:
+            return None
 
-            p_gbp = _num(candidate.get("price_gbp"), 0.0)
-            if p_gbp <= 0:
-                continue
+        # Fractional shares rounded DOWN to 4 decimals so an order never exceeds its allocation or cap room
+        shares = math.floor((alloc_gbp / p_gbp) * 10000.0) / 10000.0
+        if shares <= 0:
+            return None
 
-            # Fractional shares rounded DOWN to 4 decimals so an order never exceeds its allocation or cap room
-            shares = math.floor((alloc_gbp / p_gbp) * 10000.0) / 10000.0
-            if shares <= 0:
-                continue
-
-            order_val_gbp = shares * p_gbp
-            sym = candidate.get("search_symbol", c_ticker)
-            name = candidate.get("name", c_ticker)
+        order_val_gbp = shares * p_gbp
+        sym = candidate.get("search_symbol") or clean_search_symbol(c_ticker)
+        name = candidate.get("name", c_ticker)
+        held_here = any(
+            tickers_match(p.get("ticker", ""), c_ticker) and _num(p.get("quantity"), 0.0) > 0 for p in analyses
+        )
+        if bucket == BUCKET_SATELLITE:
             is_new = bool(candidate.get("is_new_addition", False))
-            c_research = candidate.get("research") or {}
-            cagr_5y = _num(candidate.get("cagr_5y_pct"), MISSING_METRIC_DEFAULTS["cagr_5y_pct"])
-            exp_cagr_5y = _first_num(
-                candidate.get("expected_5y_cagr_pct"),
-                c_research.get("expected_5y_cagr_pct"),
-                default=cagr_5y,
-            )
-            fwd_capped = candidate.get("expected_5y_cagr_capped", c_research.get("expected_5y_cagr_capped"))
-            val_regime = (
-                candidate.get("valuation_regime_label")
-                or c_research.get("valuation_regime_label")
-                or "🟢 Fair GARP Valuation"
-            )
-            # Metrics travel with the order; anything missing uses the conservative sentinels (never optimistic)
-            sort_5y = _num(candidate.get("sortino_5y"), MISSING_METRIC_DEFAULTS["sortino_5y"])
-            crash_22 = _num(candidate.get("crash_2022_ret_pct"), MISSING_METRIC_DEFAULTS["crash_2022_ret_pct"])
-            beta_5y = _num(candidate.get("beta_5y"), MISSING_METRIC_DEFAULTS["beta_5y"])
-            corr_5y = _num(candidate.get("corr_5y"), MISSING_METRIC_DEFAULTS["corr_5y"])
-            role_lbl = candidate.get("crash_role_label", "🛡️ 5Y Compounder")
-            rr_val = _num(candidate.get("risk_reward_ratio"), None)
+        else:
+            is_new = not held_here
+        c_research = candidate.get("research") or {}
+        cagr_5y = _num(candidate.get("cagr_5y_pct"), MISSING_METRIC_DEFAULTS["cagr_5y_pct"])
+        exp_cagr_5y = _first_num(
+            candidate.get("expected_5y_cagr_pct"),
+            c_research.get("expected_5y_cagr_pct"),
+            default=cagr_5y,
+        )
+        fwd_capped = candidate.get("expected_5y_cagr_capped", c_research.get("expected_5y_cagr_capped"))
+        val_regime = (
+            candidate.get("valuation_regime_label")
+            or c_research.get("valuation_regime_label")
+            or "🟢 Fair GARP Valuation"
+        )
+        # Metrics travel with the order; anything missing uses the conservative sentinels (never optimistic)
+        sort_5y = _num(candidate.get("sortino_5y"), MISSING_METRIC_DEFAULTS["sortino_5y"])
+        crash_22 = _num(candidate.get("crash_2022_ret_pct"), MISSING_METRIC_DEFAULTS["crash_2022_ret_pct"])
+        beta_5y = _num(candidate.get("beta_5y"), MISSING_METRIC_DEFAULTS["beta_5y"])
+        corr_5y = _num(candidate.get("corr_5y"), MISSING_METRIC_DEFAULTS["corr_5y"])
+        role_lbl = candidate.get("crash_role_label", "🛡️ 5Y Compounder")
+        rr_val = _num(candidate.get("risk_reward_ratio"), None)
 
-            type_label = "NEW SHARE" if is_new else "ADD TO POSITION"
+        type_label = "NEW SHARE" if is_new else "ADD TO POSITION"
+        if bucket == BUCKET_SATELLITE:
             crash_note = (
-                f"+{crash_22:.1f}% positive crisis alpha in 2022 crash"
+                f"{crash_22:+.1f}% in the 2022 sell-off"
                 if crash_22 >= 0.0
                 else f"Beta {beta_5y:.2f} ({val_regime})"
             )
-            order = {
-                "ticker": c_ticker,
-                "search_symbol": sym,
-                "name": name,
-                "theme": candidate.get("theme", "Core Compounder"),
-                "macro_cluster": candidate.get("macro_cluster", "Technology"),
-                "action": f"BUY ({type_label})",
-                "is_new": is_new,
-                "shares": shares,
-                "price": candidate.get("price", 0.0),
-                "currency": candidate.get("currency", "USD"),
-                "estimated_gbp": order_val_gbp,
-                "stop_price": candidate.get("trailing_stop", 0.0),
-                "target_price": candidate.get("target_price", 0.0),
-                "risk_reward_ratio": rr_val,
-                "cagr_5y_pct": cagr_5y,
-                "expected_5y_cagr_pct": exp_cagr_5y,
-                "expected_5y_cagr_capped": fwd_capped,
-                "valuation_regime_label": val_regime,
-                "sortino_5y": sort_5y,
-                "crash_2022_ret_pct": crash_22,
-                "beta_5y": beta_5y,
-                "corr_5y": corr_5y,
-                "crash_role_label": role_lbl,
-                "is_crash_shield": bool(candidate.get("is_crash_shield")),
-                "piotroski_score": candidate.get("piotroski_score"),
-                "altman_z": candidate.get("altman_z"),
-                "altman_label": candidate.get("altman_label", "N/A"),
-                "sloan_accrual": candidate.get("sloan_accrual"),
-                "sloan_label": candidate.get("sloan_label", "N/A"),
-                "weekly_trend_label": candidate.get("weekly_trend_label") or "Weekly trend n/a",
-                "eps_revision_label": candidate.get("eps_revision_label") or c_research.get("eps_revision_label", "Neutral Consensus"),
-                "eps_revision_momentum_pct": candidate.get("eps_revision_momentum_pct") or c_research.get("eps_revision_momentum_pct"),
-                "minervini_stage": candidate.get("minervini_stage", DATA_UNAVAILABLE_LABEL),
-                "volume_footprint_label": candidate.get("volume_footprint_label", "Constructive Volume"),
-                "rs_label": candidate.get("rs_label", "Benchmark Neutral"),
-                "chandelier_stop": candidate.get("chandelier_stop", candidate.get("trailing_stop")),
-                "earnings_catalyst_status": candidate.get("earnings_catalyst_status", "✅ Clear"),
-                "plain_english_why": (
-                    f"{role_lbl} ({candidate.get('theme', 'Secular Growth')}): {_fmt_fwd_cagr(exp_cagr_5y, fwd_capped)} Forward 5Y Expected CAGR ({cagr_5y:+.1f}% Hist 5Y), "
-                    f"{sort_5y:.2f} Sortino, RSI {_num(candidate.get('rsi'), 50.0):.1f}, {crash_note}. "
-                    + (
-                        f"Initiating high-conviction position to compound 5-year wealth in {candidate.get('macro_cluster', 'all-weather')}."
-                        if is_new
-                        else (
-                            f"Scaling into under-weighted 5-year compounder ({_num(candidate.get('portfolio_weight_pct'), 0.0):.1f}% current weight)"
-                            + (
-                                " at pullback support"
-                                if _num(candidate.get("pct_vs_30w"), _num((candidate.get("weekly_trend") or {}).get("pct_vs_30w"), 99.0)) <= 6.0
-                                else ""
-                            )
-                            + f" with R:R {_fmt_rr(rr_val)}."
+            why = (
+                f"{role_lbl} ({candidate.get('theme', 'Secular Growth')}): {cagr_5y:+.1f}% historical 5Y CAGR, "
+                f"{sort_5y:.2f} Sortino, RSI {_num(candidate.get('rsi'), 50.0):.1f}, {crash_note}. "
+                + (
+                    f"Starting a satellite position in {candidate.get('macro_cluster', 'a new sector')}."
+                    if is_new
+                    else (
+                        f"Adding to an under-weighted satellite ({_num(candidate.get('portfolio_weight_pct'), 0.0):.1f}% of this account)"
+                        + (
+                            " at pullback support"
+                            if _num(candidate.get("pct_vs_30w"), _num((candidate.get("weekly_trend") or {}).get("pct_vs_30w"), 99.0)) <= 6.0
+                            else ""
                         )
+                        + f" with R:R {_fmt_rr(rr_val)}."
                     )
-                ),
-                "app_instruction": f"Open Trading 212 ➔ Search '{sym}' ➔ Tap Buy ➔ Enter £{order_val_gbp:,.0f}",
-                "conviction_score": candidate.get("conviction_score", 70),
-                "rebalance_score": candidate.get("rebalance_score", 75),
-                "research": c_research,
-                "badge_color": "#10b981",
-                "data_ok": True,
-            }
-            if acc_name:
-                order["account"] = acc_name
+                )
+                + f" Model forward 5Y estimate {_fmt_fwd_cagr(exp_cagr_5y, fwd_capped)} (info only, not used for sizing)."
+            )
+        else:
+            why = instrument_why or reason or f"{BUCKET_LABELS.get(bucket, bucket)} purchase."
+        order = {
+            "ticker": c_ticker,
+            "search_symbol": sym,
+            "name": name,
+            "theme": candidate.get("theme", "Core Compounder"),
+            "macro_cluster": candidate.get("macro_cluster") or c_research.get("macro_cluster") or "Technology",
+            "action": f"BUY ({type_label})",
+            "is_new": is_new,
+            "shares": shares,
+            "price": candidate.get("price", 0.0),
+            "currency": candidate.get("currency", "USD"),
+            "estimated_gbp": order_val_gbp,
+            "stop_price": candidate.get("trailing_stop", 0.0),
+            "target_price": candidate.get("target_price", 0.0),
+            "risk_reward_ratio": rr_val,
+            "cagr_5y_pct": cagr_5y,
+            "expected_5y_cagr_pct": exp_cagr_5y,
+            "expected_5y_cagr_capped": fwd_capped,
+            "valuation_regime_label": val_regime,
+            "sortino_5y": sort_5y,
+            "crash_2022_ret_pct": crash_22,
+            "beta_5y": beta_5y,
+            "corr_5y": corr_5y,
+            "crash_role_label": role_lbl,
+            "is_crash_shield": is_crash_shield_asset(c_ticker),
+            "piotroski_score": candidate.get("piotroski_score"),
+            "altman_z": candidate.get("altman_z"),
+            "altman_label": candidate.get("altman_label", "N/A"),
+            "sloan_accrual": candidate.get("sloan_accrual"),
+            "sloan_label": candidate.get("sloan_label", "N/A"),
+            "weekly_trend_label": candidate.get("weekly_trend_label") or "Weekly trend n/a",
+            "eps_revision_label": candidate.get("eps_revision_label") or c_research.get("eps_revision_label", "Neutral Consensus"),
+            "eps_revision_momentum_pct": candidate.get("eps_revision_momentum_pct") or c_research.get("eps_revision_momentum_pct"),
+            "minervini_stage": candidate.get("minervini_stage", DATA_UNAVAILABLE_LABEL),
+            "volume_footprint_label": candidate.get("volume_footprint_label", "Constructive Volume"),
+            "rs_label": candidate.get("rs_label", "Benchmark Neutral"),
+            "chandelier_stop": candidate.get("chandelier_stop", candidate.get("trailing_stop")),
+            "earnings_catalyst_status": candidate.get("earnings_catalyst_status", "✅ Clear"),
+            "plain_english_why": why,
+            "app_instruction": f"Open Trading 212 ➔ Search '{sym}' ➔ Tap Buy ➔ Enter £{order_val_gbp:,.0f}",
+            "conviction_score": candidate.get("conviction_score", 70),
+            "rebalance_score": candidate.get("rebalance_score", 75),
+            "research": c_research,
+            "badge_color": "#10b981",
+            "data_ok": True,
+            "bucket": bucket,
+            "allocation_reason": reason,
+            "big_tech_weight": round(big_tech_weight(c_ticker), 3),
+        }
+        if acc_name:
+            order["account"] = acc_name
+        # Running household big-tech exposure (later candidates in this plan see the reduced headroom)
+        bt_state["exposure"] += big_tech_weight(c_ticker) * order_val_gbp
+        return order
+
+    hh_rows = {r.get("bucket"): r for r in (household.get("buckets") or []) if isinstance(r, dict)}
+    core_row = hh_rows.get(BUCKET_CORE) or {}
+    sat_row = hh_rows.get(BUCKET_SATELLITE) or {}
+    def_row = hh_rows.get(BUCKET_DEFENSIVE) or {}
+    targets_cfg = alloc_cfg["targets"]
+
+    # 5a. Satellite orders (stock selection), in ranking order; big-tech headroom is consumed as orders are placed
+    sat_reason = (
+        f"Satellite slice of today's new money (satellites {_num(sat_row.get('current_pct'), 0.0):.0f}% of household "
+        f"wealth vs a {_num(sat_row.get('target_pct'), targets_cfg[BUCKET_SATELLITE] * 100.0):.0f}% target)."
+    )
+    for candidate in selected_candidates:
+        c_ticker = candidate["ticker"]
+        alloc_gbp = min(allocated_amounts.get(c_ticker, 0.0), _big_tech_room(c_ticker))
+        order = _make_buy_order(candidate, alloc_gbp, BUCKET_SATELLITE, sat_reason)
+        if order is not None:
             buy_orders.append(order)
+
+    # 5b. Satellite money that found no eligible stock goes to core / defensive (by remaining shortfall, else core)
+    core_budget = bucket_budget[BUCKET_CORE] if buys_allowed else 0.0
+    def_budget = bucket_budget[BUCKET_DEFENSIVE] if buys_allowed else 0.0
+    sat_spent = sum(o["estimated_gbp"] for o in buy_orders if o.get("bucket") == BUCKET_SATELLITE)
+    sat_unspent = max(0.0, sat_budget - sat_spent)
+    if buys_allowed and sat_unspent > 0.01:
+        rem_core = max(0.0, targets_cfg[BUCKET_CORE] * hh_basis - (hh_eff_vals[BUCKET_CORE] + core_budget))
+        rem_def = max(0.0, targets_cfg[BUCKET_DEFENSIVE] * hh_basis - (hh_eff_vals[BUCKET_DEFENSIVE] + def_budget))
+        if rem_core + rem_def > 0.01:
+            core_budget += sat_unspent * rem_core / (rem_core + rem_def)
+            def_budget += sat_unspent * rem_def / (rem_core + rem_def)
+        elif targets_cfg[BUCKET_CORE] > 0:
+            core_budget += sat_unspent
+        if 0.0 < def_budget < min_ord_gbp and core_budget >= def_budget:
+            core_budget, def_budget = core_budget + def_budget, 0.0
+        elif 0.0 < core_budget < min_ord_gbp and def_budget > core_budget:
+            core_budget, def_budget = 0.0, def_budget + core_budget
+
+    def _instrument_quote(t: str) -> Optional[Dict[str, Any]]:
+        """Priced analysis for a bucket fund: this account's holding, else the watchlist scan, else new ideas."""
+        for src in (analyses, instrument_universe or [], new_opportunities):
+            for a in src or []:
+                if not isinstance(a, dict) or a.get("is_earmarked") or not tickers_match(a.get("ticker", ""), t):
+                    continue
+                if _num(a.get("price_gbp"), 0.0) > 0 and a.get("valuation_ok", True) is not False:
+                    return a
+        return None
+
+    def _bucket_block_reason(t: str) -> Optional[str]:
+        if t in EXCLUDED_TICKERS or is_earmarked(t, earmarked_set):
+            return "it is excluded or earmarked"
+        if any(tickers_match(k, t) for k in pending_buys):
+            return "a buy order for it is already pending in Trading 212"
+        if any(tickers_match(k, t) for k in pending_sells):
+            return "a sell order for it is pending in Trading 212"
+        if any(tickers_match(s.get("ticker", ""), t) for s in sell_orders if not s.get("is_pending")):
+            return "today's plan sells it"
+        if _instrument_quote(t) is None:
+            return "no valid GBP price is available today"
+        return None
+
+    bucket_notes: List[str] = []
+
+    def _place_bucket_order(t: str, amount: float, bucket: str, reason: str, instrument_why: str) -> None:
+        if amount < min_ord_gbp * 0.95:
+            return
+        blocked = _bucket_block_reason(t)
+        if blocked:
+            bucket_notes.append(f"{t} not bought because {blocked}; £{amount:,.0f} stays in cash for now.")
+            return
+        cand = dict(_instrument_quote(t) or {})
+        cand["ticker"] = cand.get("ticker") or t
+        order = _make_buy_order(cand, amount, bucket, reason, instrument_why)
+        if order is not None:
+            buy_orders.append(order)
+
+    # 5c. Core order: the GBP-quoted global index fund
+    core_t = alloc_cfg["core_buy_ticker"]
+    _place_bucket_order(
+        core_t, core_budget, BUCKET_CORE,
+        f"Core global index is {_num(core_row.get('current_pct'), 0.0):.0f}% of household wealth vs a "
+        f"{_num(core_row.get('target_pct'), targets_cfg[BUCKET_CORE] * 100.0):.0f}% target, so new money goes here.",
+        f"{core_t} is GBP-quoted (no FX fee) and spreads the money across thousands of companies worldwide.",
+    )
+
+    # 5d. Defensive orders: physical gold and/or short gilts, split by which half of the sleeve is further below target
+    gold_t, gilt_t = alloc_cfg["gold_buy_ticker"], alloc_cfg["short_gilt_buy_ticker"]
+    if def_budget >= min_ord_gbp * 0.95:
+        gold_share = alloc_cfg["defensive_gold_share"]
+        def_target_gbp = targets_cfg[BUCKET_DEFENSIVE] * hh_basis
+        gold_gap = max(0.0, gold_share * def_target_gbp - hh_gold_v)
+        gilt_gap = max(0.0, (1.0 - gold_share) * def_target_gbp - hh_cashlike_v)
+        gold_amt = def_budget * (gold_gap / (gold_gap + gilt_gap) if gold_gap + gilt_gap > 0.01 else gold_share)
+        gilt_amt = def_budget - gold_amt
+        # Route everything to the fund that can actually be bought today
+        gold_ok, gilt_ok = _bucket_block_reason(gold_t) is None, _bucket_block_reason(gilt_t) is None
+        if not gold_ok and gilt_ok:
+            gold_amt, gilt_amt = 0.0, def_budget
+        elif not gilt_ok and gold_ok:
+            gold_amt, gilt_amt = def_budget, 0.0
+        # No token orders: a slice below the minimum joins the other one
+        if 0.0 < gold_amt < min_ord_gbp and gilt_amt >= gold_amt:
+            gold_amt, gilt_amt = 0.0, gilt_amt + gold_amt
+        elif 0.0 < gilt_amt < min_ord_gbp and gold_amt > gilt_amt:
+            gold_amt, gilt_amt = gold_amt + gilt_amt, 0.0
+        def_reason = (
+            f"Defensive sleeve (cash, money-market funds, gold and short gilts) is "
+            f"{_num(def_row.get('current_pct'), 0.0):.0f}% of household wealth vs a "
+            f"{_num(def_row.get('target_pct'), targets_cfg[BUCKET_DEFENSIVE] * 100.0):.0f}% target."
+        )
+        _place_bucket_order(
+            gold_t, gold_amt, BUCKET_DEFENSIVE, def_reason,
+            f"{gold_t} is physical gold in GBP (no FX fee); historically it has moved largely independently of shares.",
+        )
+        _place_bucket_order(
+            gilt_t, gilt_amt, BUCKET_DEFENSIVE, def_reason,
+            f"{gilt_t} holds short-dated UK government bonds in GBP: low volatility and a yield close to Bank of England rates.",
+        )
+
+    # 5e. Record today's allocations in the shared household ledger (read by the next account's plan)
+    for o in buy_orders:
+        amt = max(0.0, _num(o.get("estimated_gbp"), 0.0))
+        b = o.get("bucket")
+        if b == BUCKET_CORE:
+            ledger["core"] = _num(ledger.get("core"), 0.0) + amt
+        elif b == BUCKET_SATELLITE:
+            ledger["satellite"] = _num(ledger.get("satellite"), 0.0) + amt
+        elif b == BUCKET_DEFENSIVE:
+            key = "gold" if is_gold_etc(o.get("ticker", "")) else "short_gilts"
+            ledger[key] = _num(ledger.get(key), 0.0) + amt
+        ledger["big_tech_gbp"] = _num(ledger.get("big_tech_gbp"), 0.0) + big_tech_weight(o.get("ticker", "")) * amt
+
+    alloc_notes: List[str] = []
+    if deployable_before_cadence > 0 and not data_degraded_reason:
+        if planned_bucket_budget[BUCKET_SATELLITE] <= 0 and _num(sat_row.get("current_pct"), 0.0) >= _num(sat_row.get("target_pct"), 100.0):
+            alloc_notes.append(
+                f"Satellites are {_num(sat_row.get('current_pct'), 0.0):.0f}% of household wealth vs a "
+                f"{_num(sat_row.get('target_pct'), 0.0):.0f}% target: no new single-stock buys; new money goes to the "
+                f"parts of the mix that are below target."
+            )
+        bt_pct_now = _num(big_tech_ctx.get("exposure_pct"), 0.0)
+        if bt_pct_now > bt_cap * 100.0:
+            alloc_notes.append(
+                f"US big tech is {bt_pct_now:.0f}% of household wealth vs the {bt_cap * 100.0:.0f}% cap: no buys of "
+                f"big-tech stocks or tech-heavy funds (fund look-through and outside shares included)."
+            )
+    alloc_notes.extend(bucket_notes)
+    household_allocation = {
+        "scope": household_scope,
+        "buys_allowed": buys_allowed,
+        "cadence": alloc_cfg["buy_cadence"],
+        "is_buy_day": is_buy_day,
+        "next_buy_day": next_buy_day.isoformat(),
+        "cadence_note": cadence_note,
+        "deployable_gbp": round(deployable_before_cadence, 2),
+        "by_bucket_gbp": planned_bucket_budget,
+        "ordered_by_bucket_gbp": {
+            b: round(sum(o["estimated_gbp"] for o in buy_orders if o.get("bucket") == b), 2) for b in BUCKETS
+        },
+        "notes": alloc_notes,
+        "mix_summary": household.get("summary"),
+    }
 
     # 6. Single Source of Truth: Synchronize Every Holding with Planned & Pending Action
     sold_dict = {s["ticker"]: s for s in sell_orders if not s.get("is_pending")}
@@ -3776,10 +4502,10 @@ def build_rebalancing_plan(
                 pos["plan_summary"] = f"Liquidating all {_fmt_shares(pos.get('quantity', 0.0))} shares (+£{so['estimated_gbp']:,.0f} cash unlocked). {exit_txt}"
         elif matching_bo:
             bo = matching_bo
-            descriptor = "5-year crash-resistant compounder" if bo.get("is_crash_shield") else "5-year compounder"
+            descriptor = BUCKET_LABELS.get(bo.get("bucket") or classify_bucket(bo.get("ticker", "")), "5-year compounder").lower()
             pos["plan_status"] = f"BUY (+£{bo['estimated_gbp']:,.0f})"
             pos["plan_badge_color"] = "#10b981"
-            pos["plan_summary"] = f"Active Buy Order: Deploying £{bo['estimated_gbp']:,.0f} into {descriptor} ({w}% weight)."
+            pos["plan_summary"] = f"Active Buy Order: adding £{bo['estimated_gbp']:,.0f} ({descriptor} bucket; currently {w}% of this account)."
         else:
             # Held position (trend wording only claims an uptrend when price data confirms it)
             pos["plan_status"] = "HOLD"
@@ -3831,7 +4557,10 @@ def build_rebalancing_plan(
     # Also append new additions from rebalancing plan to table_items
     for bo in buy_orders:
         if bo.get("is_new"):
-            new_label = "NEW 5Y SHIELD & ALPHA" if bo.get("is_crash_shield") else "NEW POSITION"
+            new_label = {
+                BUCKET_CORE: "NEW CORE POSITION",
+                BUCKET_DEFENSIVE: "NEW DEFENSIVE POSITION",
+            }.get(bo.get("bucket"), "NEW POSITION")
             table_items.append({
                 "ticker": bo["ticker"],
                 "search_symbol": bo["search_symbol"],
@@ -3910,6 +4639,7 @@ def build_rebalancing_plan(
         "investable_total_gbp": investable_total_gbp,
         "outside_vested_gbp": round(outside_vested_gbp, 2),
         "cap_breaches": cap_breaches,
+        "household_allocation": household_allocation,
         "limits": {
             "max_position_pct": pos_cap,
             "max_leveraged_etf_pct": lev_cap,
@@ -3917,6 +4647,12 @@ def build_rebalancing_plan(
             "target_crash_shield_pct": round(shield_target_pct / 100.0, 4),
             "max_new_ideas_to_buy": max_new_ideas,
             "cap_applies_to_broad_etfs": _rebalance_cfg_bool("cap_applies_to_broad_etfs", False),
+            "allocation_targets": {b: round(alloc_cfg["targets"][b], 4) for b in BUCKETS},
+            "allocation_band_pp": alloc_cfg["band_pp"],
+            "satellite_max_single_pct": sat_single_cap,
+            "big_tech_cap_pct": bt_cap,
+            "buy_cadence": alloc_cfg["buy_cadence"],
+            "off_cycle_min_deploy_gbp": off_cycle_min,
         },
         "model_version": _model_version(),
     }
@@ -3994,6 +4730,7 @@ def generate_tldr_summary(results_by_account: Dict[str, Dict[str, Any]]) -> Dict
                 "amount_gbp": b.get("estimated_gbp", 0.0),
                 "shares": b.get("shares", 0.0),
                 "is_new": b.get("is_new", False),
+                "bucket": b.get("bucket"),
                 "instruction": f"BUY {b.get('name', b.get('ticker'))} ({b.get('search_symbol', b.get('ticker'))}) ➔ Enter £{_num(b.get('estimated_gbp'), 0.0):,.0f}"
             })
 
@@ -4027,7 +4764,7 @@ def generate_tldr_summary(results_by_account: Dict[str, Dict[str, Any]]) -> Dict
                 phase = "HARVEST_AND_REALLOCATE"
                 if trims_are_profit_taking:
                     phase_label = "🟠 HARVEST PROFITS & REALLOCATE CAPITAL"
-                    phase_desc = f"Execute {len(sells_to_place)} profit trim(s) below to bank gains. Reallocate proceeds into {len(buys_to_place)} high-asymmetry buy orders."
+                    phase_desc = f"Execute {len(sells_to_place)} profit trim(s) below to bank gains. Today's {len(buys_to_place)} buy order(s) use only the £{net_budget:,.0f} of free cash above {reserve_txt}."
                 else:
                     phase_label = "🟠 TRIM TO LIMITS & REALLOCATE CAPITAL"
                     phase_desc = f"Execute {len(sells_to_place)} trim(s) below to bring positions back within configured limits. Today's {len(buys_to_place)} buy order(s) use only the £{net_budget:,.0f} of free cash above {reserve_txt}."
@@ -4068,7 +4805,10 @@ def generate_tldr_summary(results_by_account: Dict[str, Dict[str, Any]]) -> Dict
                 )
                 phase_desc = f"No new orders today, but {len(open_breaches)} configured limit(s) remain exceeded: {breach_txt}."
             else:
-                phase_desc = "No action required today. Portfolio is fully balanced and compounding."
+                phase_desc = "No action required today."
+            hh_alloc = plan.get("household_allocation") if isinstance(plan.get("household_allocation"), dict) else {}
+            if hh_alloc.get("buys_allowed") is False and _num(hh_alloc.get("deployable_gbp"), 0.0) > 0:
+                phase_desc = f"{phase_desc} {hh_alloc.get('cadence_note')}"
 
         if reserve_shortfall > 0.005:
             reserve_note = f"⚠️ Cash reserve unfunded: £{avail_cash:,.0f} free cash vs £{reserve_floor:,.0f} floor (shortfall £{reserve_shortfall:,.0f})."

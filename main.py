@@ -19,13 +19,25 @@ from portfolio_storage import (
     get_position_trims,
     load_portfolio_history,
     save_daily_snapshot,
+    summarize_tracking_performance,
 )
-from dashboard_generator import generate_dashboard_html
+from dashboard_generator import (
+    _MIX_EXPLAINER,
+    _allocation_view,
+    _big_tech_view,
+    _bucket_label,
+    _household_mix_view,
+    _mix_basis_text,
+    _share_text,
+    _tracking_text,
+    generate_dashboard_html,
+)
 from research_agent import DeepResearchAgent
 from strategy_engine import (
     analyze_position,
     build_rebalancing_plan,
     build_consolidated_portfolio_view,
+    classify_bucket,
     generate_tldr_summary,
     get_gbp_usd_rate,
     scan_watchlist_opportunities,
@@ -168,6 +180,21 @@ def _finite_or_none(val: Any) -> Optional[float]:
   return None if (math.isnan(f) or math.isinf(f)) else f
 
 
+def _ledger_bucket(order: Dict[str, Any]) -> Optional[str]:
+  """Household-mix bucket for a ledger record: the engine's order bucket (buys), else the instrument's own
+  classification (sells and trims carry none); None when neither is available."""
+  bucket = order.get("bucket")
+  if isinstance(bucket, str) and bucket.strip():
+    return bucket.strip()
+  ticker = str(order.get("ticker") or "").strip()
+  if not ticker:
+    return None
+  try:
+    return classify_bucket(ticker) or None
+  except Exception:  # informational only: classification must never block the ledger
+    return None
+
+
 def _build_ledger_records(results_by_account: Dict[str, Any], date_str: str) -> List[Dict[str, Any]]:
   """One recommendation-ledger record per recommended (non-pending) sell/trim and buy order."""
   records: List[Dict[str, Any]] = []
@@ -182,12 +209,72 @@ def _build_ledger_records(results_by_account: Dict[str, Any], date_str: str) -> 
           "account": acc_name,
           "action": order.get("action"),
           "ticker": order.get("ticker"),
+          "bucket": _ledger_bucket(order),
           "amount_gbp": round(amount, 2) if amount is not None else None,
           "price": _finite_or_none(order.get("price")),
           "currency": order.get("currency"),
           "reason": order.get("plain_english_why") or order.get("reason") or "",
       })
   return records
+
+def _bucket_tag(order: Optional[Dict[str, Any]]) -> str:
+  """'[CORE] ' / '[SATELLITE] ' / '[DEFENSIVE] ' for a buy order ('' when the engine gave no bucket)."""
+  label = _bucket_label(order.get("bucket")) if isinstance(order, dict) else ""
+  return f"[{label}] " if label else ""
+
+
+_MIX_CONSOLE_FLAGS = {
+    "under": "  ⚠️ OUT OF BAND (under target)",
+    "over": "  ⚠️ OUT OF BAND (over target)",
+    "in_band": "  ✅ within band",
+}
+
+
+def _household_mix_console_lines(consolidated_view: Optional[Dict[str, Any]]) -> List[str]:
+  """Console / plain-text HOUSEHOLD MIX block: each bucket now / target / after plan, US big tech vs the cap and
+  performance vs VWRP. [] when the engine supplied none of household_mix, big_tech or tracking_performance."""
+  mix = _household_mix_view(consolidated_view)
+  big_tech = _big_tech_view(consolidated_view)
+  tracking = _tracking_text(consolidated_view)
+  if not (mix or big_tech or tracking):
+    return []
+  lines = ["", "🧭 HOUSEHOLD MIX (all accounts + vested shares held outside, as one household):"]
+  rows = mix.get("rows") or []
+  for row in rows:
+    post = _share_text(row["post_pct"]) if row["post_pct"] is not None else "n/a"
+    lines.append(
+        f"  • {row['label']}: now {_share_text(row['now_pct'])} | target {_share_text(row['target_pct'])}"
+        f" | after plan {post}{_MIX_CONSOLE_FLAGS.get(row['status'], '')}"
+    )
+  if not rows and mix.get("summary"):
+    lines.append(f"  • {mix['summary']}")
+  basis = _mix_basis_text(mix)
+  if basis:
+    lines.append(f"    {basis}")
+  if big_tech:
+    post_pct = big_tech.get("post_pct")
+    post_txt = f" | after plan {_share_text(post_pct)}" if post_pct is not None else ""
+    lines.append(f"  🏢 US big tech: {big_tech['line']}{post_txt}")
+  if tracking:
+    lines.append(f"  📈 {tracking}")
+  if rows:
+    lines.append(f"  💡 {_MIX_EXPLAINER}")
+  return lines
+
+
+def _allocation_console_lines(plan: Optional[Dict[str, Any]], indent: str = "  ") -> List[str]:
+  """Console lines for one account's household allocation: buy cadence, today's new-money split and notes."""
+  alloc = _allocation_view(plan)
+  if not alloc:
+    return []
+  lines = []
+  if alloc["cadence"]:
+    lines.append(f"{indent}🗓️ New money today: {alloc['cadence']}")
+  if alloc["split_text"]:
+    lines.append(f"{indent}🧭 New money split: {alloc['split_text']}")
+  for note in alloc["notes"]:
+    lines.append(f"{indent}   • {note}")
+  return lines
 
 # Realistic sample data used for testing and offline verification
 DEFAULT_MOCK_PORTFOLIO = {
@@ -510,6 +597,9 @@ def run_pipeline(
         global_context=consolidated_view,
         official_total_gbp=official_total if official_total > 0 else None,
         account_name=account_name,
+        # Every scanned watchlist analysis (gate failures included), so the household allocation can price the
+        # core / defensive funds it routes new money into.
+        instrument_universe=watchlist_scan,
     )
 
     results_by_account[account_name] = {
@@ -546,6 +636,13 @@ def run_pipeline(
       external_flows_by_account=external_flows.get("by_account", {}),
   )
   consolidated_view["day_over_day"] = dod_metrics
+
+  # 5b. Since-tracking-began performance vs VWRP, from the saved history (display only; it never affects a
+  #     recommendation, and a failure here must never abort the run)
+  try:
+    consolidated_view["tracking_performance"] = summarize_tracking_performance(load_portfolio_history())
+  except Exception as e:
+    logger.warning("Performance tracking vs VWRP unavailable for this run: %s", e)
 
   # Build the HTML output with Consolidated Portfolio Overview
   html_report = generate_html_digest(
@@ -632,8 +729,14 @@ def run_pipeline(
     if t_info.get("buys_to_place"):
       timing_txt = "Once sell fills settle, enter these buys:" if t_info["phase"] == "AWAIT_FILLS_THEN_BUY" else "Enter these buys today:"
       out(f"   🎯 {timing_txt}")
+      tags_by_symbol: Dict[str, str] = {}
+      for bo in acc_plan.get("buy_orders") or []:
+        if _bucket_tag(bo):
+          for sym in (bo.get("search_symbol"), bo.get("ticker")):
+            if sym:
+              tags_by_symbol.setdefault(str(sym), _bucket_tag(bo))
       for idx, b in enumerate(t_info["buys_to_place"], 1):
-        out(f"      {idx}. {b['instruction']}")
+        out(f"      {idx}. {tags_by_symbol.get(str(b.get('symbol') or ''), '')}{b['instruction']}")
     if t_info["phase"] == "ALL_SET":
       if t_info.get("cap_breaches"):
         acc_outside = [
@@ -649,7 +752,14 @@ def run_pipeline(
       else:
         out("   ✨ Within all configured limits. No new orders required today.")
     out(f"   🛡️ {_reserve_status_text(acc_plan, acc_cfg)}")
+    acc_cadence = _allocation_view(acc_plan).get("cadence")
+    if acc_cadence:
+      out(f"   🗓️ New money today: {acc_cadence}")
   out("━" * 85)
+
+  # Household strategic mix (core / satellites / defensive), US big-tech cap and performance vs VWRP
+  for line in _household_mix_console_lines(consolidated_view):
+    out(line)
 
   # Consolidated Wealth Overview Banner
   out("\n🌐 CONSOLIDATED WEALTH OVERVIEW (ALL ACCOUNTS COMBINED):")
@@ -684,10 +794,10 @@ def run_pipeline(
   if cons_5y:
     out(
         f"  🛡️ 5-Year Stress-Test (GBP basis): 5Y Sortino: {_fmt(cons_5y.get('current_sortino_5y'), '{:.2f}')} |"
-        f" 5Y Hist. CAGR: {_fmt(cons_5y.get('current_cagr_5y_pct'), '{:+.1f}%')} |"
+        f" Est. 5Y CAGR (blended hist./model estimate, info only): {_fmt(cons_5y.get('current_cagr_5y_pct'), '{:+.1f}%')} |"
         f" Portfolio Beta: {_fmt(cons_5y.get('current_beta_5y'), '{:.2f}')} |"
         f" 2022-style Stress: {_fmt(cons_5y.get('current_stress_2022_pct'), '{:+.1f}%')} (£{_num(cons_5y.get('current_stress_2022_gbp'), 0.0):,.0f}) |"
-        f" Defensive (cash/money-market/gold): {_fmt(cons_5y.get('post_defensive_pct'), '{:.1f}%')}"
+        f" Defensive (cash/money-market/gold/short gilts): {_fmt(cons_5y.get('post_defensive_pct'), '{:.1f}%')}"
     )
     out(
         f"  🔮 5-Year (2031) scenarios: bear £{_num(cons_5y.get('projected_5y_bear_gbp'), 0.0):,.0f} |"
@@ -731,6 +841,8 @@ def run_pipeline(
       )
     else:
       out("  🔒 Earmarked: none held in this account.")
+    for line in _allocation_console_lines(plan):
+      out(line)
     acc_5y = plan.get("portfolio_5y_risk_profile", {})
     if acc_5y:
       out(
@@ -806,11 +918,14 @@ def run_pipeline(
         crash22_s = f"{crash22:+.1f}%" if crash22 is not None else "n/a"
         rr_s = f"{rr:.1f}:1" if rr is not None else "n/a"
         out(
-            f"    {step}. BUY {type_tag} {bo['name']} ({bo['search_symbol']}){lev_tag} ➔"
+            f"    {step}. BUY {type_tag} {_bucket_tag(bo)}{bo['name']} ({bo['search_symbol']}){lev_tag} ➔"
             f" {bo['app_instruction']}"
         )
         out(f"       5Y Profile: {role_lbl} | 5Y CAGR (GBP): {cagr5_s} | 5Y Sortino: {sort5_s} | 2022 (GBP): {crash22_s} | {w_trend} | {alt_str} | R:R: {rr_s}")
         out(f"       Why: {bo['plain_english_why']}")
+        alloc_reason = str(bo.get("allocation_reason") or "").strip()
+        if alloc_reason:
+          out(f"       Allocation: {alloc_reason}")
         step += 1
 
     if plan.get("hold_items"):

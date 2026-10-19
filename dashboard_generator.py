@@ -236,7 +236,7 @@ def _risk_kpi_texts(rp: Optional[Dict[str, Any]]) -> Dict[str, str]:
         cagr_parts.append(f"now {cur_cagr:+.0f}%/yr")
     if post_cagr is not None:
         cagr_parts.append(f"after plan {post_cagr:+.0f}%/yr")
-    cagr = "Est. 5Y CAGR (blended hist./model): " + (" ➔ ".join(cagr_parts) if cagr_parts else "N/A")
+    cagr = "Est. 5Y CAGR (blended hist./model estimate, info only): " + (" ➔ ".join(cagr_parts) if cagr_parts else "N/A")
     beta_txt = arrow(cur_beta, post_beta, lambda v: f"{v:.2f}")
     if beta_txt != "N/A":
         cagr += f" · Beta {beta_txt}"
@@ -299,6 +299,344 @@ def _signal_prefix(action_text: str, is_trim: bool) -> str:
     if action_text.startswith(("🔴", "🟠", "🟢", "🟡", "🔒", "⚪", "🏦", "⏳")):
         return ""
     return "🟠 " if is_trim else "🔴 "
+
+
+# --- Household strategic allocation (Phase 1) display helpers --------------------------------------------
+# Shared by the dashboard, the email digest (mailer.py) and the console / plain-text summary (main.py).
+# Every helper is None-safe: missing or malformed engine keys produce empty values, never an exception.
+_BUCKET_ORDER = ("core", "satellite", "defensive")
+_BUCKET_LABELS = {
+    "core": "Core global index",
+    "satellite": "Satellites (single stocks & thematic funds)",
+    "defensive": "Defensive (cash, money-market, gold, short gilts)",
+}
+_BUCKET_SHORT_LABELS = {"core": "Core", "satellite": "Satellites", "defensive": "Defensive"}
+_BUCKET_ALIASES = {"satellites": "satellite", "defence": "defensive", "defense": "defensive"}
+_MIX_STATUS_TEXT = {"under": "Under target", "over": "Over target", "in_band": "In band"}
+_MIX_EXPLAINER = (
+    "New money goes to whichever part of the mix is furthest below target. Nothing profitable is sold to rebalance."
+)
+_BIG_TECH_SOURCE_LABELS = {
+    "direct": "Direct",
+    "fund": "Fund look-through",
+    "outside": "Vested, outside T212",
+}
+
+
+def _bucket_key(val: Any) -> str:
+    """'core' / 'satellite' / 'defensive' for an engine bucket value; '' when missing or unknown."""
+    key = str(val or "").strip().lower()
+    key = _BUCKET_ALIASES.get(key, key)
+    return key if key in _BUCKET_ORDER else ""
+
+
+def _bucket_label(val: Any) -> str:
+    """Badge text for a buy order's bucket: 'CORE' / 'SATELLITE' / 'DEFENSIVE'; '' when unknown."""
+    return _bucket_key(val).upper()
+
+
+def _share_text(val: Optional[float], decimals: int = 1) -> str:
+    """Share of household wealth: '21.9%', whole numbers drop the decimals ('65%'); 'N/A' when missing."""
+    if val is None:
+        return "N/A"
+    if abs(val - round(val)) < 1e-9:
+        return f"{val:.0f}%"
+    return f"{val:.{decimals}f}%"
+
+
+def _household_mix_view(consolidated_view: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Display-ready consolidated_view["household_mix"]; {} when absent or unusable.
+
+    rows: [{key, label, now_pct, target_pct, post_pct, status ('under' / 'over' / 'in_band' / ''), out_of_band}].
+    The engine's status is trusted; without it the status is derived from out_of_band or the +/- band.
+    post_pct is None when the engine applied no plans (post_trade_available False).
+    """
+    hm = consolidated_view.get("household_mix") if isinstance(consolidated_view, dict) else None
+    if not isinstance(hm, dict):
+        return {}
+    band = _num(hm.get("band_pp"))
+    post_ok = hm.get("post_trade_available") is not False
+    buckets = hm.get("buckets")
+    rows: List[Dict[str, Any]] = []
+    for b in buckets if isinstance(buckets, list) else []:
+        if not isinstance(b, dict):
+            continue
+        key = _bucket_key(b.get("bucket"))
+        label = str(b.get("label") or _BUCKET_LABELS.get(key) or b.get("bucket") or "").strip()
+        if not label:
+            continue
+        now = _num(b.get("current_pct"))
+        target = _num(b.get("target_pct"))
+        status = str(b.get("status") or "").strip().lower()
+        if status not in _MIX_STATUS_TEXT:
+            status = ""
+            if now is not None and target is not None:
+                out_of_band = b.get("out_of_band")
+                if not isinstance(out_of_band, bool):
+                    out_of_band = band is not None and abs(now - target) > band
+                status = ("under" if now < target else "over") if out_of_band else "in_band"
+        rows.append({
+            "key": key,
+            "label": label,
+            "now_pct": now,
+            "target_pct": target,
+            "post_pct": _num(b.get("post_trade_pct")) if post_ok else None,
+            "status": status,
+            "out_of_band": status in ("under", "over"),
+        })
+    summary = str(hm.get("summary") or "").strip()
+    if not rows and not summary:
+        return {}
+    return {
+        "rows": rows,
+        "summary": summary,
+        "band_pp": band,
+        "basis_gbp": _num(hm.get("basis_gbp")),
+        "outside_included_gbp": _num(hm.get("outside_included_gbp")),
+        "excluded_cash_gbp": _num(hm.get("excluded_cash_gbp")),
+        "post_trade_available": post_ok,
+    }
+
+
+def _mix_basis_text(mix: Optional[Dict[str, Any]]) -> str:
+    """'Basis £200,000: Trading 212 investable money (earmarked funds excluded) + £20,000 vested ... · band ±5pp'."""
+    mix = mix or {}
+    parts: List[str] = []
+    basis = mix.get("basis_gbp")
+    if basis is not None and basis > 0:
+        txt = f"Basis {_gbp(basis)}: Trading 212 investable money (earmarked funds excluded)"
+        outside = mix.get("outside_included_gbp")
+        if outside is not None and outside >= 0.5:
+            txt += f" + {_gbp(outside)} vested shares held outside Trading 212"
+        parts.append(txt)
+    excluded = mix.get("excluded_cash_gbp")
+    if excluded is not None and excluded >= 0.5:
+        parts.append(f"{_gbp(excluded)} temporary reserve top-up cash not counted")
+    band = mix.get("band_pp")
+    if band is not None:
+        parts.append(f"band ±{band:g}pp")
+    return " · ".join(parts)
+
+
+def _big_tech_view(consolidated_view: Optional[Dict[str, Any]], top_n: int = 8) -> Dict[str, Any]:
+    """Display-ready consolidated_view["big_tech"]; {} when absent or without an exposure figure.
+
+    line: '47% of household wealth (cap 30%)', plus ' — no new big-tech buys' when over the cap.
+    rows: the top_n breakdown rows by exposure (source labelled direct / fund look-through / outside).
+    """
+    bt = consolidated_view.get("big_tech") if isinstance(consolidated_view, dict) else None
+    if not isinstance(bt, dict):
+        return {}
+    basis = _num(bt.get("basis_gbp"))
+    exposure_gbp = _num(bt.get("exposure_gbp"))
+    pct = _num(bt.get("exposure_pct"))
+    if pct is None and exposure_gbp is not None and basis is not None and basis > 0:
+        pct = exposure_gbp / basis * 100.0
+    if pct is None:
+        return {}
+    cap = _num(bt.get("cap_pct"))
+    over_cap = bt.get("over_cap")
+    if not isinstance(over_cap, bool):
+        over_cap = cap is not None and pct > cap
+    line = f"{pct:.0f}% of household wealth"
+    if cap is not None:
+        line += f" (cap {_share_text(cap)})"
+    if over_cap:
+        line += " — no new big-tech buys"
+
+    breakdown = bt.get("breakdown")
+    rows: List[Dict[str, Any]] = []
+    for r in breakdown if isinstance(breakdown, list) else []:
+        if not isinstance(r, dict):
+            continue
+        ticker = str(r.get("ticker") or "").strip()
+        exposure = _num(r.get("exposure_gbp"))
+        if not ticker or exposure is None:
+            continue
+        source = str(r.get("source") or "").strip().lower()
+        rows.append({
+            "account": str(r.get("account") or "").strip(),
+            "ticker": ticker,
+            "source": source,
+            "source_label": _BIG_TECH_SOURCE_LABELS.get(source, source.capitalize() or "N/A"),
+            "value_gbp": _num(r.get("value_gbp")),
+            "weight": _num(r.get("lookthrough_weight")),
+            "exposure_gbp": exposure,
+        })
+    rows.sort(key=lambda r: r["exposure_gbp"], reverse=True)
+    return {
+        "pct": pct,
+        "cap_pct": cap,
+        "over_cap": over_cap,
+        "post_pct": _num(bt.get("post_trade_exposure_pct")),
+        "exposure_gbp": exposure_gbp,
+        "basis_gbp": basis,
+        "line": line,
+        "rows": rows[:max(0, int(top_n))],
+        "total_rows": len(rows),
+        "note": str(bt.get("note") or "").strip(),
+    }
+
+
+def _tracking_text(consolidated_view: Optional[Dict[str, Any]]) -> str:
+    """Plain-English since-tracking-began line from consolidated_view["tracking_performance"]; '' when absent."""
+    tp = consolidated_view.get("tracking_performance") if isinstance(consolidated_view, dict) else None
+    if not isinstance(tp, dict):
+        return ""
+    return str(tp.get("text") or "").strip()
+
+
+def _allocation_view(plan: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Display-ready rebalancing_plan["household_allocation"] for one account; {} when absent or empty.
+
+    cadence: the engine's cadence_note (falls back to the next buy day when buys wait for it), notes: list of
+    plain-English strings, split_text: 'Core £3,900 · Defensive £1,120' from by_bucket_gbp (non-zero buckets,
+    only on days buys are allowed).
+    """
+    ha = plan.get("household_allocation") if isinstance(plan, dict) else None
+    if not isinstance(ha, dict):
+        return {}
+    cadence = str(ha.get("cadence_note") or "").strip()
+    next_day = str(ha.get("next_buy_day") or "").strip()
+    if not cadence and ha.get("buys_allowed") is False and next_day:
+        cadence = f"New buys wait for the next monthly buy day ({next_day})."
+    raw_notes = ha.get("notes")
+    if isinstance(raw_notes, str):
+        raw_notes = [raw_notes]
+    notes = [
+        str(n).strip()
+        for n in (raw_notes if isinstance(raw_notes, (list, tuple)) else [])
+        if n is not None and not isinstance(n, (dict, list)) and str(n).strip()
+    ]
+    by_bucket = ha.get("by_bucket_gbp")
+    split_parts: List[str] = []
+    if isinstance(by_bucket, dict) and ha.get("buys_allowed") is not False:
+        for key in _BUCKET_ORDER:
+            amount = _num(by_bucket.get(key))
+            if amount is not None and amount >= 0.5:
+                split_parts.append(f"{_BUCKET_SHORT_LABELS[key]} {_gbp(amount)}")
+    split_text = " · ".join(split_parts)
+    if not (cadence or notes or split_text):
+        return {}
+    return {"cadence": cadence, "notes": notes, "split_text": split_text, "next_buy_day": next_day}
+
+
+def _lookthrough_text(weight: Optional[float]) -> str:
+    """Fund look-through weight as a share: 0.35 -> '35%', 1.0 -> '100%'; 'N/A' when missing."""
+    return f"{weight * 100.0:.0f}%" if weight is not None else "N/A"
+
+
+def _household_mix_panel_html(
+    consolidated_view: Optional[Dict[str, Any]],
+    results_by_account: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> str:
+    """Server-rendered dashboard 'Household mix' panel; '' when the engine supplied none of the Phase 1 data.
+
+    Bucket table (now / target / after today's plan) with status chips, the since-tracking-began line and the
+    rebalancing explainer; US big-tech exposure vs the cap with the top 8 breakdown rows; per-account buy-cadence
+    notes. Household-wide, so it is static HTML (no JSON payload). Every engine-supplied string is HTML-escaped.
+    """
+    esc = _html.escape
+    mix = _household_mix_view(consolidated_view)
+    big_tech = _big_tech_view(consolidated_view, top_n=8)
+    tracking = _tracking_text(consolidated_view)
+
+    alloc_blocks: List[str] = []
+    for acc_name, acc_data in (results_by_account or {}).items():
+        alloc = _allocation_view((acc_data or {}).get("rebalancing_plan") if isinstance(acc_data, dict) else None)
+        if not alloc:
+            continue
+        parts = [f"<b>👤 {esc(str(acc_name))}:</b> {esc(alloc['cadence'] or 'No cadence note today.')}"]
+        if alloc["split_text"]:
+            parts.append(f'<div class="mix-sub">New money split: {esc(alloc["split_text"])}</div>')
+        if alloc["notes"]:
+            parts.append("<ul>" + "".join(f"<li>{esc(n)}</li>" for n in alloc["notes"]) + "</ul>")
+        alloc_blocks.append(f'<div class="mix-acc">{"".join(parts)}</div>')
+
+    if not (mix or big_tech or tracking or alloc_blocks):
+        return ""
+
+    cards: List[str] = []
+    mix_rows = mix.get("rows") or []
+    if mix or tracking:
+        body: List[str] = []
+        basis_txt = _mix_basis_text(mix)
+        if basis_txt:
+            body.append(f'<div class="mix-sub">{esc(basis_txt)}</div>')
+        if mix_rows:
+            tr_html = ""
+            for r in mix_rows:
+                status_txt = _MIX_STATUS_TEXT.get(r["status"], "")
+                chip = f'<span class="chip chip-{r["status"]}">{status_txt}</span>' if status_txt else ""
+                post_txt = _share_text(r["post_pct"]) if r["post_pct"] is not None else "—"
+                tr_html += (
+                    f'<tr><td><div class="mix-label">{esc(r["label"])}</div>{chip}</td>'
+                    f'<td class="mix-num"><b>{_share_text(r["now_pct"])}</b></td>'
+                    f'<td class="mix-num">{_share_text(r["target_pct"])}</td>'
+                    f'<td class="mix-num">{post_txt}</td></tr>'
+                )
+            body.append(
+                '<table class="mix-table"><thead><tr><th>Bucket</th><th class="mix-num">Now</th>'
+                '<th class="mix-num">Target</th><th class="mix-num">After today\'s plan</th></tr></thead>'
+                f"<tbody>{tr_html}</tbody></table>"
+            )
+            if not mix.get("post_trade_available", True):
+                body.append('<div class="mix-sub">After-plan figures are unavailable today (no plan applied).</div>')
+        elif mix.get("summary"):
+            body.append(f'<div class="mix-line">{esc(mix["summary"])}</div>')
+        if tracking:
+            body.append(f'<div class="mix-line">📈 {esc(tracking)}</div>')
+        if mix_rows:
+            body.append(f'<div class="mix-explainer">💡 {esc(_MIX_EXPLAINER)}</div>')
+        cards.append(
+            '<div class="mix-card"><div class="mix-head">⚖️ Core / Satellites / Defensive</div>'
+            + "".join(body) + "</div>"
+        )
+
+    if big_tech:
+        line_color = "var(--rose)" if big_tech["over_cap"] else "var(--emerald)"
+        sub_parts = []
+        if big_tech["post_pct"] is not None:
+            sub_parts.append(f"After today's plan: {_share_text(big_tech['post_pct'])}")
+        sub_parts.append("Counts fund look-through and vested shares held outside Trading 212")
+        body = [
+            f'<div class="mix-head">🏢 US big tech: <span style="color: {line_color};">{esc(big_tech["line"])}</span></div>',
+            f'<div class="mix-sub">{esc(" · ".join(sub_parts))}</div>',
+        ]
+        if big_tech["rows"]:
+            tr_html = "".join(
+                f'<tr><td><b>{esc(r["ticker"])}</b><div class="mix-sub-cell">{esc(r["account"] or "—")}</div></td>'
+                f'<td>{esc(r["source_label"])}</td><td class="mix-num">{_gbp(r["value_gbp"])}</td>'
+                f'<td class="mix-num">{_lookthrough_text(r["weight"])}</td>'
+                f'<td class="mix-num"><b>{_gbp(r["exposure_gbp"])}</b></td></tr>'
+                for r in big_tech["rows"]
+            )
+            body.append(
+                '<table class="mix-table"><thead><tr><th>Holding</th><th>Source</th>'
+                '<th class="mix-num">Value</th><th class="mix-num">Look-through</th>'
+                '<th class="mix-num">Big tech</th></tr></thead>'
+                f"<tbody>{tr_html}</tbody></table>"
+            )
+        foot = []
+        if big_tech["total_rows"] > len(big_tech["rows"]):
+            foot.append(f"Top {len(big_tech['rows'])} of {big_tech['total_rows']} holdings shown")
+        if big_tech["note"]:
+            foot.append(big_tech["note"])
+        if foot:
+            body.append(f'<div class="mix-sub">{esc(" · ".join(foot))}</div>')
+        cards.append('<div class="mix-card">' + "".join(body) + "</div>")
+
+    grid_html = f'\n    <div class="mix-grid">\n      {"".join(cards)}\n    </div>' if cards else ""
+    cadence_html = (
+        '\n    <div class="mix-card mix-wide"><div class="mix-head">🗓️ New money today, by account</div>'
+        + "".join(alloc_blocks) + "</div>"
+        if alloc_blocks else ""
+    )
+    return f"""
+    <!-- Household Mix (strategic allocation: core / satellites / defensive) -->
+    <div class="section-title">
+      <span>🧭 Household Mix — all accounts + vested outside shares, as one household</span>
+    </div>{grid_html}{cadence_html}"""
 
 
 def generate_dashboard_html(
@@ -567,6 +905,9 @@ def generate_dashboard_html(
         notes_items = "".join(f'<div class="note-item">{n}</div>' for n in household_notes)
         household_notes_html = f'\n    <div class="household-notes">{notes_items}</div>'
 
+    # Household mix panel (Phase 1 strategic allocation); empty when the engine supplies none of the data
+    household_mix_panel_html = _household_mix_panel_html(consolidated_view, results_by_account)
+
     # Build dynamic action cards and status badges per account
     action_cards_by_account: Dict[str, List[str]] = {}
     action_badges_by_account: Dict[str, Dict[str, str]] = {}
@@ -683,14 +1024,23 @@ def generate_dashboard_html(
                 b_why = bo.get("plain_english_why", "")
                 b_inst = bo.get("app_instruction", "")
                 act_label = f"STEP {step}: 🟢 BUY {b_name} ({b_sym})"
+                b_bucket = _bucket_key(bo.get("bucket"))
+                bucket_badge = (
+                    f' <span class="bucket-badge bucket-{b_bucket}">{b_bucket.upper()}</span>' if b_bucket else ""
+                )
+                b_alloc = str(bo.get("allocation_reason") or "").strip()
+                alloc_html = (
+                    f'\n          <div class="action-why alloc-why"><b>Allocation:</b> {_html.escape(b_alloc)}</div>'
+                    if b_alloc else ""
+                )
                 cards.append(f"""
         <div class="action-card buy">
           <div class="action-header">
-            <span style="font-weight: 800; font-size: 14px; color: var(--emerald);">👤 [{acc_name.upper()}] {act_label}</span>
+            <span style="font-weight: 800; font-size: 14px; color: var(--emerald);">👤 [{acc_name.upper()}] {act_label}{bucket_badge}</span>
             <span class="action-badge" style="background: var(--emerald-glow); color: var(--emerald);">REINVEST £{b_est:,.0f}</span>
           </div>
           <div class="action-instruction">{b_inst}</div>
-          <div class="action-why"><b>Data Rationale:</b> {b_why}</div>
+          <div class="action-why"><b>Data Rationale:</b> {b_why}</div>{alloc_html}
         </div>""")
                 step += 1
 
@@ -853,6 +1203,68 @@ def generate_dashboard_html(
       flex-direction: column;
       gap: 4px;
     }}
+
+    /* Household mix (strategic allocation: core / satellites / defensive) */
+    .mix-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+      gap: 16px;
+      margin-bottom: 16px;
+    }}
+    .mix-card {{
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      padding: 18px 20px;
+      overflow-x: auto;
+    }}
+    .mix-card.mix-wide {{ margin-bottom: 28px; }}
+    .mix-head {{ font-size: 14px; font-weight: 800; margin-bottom: 6px; }}
+    .mix-sub {{ font-size: 12px; color: var(--text-muted); margin: 4px 0 8px 0; }}
+    .mix-line {{ font-size: 13px; margin-top: 10px; }}
+    .mix-explainer {{
+      font-size: 12.5px;
+      color: var(--text-muted);
+      margin-top: 10px;
+      background: rgba(0, 0, 0, 0.25);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 8px;
+      padding: 8px 12px;
+    }}
+    .mix-table {{ font-size: 12.5px; margin-top: 6px; }}
+    .mix-table th {{ cursor: default; padding: 8px 10px; }}
+    .mix-table td {{ padding: 9px 10px; vertical-align: top; }}
+    .mix-num {{ text-align: right; white-space: nowrap; }}
+    .mix-label {{ font-weight: 700; color: #fff; }}
+    .mix-sub-cell {{ font-size: 11px; color: var(--text-muted); font-weight: 400; margin-top: 2px; }}
+    .mix-acc {{ font-size: 13px; padding: 8px 0; border-top: 1px solid rgba(255, 255, 255, 0.05); }}
+    .mix-acc ul {{ margin: 4px 0 0 18px; color: var(--text-muted); font-size: 12.5px; }}
+    .chip {{
+      display: inline-block;
+      margin-top: 4px;
+      padding: 1px 8px;
+      border-radius: 9999px;
+      font-size: 10.5px;
+      font-weight: 800;
+      white-space: nowrap;
+    }}
+    .chip-under {{ background: var(--amber-glow); color: var(--amber); border: 1px solid var(--amber); }}
+    .chip-over {{ background: var(--rose-glow); color: var(--rose); border: 1px solid var(--rose); }}
+    .chip-in_band {{ background: var(--emerald-glow); color: var(--emerald); border: 1px solid var(--emerald); }}
+    .bucket-badge {{
+      display: inline-block;
+      margin-left: 6px;
+      padding: 1px 8px;
+      border-radius: 6px;
+      font-size: 10.5px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      vertical-align: middle;
+    }}
+    .bucket-core {{ background: rgba(99, 102, 241, 0.15); color: #a5b4fc; border: 1px solid #6366f1; }}
+    .bucket-satellite {{ background: rgba(139, 92, 246, 0.15); color: #c4b5fd; border: 1px solid #8b5cf6; }}
+    .bucket-defensive {{ background: rgba(6, 182, 212, 0.15); color: #67e8f9; border: 1px solid #06b6d4; }}
+    .alloc-why {{ margin-top: 6px; color: #a5b4fc; }}
 
     /* Macro Marquee */
     .macro-bar {{
@@ -1268,6 +1680,7 @@ def generate_dashboard_html(
       </div>
     </div>
 {household_notes_html}
+{household_mix_panel_html}
 
     <!-- Account View Selector Tabs -->
     <div class="tabs-bar">

@@ -665,6 +665,111 @@ def _fetch_benchmark_closes(base_date_str: str, as_of_date_str: str) -> Tuple[Op
         return None, None
 
 
+_MONTH_ABBR = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _positive_index(val: Any) -> Optional[float]:
+    """A finite, strictly positive index level; None for missing, zero, negative, NaN, inf, bools or garbage."""
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f <= 0:
+        return None
+    return f
+
+
+def _history_date(val: Any) -> Optional[date]:
+    """Calendar date of a history record ('YYYY-MM-DD', time part ignored); None when missing or malformed."""
+    try:
+        return date.fromisoformat(str(val or "").strip()[:10])
+    except ValueError:
+        return None
+
+
+def _pretty_date(d: date) -> str:
+    """'19 Oct 2026' (locale-independent)."""
+    return f"{d.day} {_MONTH_ABBR[d.month - 1]} {d.year}"
+
+
+def _signed_pct_text(val: float) -> str:
+    """'+3.2%' / '-1.5%'; a value that rounds to zero reads '+0.0%', never '-0.0%'."""
+    rounded = round(val, 1)
+    return f"{(rounded if rounded != 0 else 0.0):+.1f}%"
+
+
+def summarize_tracking_performance(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Since-tracking-began comparison of the portfolio's time-weighted return against the VWRP.L benchmark.
+
+    Pure function: no file or network access (pass it load_portfolio_history()). Only history records with a
+    valid date AND a finite, positive `twr_index_total` AND `benchmark_vwrp_index` are used; zero, negative,
+    NaN, boolean and non-numeric values are skipped, and when several usable records share a date the last
+    one wins. Both returns are latest / first - 1 (in %) over the same window, so they compare like for like
+    even when the benchmark was unavailable on the first tracked day.
+
+    Returns {"available", "start_date", "end_date" (ISO dates), "portfolio_return_pct", "benchmark_return_pct",
+    "difference_pp", "days", "text"}. The numbers stay None (available False) until two usable daily
+    snapshots exist; "text" is always a plain-English sentence for the email, dashboard and console.
+    """
+    by_date: Dict[date, Tuple[float, float]] = {}
+    for rec in history if isinstance(history, (list, tuple)) else []:
+        if not isinstance(rec, dict):
+            continue
+        rec_date = _history_date(rec.get("date"))
+        twr = _positive_index(rec.get("twr_index_total"))
+        bench = _positive_index(rec.get("benchmark_vwrp_index"))
+        if rec_date is None or twr is None or bench is None:
+            continue
+        by_date[rec_date] = (twr, bench)
+    points = sorted(by_date.items())
+
+    summary: Dict[str, Any] = {
+        "available": False,
+        "start_date": None,
+        "end_date": None,
+        "portfolio_return_pct": None,
+        "benchmark_return_pct": None,
+        "difference_pp": None,
+        "days": None,
+        "text": "Performance tracking vs VWRP starts with the next daily snapshot.",
+    }
+    if not points:
+        return summary
+
+    start_d, (twr_first, bench_first) = points[0]
+    end_d, (twr_last, bench_last) = points[-1]
+    summary["start_date"] = start_d.isoformat()
+    summary["end_date"] = end_d.isoformat()
+    started_text = (
+        f"Performance tracking vs VWRP started on {_pretty_date(start_d)}; "
+        "the comparison appears after the second daily snapshot."
+    )
+    if len(points) < 2:
+        summary["text"] = started_text
+        return summary
+
+    portfolio_pct = (twr_last / twr_first - 1.0) * 100.0
+    benchmark_pct = (bench_last / bench_first - 1.0) * 100.0
+    if not (math.isfinite(portfolio_pct) and math.isfinite(benchmark_pct)):
+        summary["text"] = started_text
+        return summary
+
+    summary.update({
+        "available": True,
+        "portfolio_return_pct": round(portfolio_pct, 2),
+        "benchmark_return_pct": round(benchmark_pct, 2),
+        "difference_pp": round(portfolio_pct - benchmark_pct, 2),
+        "days": (end_d - start_d).days,
+        "text": (
+            f"Since tracking began ({_pretty_date(start_d)}): your portfolio {_signed_pct_text(portfolio_pct)} "
+            f"vs VWRP {_signed_pct_text(benchmark_pct)} (time-weighted, net of deposits and withdrawals)."
+        ),
+    })
+    return summary
+
+
 def compute_day_over_day_delta(
     current_combined_total: float,
     current_account_totals: Dict[str, float],

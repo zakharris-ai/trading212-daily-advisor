@@ -242,5 +242,63 @@ class OutsideHoldingsTests(unittest.TestCase):
                     self.assertEqual(config._parse_outside_holdings(raw, self.DEFAULT), self.DEFAULT)
 
 
+class AllocationConfigTests(unittest.TestCase):
+    # Shape / parsing checks only (these tests gate the daily email in CI, so never assert personal values).
+    ENV_KEYS = ("TARGET_CORE_PCT", "TARGET_SATELLITE_PCT", "TARGET_DEFENSIVE_PCT", "BUY_CADENCE", "BIG_TECH_CAP_PCT",
+                "ALLOCATION_BAND_PP", "SATELLITE_MAX_SINGLE_PCT", "OFF_CYCLE_MIN_DEPLOY_GBP", "CORE_BUY_TICKER",
+                "GOLD_BUY_TICKER", "SHORT_GILT_BUY_TICKER")
+
+    def _build(self, **env):
+        clean = {k: v for k, v in os.environ.items() if k not in self.ENV_KEYS}
+        clean.update(env)
+        with mock.patch.dict(os.environ, clean, clear=True):
+            return config._build_allocation_config()
+
+    def test_shipped_allocation_is_well_formed(self):
+        cfg = config.ALLOCATION_CONFIG
+        self.assertEqual(set(cfg["targets"]), {"core", "satellite", "defensive"})
+        self.assertAlmostEqual(sum(cfg["targets"].values()), 1.0, places=6)
+        self.assertIn(cfg["buy_cadence"], ("monthly", "daily"))
+        for key in ("band_pp", "satellite_max_single_pct", "big_tech_cap_pct", "off_cycle_min_deploy_gbp"):
+            self.assertGreaterEqual(cfg[key], 0.0, key)
+        for key in ("core_buy_ticker", "gold_buy_ticker", "short_gilt_buy_ticker"):
+            self.assertTrue(cfg[key], key)
+
+    def test_bucket_funds_are_scanned_so_they_can_be_priced(self):
+        cfg = config.ALLOCATION_CONFIG
+        watch = {w["ticker"] for w in config.WATCHLIST}
+        for key in ("core_buy_ticker", "gold_buy_ticker", "short_gilt_buy_ticker"):
+            self.assertIn(cfg[key], watch, key)
+
+    def test_env_overrides_are_parsed_safely(self):
+        # GitHub Actions renders `||` expressions as 'true' and missing secrets as '' — both must fall back to defaults
+        cfg = self._build(TARGET_CORE_PCT="true", TARGET_SATELLITE_PCT="", TARGET_DEFENSIVE_PCT="0.15",
+                          BUY_CADENCE="weekly", BIG_TECH_CAP_PCT="true", ALLOCATION_BAND_PP="abc",
+                          OFF_CYCLE_MIN_DEPLOY_GBP="null")
+        self.assertEqual(cfg["targets"], {"core": 0.65, "satellite": 0.20, "defensive": 0.15})
+        self.assertEqual(cfg["buy_cadence"], "monthly")
+        self.assertEqual(cfg["big_tech_cap_pct"], 0.30)
+        self.assertEqual(cfg["band_pp"], 5.0)
+        self.assertEqual(cfg["off_cycle_min_deploy_gbp"], 2000.0)
+        self.assertEqual(self._build(BUY_CADENCE="Daily")["buy_cadence"], "daily")
+        self.assertEqual(self._build(CORE_BUY_TICKER=" vwra.l ")["core_buy_ticker"], "VWRA.L")
+
+    def test_targets_are_normalised_or_fall_back(self):
+        cfg = self._build(TARGET_CORE_PCT="0.6", TARGET_SATELLITE_PCT="0.3", TARGET_DEFENSIVE_PCT="0.3")
+        self.assertAlmostEqual(cfg["targets"]["core"], 0.5)
+        self.assertAlmostEqual(cfg["targets"]["satellite"], 0.25)
+        self.assertAlmostEqual(cfg["targets"]["defensive"], 0.25)
+        cfg = self._build(TARGET_CORE_PCT="0", TARGET_SATELLITE_PCT="0", TARGET_DEFENSIVE_PCT="0")
+        self.assertEqual(cfg["targets"], {"core": 0.65, "satellite": 0.20, "defensive": 0.15})
+        cfg = self._build(TARGET_CORE_PCT="-1")
+        self.assertGreaterEqual(min(cfg["targets"].values()), 0.0)
+
+    def test_big_tech_settings_are_well_formed(self):
+        self.assertTrue(config.BIG_TECH_TICKERS)
+        self.assertTrue(all(t == t.upper() for t in config.BIG_TECH_TICKERS))
+        for key, weight in config.BIG_TECH_LOOKTHROUGH.items():
+            self.assertTrue(0.0 <= weight <= 3.0, key)
+
+
 if __name__ == "__main__":
     unittest.main()

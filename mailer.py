@@ -1,5 +1,6 @@
 """Email formatting and dispatch module designed for simplicity and institutional research depth."""
 
+import html as _html
 import logging
 import math
 import re
@@ -13,15 +14,24 @@ from typing import Any, Dict, List, Optional
 import config as _config
 from config import SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, RECIPIENT_EMAILS
 from dashboard_generator import (
+    _MIX_EXPLAINER,
+    _MIX_STATUS_TEXT,
     _all_stage2_verified,
+    _allocation_view,
+    _big_tech_view,
+    _bucket_key,
     _crash_delta_text,
     _earmark_line,
     _first_num,
     _gbp,
+    _household_mix_view,
+    _mix_basis_text,
     _num,
     _outside_holdings_line,
     _regime_badge_class,
     _reserve_status,
+    _share_text,
+    _tracking_text,
     _wrapper_footer_line,
 )
 from strategy_engine import generate_tldr_summary
@@ -41,6 +51,20 @@ _REGIME_PALETTE = {
     "badge-orange": {"bg": "#fff7ed", "fg": "#c2410c", "solid": "#ea580c"},
     "badge-rose": {"bg": "#fef2f2", "fg": "#b91c1c", "solid": "#dc2626"},
     "badge-slate": {"bg": "#f1f5f9", "fg": "#475569", "solid": "#64748b"},
+}
+
+# Household-mix status chips: under target (outside the band) = amber, over target = red, within the band = green
+_MIX_CHIP_PALETTE = {
+    "under": {"bg": "#fffbeb", "fg": "#b45309", "border": "#fcd34d"},
+    "over": {"bg": "#fef2f2", "fg": "#b91c1c", "border": "#fecaca"},
+    "in_band": {"bg": "#ecfdf5", "fg": "#047857", "border": "#a7f3d0"},
+}
+
+# Buy-order bucket badges (household strategic allocation)
+_BUCKET_BADGE_PALETTE = {
+    "core": {"bg": "#e0e7ff", "fg": "#3730a3"},
+    "satellite": {"bg": "#fae8ff", "fg": "#86198f"},
+    "defensive": {"bg": "#ccfbf1", "fg": "#115e59"},
 }
 
 
@@ -253,6 +277,134 @@ def format_price(ticker: str, price: Optional[float], currency: str = "USD") -> 
     return f"{p_val:,.2f} {currency}"
 
 
+def _bucket_badge_html(bucket: Any) -> str:
+    """Small inline badge for a buy order's household bucket ('CORE' / 'SATELLITE' / 'DEFENSIVE'); '' if unknown."""
+    key = _bucket_key(bucket)
+    if not key:
+        return ""
+    pal = _BUCKET_BADGE_PALETTE[key]
+    return (
+        f'<span style="background: {pal["bg"]}; color: {pal["fg"]}; font-size: 11px; font-weight: 800; '
+        f'padding: 2px 8px; border-radius: 6px; letter-spacing: 0.03em;">{key.upper()}</span>'
+    )
+
+
+def build_household_mix_html(consolidated_view: Optional[Dict[str, Any]]) -> str:
+    """Compact 'Household mix' card for the top of the email (inline styles, table layout).
+
+    Bucket table (now / target / after today's plan) with coloured status chips, the US big-tech line, the
+    since-tracking-began line and the rebalancing explainer. Each part renders only when the engine supplied its
+    data; returns '' when household_mix, big_tech and tracking_performance are all missing or unusable.
+    """
+    esc = _html.escape
+    mix = _household_mix_view(consolidated_view)
+    big_tech = _big_tech_view(consolidated_view)
+    tracking = _tracking_text(consolidated_view)
+    if not (mix or big_tech or tracking):
+        return ""
+
+    parts: List[str] = []
+    rows = mix.get("rows") or []
+    if rows:
+        body = ""
+        for r in rows:
+            pal = _MIX_CHIP_PALETTE.get(r["status"])
+            chip = (
+                f'<br><span style="display: inline-block; margin-top: 3px; background: {pal["bg"]}; color: {pal["fg"]}; '
+                f'border: 1px solid {pal["border"]}; font-size: 10px; font-weight: 800; padding: 1px 7px; '
+                f'border-radius: 9999px; white-space: nowrap;">{_MIX_STATUS_TEXT.get(r["status"], "")}</span>'
+                if pal else ""
+            )
+            now_color = pal["fg"] if pal else "#0f172a"
+            post_txt = _share_text(r["post_pct"]) if r["post_pct"] is not None else "—"
+            body += f"""
+              <tr style="border-bottom: 1px solid #e2e8f0;">
+                <td style="padding: 9px 8px; font-weight: 700; color: #0f172a; line-height: 1.35;">{esc(r['label'])}{chip}</td>
+                <td style="padding: 9px 8px; text-align: right; font-weight: 800; color: {now_color}; white-space: nowrap;">{_share_text(r['now_pct'])}</td>
+                <td style="padding: 9px 8px; text-align: right; color: #475569; white-space: nowrap;">{_share_text(r['target_pct'])}</td>
+                <td style="padding: 9px 8px; text-align: right; color: #0f172a; white-space: nowrap;">{post_txt}</td>
+              </tr>"""
+        parts.append(f"""
+      <table role="presentation" cellpadding="0" cellspacing="0" style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left;">
+        <thead>
+          <tr style="background-color: #f8fafc; color: #64748b; font-size: 11px; text-transform: uppercase;">
+            <th style="padding: 8px; text-align: left;">Bucket</th>
+            <th style="padding: 8px; text-align: right;">Now</th>
+            <th style="padding: 8px; text-align: right;">Target</th>
+            <th style="padding: 8px; text-align: right;">After today's plan</th>
+          </tr>
+        </thead>
+        <tbody>{body}
+        </tbody>
+      </table>""")
+        if not mix.get("post_trade_available", True):
+            parts.append(
+                '<div style="font-size: 11px; color: #64748b; margin-top: 4px;">'
+                "After-plan figures are unavailable today (no plan applied).</div>"
+            )
+    elif mix.get("summary"):
+        parts.append(f'<div style="font-size: 13px; color: #0f172a; font-weight: 700;">{esc(mix["summary"])}</div>')
+
+    if big_tech:
+        bt_color = "#b91c1c" if big_tech["over_cap"] else "#047857"
+        parts.append(
+            f'<div style="margin-top: 12px; font-size: 13px; color: #0f172a; line-height: 1.5;">🏢 <b>US big tech:</b> '
+            f'<span style="color: {bt_color}; font-weight: 700;">{esc(big_tech["line"])}</span></div>'
+        )
+        bt_sub = "Counts fund look-through and vested shares held outside Trading 212."
+        if big_tech["note"]:
+            bt_sub += f" {big_tech['note']}"
+        parts.append(f'<div style="font-size: 11px; color: #64748b; margin-top: 2px;">{esc(bt_sub)}</div>')
+    if tracking:
+        parts.append(
+            f'<div style="margin-top: 10px; font-size: 13px; color: #0f172a; line-height: 1.5;">📈 {esc(tracking)}</div>'
+        )
+    if rows:
+        parts.append(
+            '<div style="margin-top: 12px; font-size: 12px; color: #475569; background: #f8fafc; border: 1px solid #e2e8f0; '
+            f'border-radius: 8px; padding: 8px 12px; line-height: 1.5;">💡 {esc(_MIX_EXPLAINER)}</div>'
+        )
+
+    basis_txt = _mix_basis_text(mix)
+    basis_html = f'<div style="font-size: 12px; color: #64748b; margin-top: 4px;">{esc(basis_txt)}</div>' if basis_txt else ""
+    parts_html = "".join(parts)
+    return f"""
+    <!-- 🧭 HOUSEHOLD MIX — strategic allocation (core / satellites / defensive) -->
+    <div style="background-color: #ffffff; border-radius: 16px; border: 2px solid #6366f1; margin-bottom: 24px; padding: 20px; box-shadow: 0 4px 14px rgba(99, 102, 241, 0.12);">
+      <div style="border-bottom: 2px solid #f1f5f9; padding-bottom: 10px; margin-bottom: 12px;">
+        <div style="display: inline-block; background: #eef2ff; color: #4338ca; font-size: 11px; font-weight: 800; text-transform: uppercase; padding: 3px 8px; border-radius: 4px; margin-bottom: 4px; border: 1px solid #c7d2fe;">
+          🧭 Household Mix
+        </div>
+        <h2 style="margin: 0; font-size: 18px; font-weight: 900; color: #0f172a;">Household mix: all accounts + vested outside shares</h2>
+        {basis_html}
+      </div>
+      {parts_html}
+    </div>
+    """
+
+
+def _allocation_html(plan: Optional[Dict[str, Any]]) -> str:
+    """Small grey per-account block: buy cadence, today's new-money split and the engine's allocation notes."""
+    alloc = _allocation_view(plan)
+    if not alloc:
+        return ""
+    esc = _html.escape
+    lines: List[str] = []
+    if alloc["cadence"]:
+        lines.append(f"🗓️ <b>New money today:</b> {esc(alloc['cadence'])}")
+    if alloc["split_text"]:
+        lines.append(f"🧭 <b>New money split:</b> {esc(alloc['split_text'])}")
+    notes_html = ""
+    if alloc["notes"]:
+        items = "".join(f"<li style='margin-bottom: 2px;'>{esc(n)}</li>" for n in alloc["notes"])
+        notes_html = f'<ul style="margin: 4px 0 0 18px; padding: 0;">{items}</ul>'
+    lines_html = "<br>".join(lines)
+    return (
+        '<div style="margin: 0 0 14px 0; font-size: 12px; color: #64748b; line-height: 1.5; background: #f8fafc; '
+        f'border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px 12px;">{lines_html}{notes_html}</div>'
+    )
+
+
 def build_tldr_html(
     tldr_summary: Dict[str, Any],
     results_by_account: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -283,6 +435,14 @@ def build_tldr_html(
                 reserve_plan[c5_key] = t_info.get(c5_key)
         reserve = describe_reserve(reserve_plan, acc_data.get("cash"), acc_name)
         stage2_verified = _all_stage2_verified(acc_data.get("analyses") or [])
+        acc_plan = acc_data.get("rebalancing_plan") if isinstance(acc_data.get("rebalancing_plan"), dict) else {}
+        alloc = _allocation_view(acc_plan)
+        bucket_by_symbol: Dict[str, str] = {}
+        for bo in acc_plan.get("buy_orders") or []:
+            if isinstance(bo, dict) and _bucket_key(bo.get("bucket")):
+                for sym in (bo.get("search_symbol"), bo.get("ticker")):
+                    if sym:
+                        bucket_by_symbol.setdefault(str(sym), _bucket_key(bo.get("bucket")))
         sells_queued = t_info.get("sells_already_queued", [])
         buys_queued = t_info.get("buys_already_queued", [])
         sells_to_place = t_info.get("sells_to_place", [])
@@ -358,10 +518,14 @@ def build_tldr_html(
             buy_timing = "2. BUY ORDERS TO PLACE ONCE SELLS FILL:" if phase == "AWAIT_FILLS_THEN_BUY" else "BUY ORDERS TO PLACE TODAY:"
             timing_color = "#92400e" if phase == "AWAIT_FILLS_THEN_BUY" else "#166534"
             timing_border = "#fde68a" if phase == "AWAIT_FILLS_THEN_BUY" else "#bbf7d0"
-            b_items = "".join([
-                f"<li style='margin-bottom: 6px;'><b>BUY {b['name']} ({b['symbol']})</b> ➔ Enter <b>£{b['amount_gbp']:,.0f}</b></li>"
-                for b in buys_to_place
-            ])
+            b_items_list = []
+            for b in buys_to_place:
+                b_badge = _bucket_badge_html(bucket_by_symbol.get(str(b.get("symbol") or "")))
+                b_badge_txt = f" {b_badge}" if b_badge else ""
+                b_items_list.append(
+                    f"<li style='margin-bottom: 6px;'><b>BUY {b['name']} ({b['symbol']})</b>{b_badge_txt} ➔ Enter <b>£{_num(b.get('amount_gbp'), 0.0):,.0f}</b></li>"
+                )
+            b_items = "".join(b_items_list)
             buys_to_place_html = f"""
             <div style="background: #ffffff; border: 1px solid {timing_border}; border-radius: 8px; padding: 12px 14px; margin-top: 10px;">
               <div style="font-weight: 800; color: {timing_color}; font-size: 13px; margin-bottom: 6px;">🎯 {buy_timing}</div>
@@ -390,6 +554,12 @@ def build_tldr_html(
                 f"<span>🛡️ <b>Cash Reserve:</b> £{reserve['floor']:,.0f} floor — ✅ funded from free cash</span>"
             )
 
+        cadence_html = (
+            '<div style="margin-top: 6px; font-size: 11px; color: #64748b; line-height: 1.4;">'
+            f"🗓️ <b>New money today:</b> {_html.escape(alloc['cadence'])}</div>"
+            if alloc.get("cadence") else ""
+        )
+
         card_html = f"""
         <div style="background: {card_bg}; border: 2px solid {card_border}; border-radius: 12px; padding: 16px; margin-bottom: 14px;">
           <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px;">
@@ -417,6 +587,7 @@ def build_tldr_html(
             {reserve_line_html}
             <span>💰 <b>Deployable Capital:</b> £{net_budget:,.0f}</span>
           </div>
+          {cadence_html}
         </div>
         """
         account_cards.append(card_html)
@@ -487,6 +658,9 @@ def generate_html_digest(
 
     if consolidated_view is None:
         consolidated_view = next((v.get("consolidated_view") for v in results_by_account.values() if v.get("consolidated_view")), None)
+
+    # Household strategic mix card (Phase 1): renders nothing when the engine supplied none of its data
+    household_mix_html = build_household_mix_html(consolidated_view)
 
 
     consolidated_overview_html = ""
@@ -611,7 +785,7 @@ def generate_html_digest(
             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; font-size: 12px;">
               <div style="background: #ffffff; border: 1px solid #dcfce7; border-radius: 6px; padding: 8px;">
                 <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">Combined 5Y Sortino</span><br>
-                <b style="color: #15803d; font-size: 14px;">{cons_rt['sortino']}</b> <span style="font-size: 10px; color: #64748b;">(Est. 5Y CAGR, blended hist./model: now {cons_rt['cagr_now']} ➔ after plan {cons_rt['cagr_post']})</span>
+                <b style="color: #15803d; font-size: 14px;">{cons_rt['sortino']}</b> <span style="font-size: 10px; color: #64748b;">(Est. 5Y CAGR, blended hist./model estimate, info only: now {cons_rt['cagr_now']} ➔ after plan {cons_rt['cagr_post']})</span>
               </div>
               <div style="background: #ffffff; border: 1px solid #dcfce7; border-radius: 6px; padding: 8px;">
                 <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">2022 Crash Stress-Test</span><br>
@@ -909,6 +1083,13 @@ def generate_html_digest(
             )
             fwd_cagr_txt = _fwd_cagr_text(fwd_research_val, _cagr_capped_flag(bo_research, bo))
             bo_est = _num(bo.get("estimated_gbp"), 0.0)
+            bucket_badge = _bucket_badge_html(bo.get("bucket"))
+            alloc_reason = str(bo.get("allocation_reason") or "").strip()
+            alloc_reason_html = (
+                f'<div style="font-size: 12px; color: #3730a3; line-height: 1.4; margin-top: 6px;">🧭 <b>Allocation:</b> '
+                f"{_html.escape(alloc_reason)}</div>"
+                if alloc_reason else ""
+            )
 
             action_cards_html += f"""
             <div style="background-color: #f0fdf4; border: 2px solid #bbf7d0; border-radius: 12px; padding: 18px 20px; margin-bottom: 16px;">
@@ -923,9 +1104,10 @@ def generate_html_digest(
 
               <!-- Institutional Quality Badges -->
               <div style="display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px;">
+                {bucket_badge}
                 {role_badge}
                 <span style="background: #ecfdf5; color: #047857; font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 6px;">🚀 5Y Hist. CAGR: {cagr5_txt} (Sortino {sort5_txt})</span>
-                <span style="background: #f5f3ff; color: #6d28d9; font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 6px;">🔮 Fwd 5Y CAGR (model): {fwd_cagr_txt}</span>
+                <span style="background: #f5f3ff; color: #6d28d9; font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 6px;">🔮 Fwd 5Y CAGR (model estimate, info only): {fwd_cagr_txt}</span>
                 <span style="background: {crash_bg}; color: {crash_color}; font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 6px;">🛡️ 2022 Crash: {crash22_txt}</span>
                 <span style="background: #e0f2fe; color: #0369a1; font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 6px;">📈 {bo.get('minervini_stage') or 'Trend stage N/A'}</span>
                 <span style="background: {w_bg}; color: {w_color}; font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 6px;">🌊 {w_label}</span>
@@ -950,6 +1132,7 @@ def generate_html_digest(
               <div style="font-size: 13px; color: #14532d; line-height: 1.4;">
                 💡 <b>Why:</b> {bo.get('plain_english_why', '')}
               </div>
+              {alloc_reason_html}
             </div>
             """
             step_number += 1
@@ -1173,7 +1356,7 @@ def generate_html_digest(
               <!-- Metrics Grid -->
               <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; background: #f8fafc; border-radius: 8px; padding: 12px; margin-bottom: 10px; font-size: 11px;">
                 <div><span style="color: #64748b;">5Y Hist. CAGR:</span> <b style="color: #059669;">{item_cagr5}</b></div>
-                <div><span style="color: #64748b;">Fwd 5Y CAGR (model):</span> <b style="color: #6d28d9;">{item_fwd_cagr}</b></div>
+                <div><span style="color: #64748b;">Fwd 5Y CAGR (model estimate, info only):</span> <b style="color: #6d28d9;">{item_fwd_cagr}</b></div>
                 <div><span style="color: #64748b;">5Y Sortino Ratio:</span> <b style="color: #0284c7;">{item_sort5}</b></div>
                 <div><span style="color: #64748b;">2022 Crash Return:</span> <b style="color: {item_crash22_color};">{item_crash22}</b></div>
                 <div><span style="color: #64748b;">Minervini Trend:</span> <b style="color: #059669;">{item.get('minervini_stage') or 'N/A'}</b></div>
@@ -1218,6 +1401,9 @@ def generate_html_digest(
             </div>
             """
 
+        # Household allocation: buy cadence, today's new-money split and the engine's notes (grey, under the header)
+        allocation_html = _allocation_html(rebalance_plan)
+
         acc_5y = rebalance_plan.get("portfolio_5y_risk_profile") or {}
         acc_5y_html = ""
         if acc_5y:
@@ -1241,7 +1427,7 @@ def generate_html_digest(
               <div style="background: #ffffff; border: 1px solid #dcfce7; border-radius: 8px; padding: 8px 10px;">
                 <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">5Y Sortino (now ➔ after plan)</span><br>
                 <b style="color: #15803d; font-size: 14px;">{acc_rt['sortino']}</b>
-                <div style="font-size: 10px; color: #64748b; margin-top: 2px;">Est. 5Y CAGR (blended): now {acc_rt['cagr_now']} ➔ after plan {acc_rt['cagr_post']}</div>
+                <div style="font-size: 10px; color: #64748b; margin-top: 2px;">Est. 5Y CAGR (blended hist./model estimate, info only): now {acc_rt['cagr_now']} ➔ after plan {acc_rt['cagr_post']}</div>
               </div>
               <div style="background: #ffffff; border: 1px solid #dcfce7; border-radius: 8px; padding: 8px 10px;">
                 <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">2022 Crash Stress-Test</span><br>
@@ -1311,6 +1497,7 @@ def generate_html_digest(
 
           <!-- 2-Minute Action Cards -->
           <h3 style="margin: 0 0 14px 0; font-size: 17px; font-weight: 800; color: #0f172a;">⚡ What To Do in Trading 212 Today</h3>
+          {allocation_html}
           {action_cards_html}
 
           <!-- Thematic Concentration Dashboard -->
@@ -1396,6 +1583,9 @@ def generate_html_digest(
 
         <!-- ⚡ 30-SECOND TL;DR — WHAT TO DO TODAY -->
         {tldr_section_html}
+
+        <!-- 🧭 Household Mix (strategic allocation) -->
+        {household_mix_html}
 
         <!-- Consolidated Portfolio Dashboard -->
         {consolidated_overview_html}

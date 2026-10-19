@@ -32,6 +32,37 @@ BASE_REBALANCE_CFG = {
     "cap_applies_to_broad_etfs": False,
 }
 
+# Legacy allocation used by the pre-household tests: every pound of new money goes through stock selection, buys are
+# daily and the household caps are effectively off, so those tests keep exercising the stock-selection pipeline.
+LEGACY_ALLOCATION_CFG = {
+    "targets": {"core": 0.0, "satellite": 1.0, "defensive": 0.0},
+    "band_pp": 5.0,
+    "satellite_max_single_pct": 1.0,
+    "defensive_split": {"gold": 0.5, "short_gilts": 0.5},
+    "core_buy_ticker": "VWRP.L",
+    "gold_buy_ticker": "SGLN.L",
+    "short_gilt_buy_ticker": "IGLS.L",
+    "big_tech_cap_pct": 10.0,
+    "buy_cadence": "daily",
+    "off_cycle_min_deploy_gbp": 2000.0,
+}
+
+# The owner-approved household defaults (config.ALLOCATION_CONFIG as shipped), used by the household tests
+HOUSEHOLD_ALLOCATION_CFG = {
+    "targets": {"core": 0.65, "satellite": 0.20, "defensive": 0.15},
+    "band_pp": 5.0,
+    "satellite_max_single_pct": 0.05,
+    "defensive_split": {"gold": 0.5, "short_gilts": 0.5},
+    "core_buy_ticker": "VWRP.L",
+    "gold_buy_ticker": "SGLN.L",
+    "short_gilt_buy_ticker": "IGLS.L",
+    "big_tech_cap_pct": 0.30,
+    "buy_cadence": "monthly",
+    "off_cycle_min_deploy_gbp": 2000.0,
+}
+BIG_TECH = {"AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "AVGO", "TSLA"}
+BIG_TECH_LOOKTHROUGH = {"VWRP": 0.22, "VUAA": 0.35, "VUAG": 0.35, "CNDX": 0.50, "CNX1": 0.50, "QQQ3": 1.50}
+
 
 # ---------------------------------------------------------------------------
 # Fakes & builders
@@ -154,6 +185,8 @@ VOLUME_ACCUM = {
 class EngineTestCase(unittest.TestCase):
     """Isolates every test: no network, empty caches, deterministic config limits / exclusions / earmarks / outside holdings."""
 
+    allocation_cfg = LEGACY_ALLOCATION_CFG
+
     def setUp(self):
         se.reset_runtime_caches()
         self._patches = [
@@ -162,6 +195,9 @@ class EngineTestCase(unittest.TestCase):
             mock.patch.object(config, "EARMARKED_TICKERS", set(), create=True),
             mock.patch.object(config, "OUTSIDE_HOLDINGS", {}, create=True),
             mock.patch.object(se, "EXCLUDED_TICKERS", {"COIN"}),
+            mock.patch.object(config, "ALLOCATION_CONFIG", dict(self.allocation_cfg), create=True),
+            mock.patch.object(config, "BIG_TECH_TICKERS", set(BIG_TECH), create=True),
+            mock.patch.object(config, "BIG_TECH_LOOKTHROUGH", dict(BIG_TECH_LOOKTHROUGH), create=True),
         ]
         for p in self._patches:
             p.start()
@@ -843,7 +879,14 @@ class TestPendingOrdersAndCash(EngineTestCase):
         self.assertEqual(t["phase"], "ALL_SET")
         self.assertNotIn("fully balanced", t["phase_desc"])
         t = se.generate_tldr_summary({"Main": {"rebalancing_plan": {"available_cash_gbp": 5000.0, "reserve_floor_gbp": 1500.0}}})["Main"]
-        self.assertIn("fully balanced", t["phase_desc"])
+        self.assertEqual(t["phase_desc"], "No action required today.")
+        self.assertNotIn("fully balanced", t["phase_desc"])  # never claim balance the engine has not measured
+        deferred = {"available_cash_gbp": 3000.0, "reserve_floor_gbp": 1500.0, "household_allocation": {
+            "buys_allowed": False, "deployable_gbp": 1350.0,
+            "cadence_note": "Monthly buy cadence: £1,350 deployable will be invested on the next buy day (Mon 02 Nov 2026)."}}
+        t = se.generate_tldr_summary({"Main": {"rebalancing_plan": deferred}})["Main"]
+        self.assertEqual(t["phase"], "ALL_SET")
+        self.assertIn("next buy day", t["phase_desc"])
 
 
 # ---------------------------------------------------------------------------
@@ -1127,6 +1170,326 @@ class TestEndToEndOffline(EngineTestCase):
         self.assertEqual(view2["holdings"]["NVDA"]["accounts"], ["Main", "Secondary"])
         self.assertIn(tldr["Main"]["phase"], ("ALL_SET", "SELL_FIRST", "TRIM_FIRST"))
         self.assertIn("unfunded", tldr["Main"]["reserve_note"].lower())
+
+
+# ---------------------------------------------------------------------------
+# Household strategic allocation (Phase 1, 2026-10-19)
+# ---------------------------------------------------------------------------
+def fund(ticker, price_gbp, cluster, value_gbp=0.0, **overrides):
+    """A priced fund analysis (e.g. from the watchlist scan) that may or may not be held."""
+    return make_analysis(ticker, value_gbp, price_gbp=price_gbp, macro_cluster=cluster, **overrides)
+
+
+def bucket_universe():
+    return [
+        fund("VWRP.L", 120.0, "Diversified Index Core"),
+        fund("SGLN.L", 60.0, "Uncorrelated Crash Hedge & Gold"),
+        fund("IGLS.L", 130.0, "Defensive Gilts & Cash"),
+    ]
+
+
+class TestHouseholdHelpers(EngineTestCase):
+    allocation_cfg = HOUSEHOLD_ALLOCATION_CFG
+
+    def test_bucket_classification(self):
+        expected = {
+            "VWRP.L": "core", "VUAA.L": "core", "VUAG.L": "core", "CSPX.L": "core",
+            "CNX1.L": "satellite", "CNDX.L": "satellite", "QQQ3.L": "satellite", "NVDA": "satellite",
+            "BRK-B": "satellite", "SMGB.L": "satellite",
+            "SGLN.L": "defensive", "IGLS.L": "defensive", "ERNS.L": "defensive", "CSH2.L": "defensive",
+        }
+        for ticker, bucket in expected.items():
+            self.assertEqual(se.classify_bucket(ticker), bucket, ticker)
+
+    def test_crash_shield_is_strict(self):
+        for t in ("BRK-B", "LLY", "ABBV", "VWRP.L", "MSFT"):
+            self.assertFalse(se.is_crash_shield_asset(t, "Defensive Ballast & Value", 0.2, 10.0), t)
+        for t in ("SGLN.L", "IGLS.L", "CSH2.L"):
+            self.assertTrue(se.is_crash_shield_asset(t), t)
+
+    def test_big_tech_lookthrough_weights(self):
+        self.assertEqual(se.big_tech_weight("NVDA"), 1.0)
+        self.assertEqual(se.big_tech_weight("GOOGL"), 1.0)
+        self.assertAlmostEqual(se.big_tech_weight("VWRP.L"), 0.22)
+        self.assertAlmostEqual(se.big_tech_weight("VUAA.L"), 0.35)
+        self.assertAlmostEqual(se.big_tech_weight("CNX1.L"), 0.50)
+        self.assertAlmostEqual(se.big_tech_weight("QQQ3.L"), 1.50)
+        self.assertEqual(se.big_tech_weight("BRK-B"), 0.0)
+        self.assertEqual(se.big_tech_weight("SGLN.L"), 0.0)
+
+    def test_uk_bank_holidays_and_buy_days(self):
+        from datetime import date
+        self.assertIn(date(2026, 12, 28), se.uk_bank_holidays(2026))  # Boxing Day (Sat) substitute
+        self.assertIn(date(2028, 1, 3), se.uk_bank_holidays(2028))    # New Year's Day (Sat) substitute
+        self.assertIn(date(2027, 3, 26), se.uk_bank_holidays(2027))   # Good Friday
+        self.assertEqual(se.first_london_business_day(2026, 1), date(2026, 1, 2))
+        self.assertEqual(se.first_london_business_day(2026, 11), date(2026, 11, 2))  # 1 Nov is a Sunday
+        self.assertEqual(se.first_london_business_day(2028, 5), date(2028, 5, 2))    # 1 May 2028 = bank holiday
+        self.assertEqual(se.next_monthly_buy_day(date(2026, 10, 19)), date(2026, 11, 2))
+        self.assertEqual(se.next_monthly_buy_day(date(2026, 11, 2)), date(2026, 11, 2))
+        self.assertEqual(se.next_monthly_buy_day(date(2026, 12, 31)), date(2027, 1, 4))
+
+    def test_allocate_new_money_follows_shortfall_and_never_feeds_overweight(self):
+        alloc = se.allocate_new_money(5000.0, {"core": 22000.0, "satellite": 75000.0, "defensive": 3000.0}, 105000.0)
+        self.assertEqual(alloc["satellite"], 0.0)
+        self.assertAlmostEqual(sum(alloc.values()), 5000.0, places=6)
+        core_gap, def_gap = 0.65 * 105000 - 22000, 0.15 * 105000 - 3000
+        self.assertAlmostEqual(alloc["core"], 5000.0 * core_gap / (core_gap + def_gap), places=6)
+
+    def test_allocate_new_money_out_of_band_bucket_first(self):
+        # Core 50% (more than 5pp below 65%) is filled before in-band shortfalls
+        alloc = se.allocate_new_money(5000.0, {"core": 50000.0, "satellite": 19000.0, "defensive": 26000.0}, 100000.0)
+        self.assertAlmostEqual(alloc["core"], 5000.0, places=6)
+        # All in band: split across the under-target buckets in proportion to their shortfall
+        alloc = se.allocate_new_money(5000.0, {"core": 64000.0, "satellite": 21000.0, "defensive": 10000.0}, 100000.0)
+        self.assertEqual(alloc["satellite"], 0.0)
+        self.assertAlmostEqual(alloc["core"], 5000.0 * 1000.0 / 6000.0, places=6)
+        self.assertAlmostEqual(alloc["defensive"], 5000.0 * 5000.0 / 6000.0, places=6)
+        self.assertEqual(se.allocate_new_money(0.0, {"core": 1.0}, 10.0), {"core": 0.0, "satellite": 0.0, "defensive": 0.0})
+
+    def test_household_mix_values_status_and_post_trade(self):
+        holdings = [{"ticker": "VWRP.L", "value_gbp": 20000.0}, {"ticker": "NVDA", "value_gbp": 70000.0},
+                    {"ticker": "SGLN.L", "value_gbp": 2000.0}]
+        outside = [{"account": "Main", "ticker": "GOOGL", "vested_gbp": 5000.0, "unvested_gbp": 9000.0}]
+        mix = se.compute_household_mix(holdings, 3000.0, outside, excluded_cash_gbp=6500.0,
+                                       sell_orders=[{"ticker": "NVDA", "estimated_gbp": 10000.0}],
+                                       buy_orders=[{"ticker": "VWRP.L", "estimated_gbp": 2000.0, "bucket": "core"}])
+        self.assertEqual(mix["basis_gbp"], 100000.0)  # unvested and excluded top-up cash never count
+        self.assertEqual(mix["values_gbp"], {"core": 20000.0, "satellite": 75000.0, "defensive": 5000.0})
+        rows = {r["bucket"]: r for r in mix["buckets"]}
+        self.assertEqual(rows["core"]["status"], "under")
+        self.assertEqual(rows["satellite"]["status"], "over")
+        self.assertEqual(rows["defensive"]["status"], "under")
+        self.assertEqual(rows["core"]["post_trade_gbp"], 22000.0)
+        self.assertEqual(rows["satellite"]["post_trade_gbp"], 65000.0)
+        self.assertEqual(rows["defensive"]["post_trade_gbp"], 13000.0)
+        self.assertEqual(mix["excluded_cash_gbp"], 6500.0)
+        self.assertTrue(mix["post_trade_available"])
+        self.assertFalse(se.compute_household_mix(holdings, 0.0)["post_trade_available"])
+
+    def test_big_tech_exposure_with_lookthrough_and_outside_shares(self):
+        holdings = [{"account": "Main", "ticker": "NVDA", "value_gbp": 10000.0},
+                    {"account": "Second", "ticker": "VUAA.L", "value_gbp": 10000.0},
+                    {"account": "Second", "ticker": "LIN", "value_gbp": 10000.0}]
+        outside = [{"account": "Main", "ticker": "GOOGL", "vested_gbp": 20000.0}]
+        bt = se.compute_big_tech_exposure(holdings, outside, 100000.0,
+                                          sell_orders=[{"ticker": "NVDA", "estimated_gbp": 2000.0}],
+                                          buy_orders=[{"ticker": "VWRP.L", "estimated_gbp": 5000.0}])
+        self.assertAlmostEqual(bt["exposure_gbp"], 10000.0 + 3500.0 + 20000.0)
+        self.assertEqual(bt["exposure_pct"], 33.5)
+        self.assertTrue(bt["over_cap"])
+        self.assertAlmostEqual(bt["post_trade_exposure_gbp"], 33500.0 - 2000.0 + 1100.0)
+        self.assertEqual(bt["breakdown"][0]["ticker"], "GOOGL")
+        self.assertEqual({r["source"] for r in bt["breakdown"]}, {"direct", "fund", "outside"})
+        self.assertNotIn("LIN", [r["ticker"] for r in bt["breakdown"]])
+
+
+class TestHouseholdPlan(EngineTestCase):
+    allocation_cfg = HOUSEHOLD_ALLOCATION_CFG
+
+    def setUp(self):
+        super().setUp()
+        from datetime import date
+        self.off_cycle_day = date(2026, 10, 19)  # not the first London business day of the month
+        self.buy_day = date(2026, 11, 2)
+
+    def hh_plan(self, analyses, cash, opps=None, universe=None, as_of=None, **kwargs):
+        kwargs.setdefault("min_cash_reserve_gbp", 500.0)
+        return self.plan(analyses, cash=cash, opps=opps, account_name="Second",
+                         instrument_universe=bucket_universe() if universe is None else universe,
+                         as_of=as_of or self.off_cycle_day, **kwargs)
+
+    def tech_heavy_book(self):
+        return [make_analysis("NVDA", 60000.0, macro_cluster="AI Hardware & Semiconductors"),
+                make_analysis("MSFT", 30000.0, action_short="BUY", conviction_score=90),
+                fund("VUAA.L", 100.0, "Diversified Index Core", value_gbp=10000.0)]
+
+    def test_off_cycle_buy_goes_to_core_and_defensive_only(self):
+        meta = make_analysis("META", 0.0, conviction_score=95, is_new_addition=True)
+        plan = self.hh_plan(self.tech_heavy_book(), cash=6000.0, opps=[meta])
+        buys = {b["ticker"]: b for b in plan["buy_orders"]}
+        self.assertEqual(set(buys), {"VWRP.L", "SGLN.L", "IGLS.L"})
+        self.assertEqual(buys["VWRP.L"]["bucket"], "core")
+        self.assertEqual(buys["SGLN.L"]["bucket"], "defensive")
+        self.assertEqual(buys["IGLS.L"]["bucket"], "defensive")
+        self.assertAlmostEqual(sum(b["estimated_gbp"] for b in plan["buy_orders"]), 5500.0, delta=1.0)
+        self.assertGreater(buys["VWRP.L"]["estimated_gbp"], buys["SGLN.L"]["estimated_gbp"] + buys["IGLS.L"]["estimated_gbp"])
+        alloc = plan["household_allocation"]
+        self.assertTrue(alloc["buys_allowed"])
+        self.assertIn("Off-cycle", alloc["cadence_note"])
+        self.assertEqual(alloc["by_bucket_gbp"]["satellite"], 0.0)
+        notes = " ".join(alloc["notes"])
+        self.assertIn("Satellites", notes)
+        self.assertIn("big tech", notes)
+        self.assertTrue(all(b["is_new"] for b in plan["buy_orders"]))  # none of the bucket funds is held here
+
+    def test_monthly_cadence_defers_small_buys_until_buy_day(self):
+        book = self.cap_compliant_book()
+        plan = self.hh_plan(book, cash=2200.0)  # £1,700 deployable < £2,000 off-cycle threshold
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(plan["sell_orders"], [])
+        alloc = plan["household_allocation"]
+        self.assertFalse(alloc["buys_allowed"])
+        self.assertEqual(alloc["next_buy_day"], "2026-11-02")
+        self.assertEqual(alloc["deployable_gbp"], 1700.0)
+        self.assertEqual(plan["net_budget_to_deploy_gbp"], 0.0)
+        tldr = se.generate_tldr_summary({"Second": {"rebalancing_plan": plan}})["Second"]
+        self.assertEqual(tldr["phase"], "ALL_SET")
+        self.assertIn("next buy day", tldr["phase_desc"])
+        plan = self.hh_plan(self.cap_compliant_book(), cash=2200.0, as_of=self.buy_day)
+        self.assertTrue(plan["buy_orders"])
+        self.assertIn("Monthly buy day", plan["household_allocation"]["cadence_note"])
+
+    def test_daily_cadence_buys_small_amounts_any_day(self):
+        config.ALLOCATION_CONFIG["buy_cadence"] = "daily"
+        plan = self.hh_plan(self.cap_compliant_book(), cash=2200.0)
+        self.assertTrue(plan["buy_orders"])
+        self.assertTrue(plan["household_allocation"]["buys_allowed"])
+
+    def test_reserve_invariant_still_blocks_all_buys(self):
+        plan = self.hh_plan(self.cap_compliant_book(), cash=1400.0, as_of=self.buy_day)  # < £500 reserve + £1,000
+        self.assertEqual(plan["buy_orders"], [])
+        tldr = se.generate_tldr_summary({"Second": {"rebalancing_plan": plan}})["Second"]
+        self.assertEqual(tldr["phase_label"], "✅ ALL SET — SIT BACK & RELAX")
+
+    def cap_compliant_book(self):
+        """Tech-heavy, but no single position above the 15% account cap (so no cap trims interfere)."""
+        names = ("NVDA", "MSFT", "AAPL", "AMZN", "META", "LIN")
+        return [make_analysis(t, 14000.0, macro_cluster=f"Cluster {t}") for t in names] + [
+            fund("VUAA.L", 100.0, "Diversified Index Core", value_gbp=10000.0)]
+
+    def test_underweight_satellites_use_stock_selection_with_5pct_cap(self):
+        book = [fund("VWRP.L", 100.0, "Diversified Index Core", value_gbp=80000.0),
+                fund("SGLN.L", 60.0, "Uncorrelated Crash Hedge & Gold", value_gbp=8000.0),
+                fund("IGLS.L", 130.0, "Defensive Gilts & Cash", value_gbp=7000.0)]
+        lin = make_analysis("LIN", 0.0, price_gbp=400.0, conviction_score=80, is_new_addition=True,
+                            macro_cluster="Infrastructure & Electrification")
+        plan = self.hh_plan(book, cash=6000.0, opps=[lin])
+        buys = {b["ticker"]: b for b in plan["buy_orders"]}
+        self.assertIn("LIN", buys)
+        self.assertEqual(buys["LIN"]["bucket"], "satellite")
+        basis = plan["household_allocation"]["deployable_gbp"] + 0.0
+        self.assertEqual(plan["household_allocation"]["by_bucket_gbp"]["satellite"], basis)
+        self.assertLessEqual(buys["LIN"]["estimated_gbp"], 0.05 * 101000.0 + 0.01)  # 5% household single-stock cap
+        self.assertAlmostEqual(sum(b["estimated_gbp"] for b in plan["buy_orders"]), 5500.0, delta=1.0)
+        self.assertIn("Model forward 5Y estimate", buys["LIN"]["plain_english_why"])
+        self.assertIn("info only", buys["LIN"]["plain_english_why"])
+
+    def test_big_tech_cap_blocks_big_tech_satellites(self):
+        book = [fund("VUAG.L", 100.0, "Diversified Index Core", value_gbp=65000.0),
+                make_analysis("MSFT", 10000.0),
+                fund("SGLN.L", 60.0, "Uncorrelated Crash Hedge & Gold", value_gbp=10000.0),
+                fund("IGLS.L", 130.0, "Defensive Gilts & Cash", value_gbp=10000.0)]
+        meta = make_analysis("META", 0.0, conviction_score=95, is_new_addition=True,
+                             macro_cluster="Consumer & Digital Platforms")
+        lin = make_analysis("LIN", 0.0, price_gbp=400.0, conviction_score=70, is_new_addition=True,
+                            macro_cluster="Infrastructure & Electrification")
+        plan = self.hh_plan(book, cash=6000.0, opps=[meta, lin])
+        tickers = [b["ticker"] for b in plan["buy_orders"]]
+        self.assertNotIn("META", tickers)  # big tech is ~32% of the household vs the 30% cap
+        self.assertIn("LIN", tickers)
+        self.assertIn("big tech", " ".join(plan["household_allocation"]["notes"]))
+
+    def test_household_single_stock_cap_blocks_adds(self):
+        book = [fund("VWRP.L", 100.0, "Diversified Index Core", value_gbp=80000.0),
+                make_analysis("LIN", 6000.0, action_short="BUY", conviction_score=85,
+                              macro_cluster="Infrastructure & Electrification")]
+        plan = self.hh_plan(book, cash=6000.0)
+        self.assertNotIn("LIN", [b["ticker"] for b in plan["buy_orders"]])  # 6.5% of the household > 5%
+        self.assertEqual(plan["household_allocation"]["ordered_by_bucket_gbp"]["satellite"], 0.0)
+        self.assertTrue(any(b["bucket"] == "defensive" for b in plan["buy_orders"]))  # unspent money still invested
+
+    def test_usd_lines_never_get_new_money(self):
+        config.ALLOCATION_CONFIG.update(LEGACY_ALLOCATION_CFG)  # all new money to satellites
+        book = [fund("CNDX.L", 100.0, "Diversified Index Core", value_gbp=5000.0, action_short="BUY", conviction_score=90)]
+        cnx1 = fund("CNX1.L", 100.0, "Diversified Index Core", conviction_score=90, is_new_addition=True)
+        plan = self.hh_plan(book, cash=6000.0, opps=[fund("VUAA.L", 100.0, "Diversified Index Core", is_new_addition=True), cnx1])
+        tickers = [b["ticker"] for b in plan["buy_orders"]]
+        self.assertNotIn("CNDX.L", tickers)
+        self.assertIn("CNX1.L", tickers)
+
+    def test_unpriced_core_fund_stays_in_cash_with_note(self):
+        universe = [fund("SGLN.L", 60.0, "Uncorrelated Crash Hedge & Gold"), fund("IGLS.L", 130.0, "Defensive Gilts & Cash")]
+        plan = self.hh_plan(self.tech_heavy_book(), cash=6000.0, universe=universe)
+        self.assertNotIn("VWRP.L", [b["ticker"] for b in plan["buy_orders"]])
+        self.assertIn("VWRP.L not bought because no valid GBP price", " ".join(plan["household_allocation"]["notes"]))
+        self.assertTrue(any(b["bucket"] == "defensive" for b in plan["buy_orders"]))
+
+    def test_pending_core_buy_is_not_duplicated(self):
+        pending = {"pending_buys": {"VWRP.L": {"estimated_value": 4000.0}}, "pending_sells": {}, "has_orders_scope": True}
+        plan = self.hh_plan(self.tech_heavy_book(), cash=6000.0, pending_orders_data=pending)
+        self.assertNotIn("VWRP.L", [b["ticker"] for b in plan["buy_orders"]])
+        self.assertIn("already pending", " ".join(plan["household_allocation"]["notes"]))
+
+    def test_forward_cagr_no_longer_changes_sizing(self):
+        config.ALLOCATION_CONFIG.update(LEGACY_ALLOCATION_CFG)
+        hi = make_analysis("AAA", 0.0, conviction_score=80, is_new_addition=True, expected_5y_cagr_pct=28.5,
+                           macro_cluster="Financials & Payment Rails")
+        lo = make_analysis("BBB", 0.0, conviction_score=80, is_new_addition=True, expected_5y_cagr_pct=5.5,
+                           macro_cluster="Healthcare & Biopharma")
+        plan = self.hh_plan([make_analysis("VWRP.L", 50000.0, macro_cluster="Diversified Index Core")], cash=8000.0,
+                            opps=[hi, lo])
+        buys = {b["ticker"]: b for b in plan["buy_orders"]}
+        self.assertEqual(set(buys), {"AAA", "BBB"})
+        self.assertAlmostEqual(buys["AAA"]["estimated_gbp"], buys["BBB"]["estimated_gbp"], delta=0.01)
+        self.assertEqual(buys["AAA"]["rebalance_score"], buys["BBB"]["rebalance_score"])
+
+    def _two_accounts(self, topup=0.0):
+        return {
+            "Main": {"cfg": {"reserve_topup_gbp": topup},
+                    "cash": {"free_gbp": 6000.0, "blocked_gbp": 0.0},
+                    "analyses": [fund("VWRP.L", 100.0, "Diversified Index Core", value_gbp=40000.0),
+                                 make_analysis("NVDA", 40000.0, macro_cluster="AI Hardware & Semiconductors")]},
+            "Second": {"cfg": {}, "cash": {"free_gbp": 6000.0, "blocked_gbp": 0.0},
+                     "analyses": [make_analysis("MSFT", 10000.0)]},
+        }
+
+    def _account_plan(self, accounts, name, view):
+        return self.plan(accounts[name]["analyses"], cash=accounts[name]["cash"]["free_gbp"], account_name=name,
+                         min_cash_reserve_gbp=500.0, global_context=view, instrument_universe=bucket_universe(),
+                         as_of=self.off_cycle_day)
+
+    def test_shared_ledger_prevents_double_filling_across_accounts(self):
+        accounts = self._two_accounts()
+        view = se.build_consolidated_portfolio_view(accounts, gbp_rate=1.25)
+        self.assertEqual(view["household_mix"]["basis_gbp"], 102000.0)
+        main = self._account_plan(accounts, "Main", view)
+        ledger = view["household_mix"]["ledger"]
+        main_core = sum(b["estimated_gbp"] for b in main["buy_orders"] if b["bucket"] == "core")
+        self.assertAlmostEqual(ledger["core"], main_core, places=6)
+        second = self._account_plan(accounts, "Second", view)
+        fresh_view = se.build_consolidated_portfolio_view(self._two_accounts(), gbp_rate=1.25)
+        second_fresh = self._account_plan(self._two_accounts(), "Second", fresh_view)
+        # Main already filled part of the household core gap, so Second's plan puts less into core
+        self.assertLess(second["household_allocation"]["by_bucket_gbp"]["core"],
+                        second_fresh["household_allocation"]["by_bucket_gbp"]["core"])
+        rebuilt = se.build_consolidated_portfolio_view(accounts, gbp_rate=1.25, account_plans={"Main": main, "Second": second})
+        rows = {r["bucket"]: r for r in rebuilt["household_mix"]["buckets"]}
+        spent = sum(b["estimated_gbp"] for p in (main, second) for b in p["buy_orders"])
+        self.assertAlmostEqual(rows["core"]["post_trade_gbp"] - rows["core"]["current_gbp"],
+                               sum(b["estimated_gbp"] for p in (main, second) for b in p["buy_orders"] if b["bucket"] == "core"), places=2)
+        self.assertAlmostEqual(sum(r["post_trade_gbp"] for r in rows.values()), rebuilt["household_mix"]["basis_gbp"], places=2)
+        self.assertGreater(spent, 0.0)
+        self.assertTrue(rebuilt["household_mix"]["post_trade_available"])
+
+    def test_topup_cash_and_earmarked_funds_are_outside_the_household_basis(self):
+        accounts = self._two_accounts(topup=6500.0)
+        accounts["Main"]["analyses"].append(make_analysis("CSH2.L", 20000.0, macro_cluster="Uncorrelated Crash Hedge & Gold"))
+        with mock.patch.object(config, "EARMARKED_TICKERS", {"CSH2.L"}):
+            view = se.build_consolidated_portfolio_view(accounts, gbp_rate=1.25)
+        mix = view["household_mix"]
+        self.assertEqual(mix["excluded_cash_gbp"], 6000.0)  # all of Main's free cash is the parked top-up
+        self.assertEqual(mix["basis_gbp"], 40000.0 + 40000.0 + 10000.0 + 6000.0)  # CSH2 and top-up cash excluded
+        self.assertIn("big_tech", view)
+        self.assertAlmostEqual(view["big_tech"]["exposure_gbp"], 40000.0 * 0.22 + 40000.0 + 10000.0)
+
+    def test_risk_profile_shield_uses_strict_definition(self):
+        book = [make_analysis("BRK-B", 10000.0, macro_cluster="Defensive Ballast & Value", beta_5y=0.3, crash_2022_ret_pct=4.0),
+                fund("IGLS.L", 130.0, "Defensive Gilts & Cash", value_gbp=10000.0, beta_5y=0.05, crash_2022_ret_pct=-3.0),
+                make_analysis("MSFT", 80000.0)]
+        rp = se.compute_portfolio_5y_risk_profile(book, 0.0, 0.0, 100000.0)
+        self.assertEqual(rp["current_shield_pct"], 10.0)     # IGLS only; BRK-B is a stock
+        self.assertEqual(rp["current_defensive_pct"], 10.0)
 
 
 class TestCompiles(unittest.TestCase):
