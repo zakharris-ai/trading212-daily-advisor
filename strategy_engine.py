@@ -3,10 +3,11 @@
 import logging
 import math
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 import config
 import research_agent as research_agent_module
@@ -470,26 +471,99 @@ def _live_quote(pair: str) -> Optional[float]:
 def get_gbp_usd_rate() -> float:
     """Fetches the current GBP/USD exchange rate (e.g. 1.35 means £1 = $1.35).
 
-    Raises RuntimeError when no live quote is available: a static fallback rate is never assumed silently.
+    Source order: Yahoo's live quote (GBPUSD=X), then the keyless reference sources in
+    _FX_REFERENCE_SOURCES (ECB, ExchangeRate-API). Raises RuntimeError only when every source fails:
+    a static fallback rate is never assumed silently.
     """
     global _CACHED_GBP_RATE
     if _CACHED_GBP_RATE is not None:
         return _CACHED_GBP_RATE
     try:
         rate = _live_quote("GBPUSD=X")
+        yahoo_problem = None if rate is not None and 0.5 <= rate <= 3.0 else f"unavailable or implausible ({rate!r})"
     except Exception as e:
-        raise RuntimeError(f"Failed to fetch live GBPUSD rate: {e}") from e
-    if rate is None or not (0.5 <= rate <= 3.0):
-        raise RuntimeError(f"Live GBPUSD rate unavailable or implausible ({rate!r})")
+        rate, yahoo_problem = None, str(e)
+    if yahoo_problem is not None:
+        logger.warning("Live Yahoo GBPUSD=X quote failed (%s); trying reference FX sources.", yahoo_problem)
+        fallback = _reference_fx_rate("GBP", "USD", bounds=(0.5, 3.0))
+        if fallback is None:
+            raise RuntimeError(
+                f"Failed to fetch live GBPUSD rate: Yahoo {yahoo_problem}; every reference FX source also failed"
+            )
+        rate, source = fallback
+        logger.warning("Using GBP/USD %.4f from %s because the Yahoo quote was unavailable.", rate, source)
     _CACHED_GBP_RATE = rate
     return rate
+
+
+# Keyless public reference-rate sources, consulted only when Yahoo's live quote fails (for example when
+# Yahoo rate-limits GitHub's cloud runners). Both publish real market rates, so a fallback is never a
+# static assumption: ECB euro reference rates via Frankfurter (every TARGET business day) and
+# ExchangeRate-API's open endpoint (refreshed daily).
+_FX_REFERENCE_SOURCES: Tuple[Tuple[str, str], ...] = (
+    ("ECB reference rate (frankfurter.dev)", "https://api.frankfurter.dev/v1/latest?base={base}&symbols={quote}"),
+    ("ExchangeRate-API (open.er-api.com)", "https://open.er-api.com/v6/latest/{base}"),
+)
+# A reference rate published longer ago than this is treated as unavailable (covers weekends and holidays).
+_FX_REFERENCE_MAX_AGE_DAYS = 5
+
+
+def _fetch_json(url: str, timeout: float = 10.0) -> Any:
+    """HTTP GET returning the decoded JSON body; raises on any network, HTTP-status or JSON error."""
+    resp = requests.get(url, timeout=timeout, headers={"User-Agent": "trading212-notifier"})
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _reference_rate_date(payload: Dict[str, Any]) -> Optional[date]:
+    """Publication date of a reference-rate payload (Frankfurter `date` or ExchangeRate-API unix time)."""
+    raw_date = payload.get("date")
+    if raw_date:
+        try:
+            return datetime.strptime(str(raw_date)[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    unix_time = _num(payload.get("time_last_update_unix"), None)
+    if unix_time is not None and unix_time > 0:
+        return datetime.fromtimestamp(unix_time, tz=timezone.utc).date()
+    return None
+
+
+def _reference_fx_rate(
+    base: str, quote: str, bounds: Tuple[float, float] = (0.0, math.inf)
+) -> Optional[Tuple[float, str]]:
+    """Units of `quote` per 1 `base` from the first usable reference source, as (rate, source label).
+
+    A source is skipped when it errors, returns no positive rate inside `bounds`, or publishes a rate
+    older than _FX_REFERENCE_MAX_AGE_DAYS. Returns None when no source is usable; never raises.
+    """
+    today = datetime.now(timezone.utc).date()
+    for label, template in _FX_REFERENCE_SOURCES:
+        try:
+            payload = _fetch_json(template.format(base=base, quote=quote))
+            if not isinstance(payload, dict):
+                raise ValueError(f"unexpected payload type {type(payload).__name__}")
+            rate = _num((payload.get("rates") or {}).get(quote), None)
+            published = _reference_rate_date(payload)
+        except Exception as e:
+            logger.warning("FX fallback %s failed for %s/%s: %s", label, base, quote, e)
+            continue
+        if rate is None or rate <= 0 or not (bounds[0] <= rate <= bounds[1]):
+            logger.warning("FX fallback %s returned no usable %s/%s rate (%r).", label, base, quote, rate)
+            continue
+        if published is None or (today - published).days > _FX_REFERENCE_MAX_AGE_DAYS:
+            logger.warning("FX fallback %s %s/%s rate is stale or undated (%s); ignoring it.", label, base, quote, published)
+            continue
+        return rate, f"{label}, published {published.isoformat()}"
+    return None
 
 
 def get_fx_to_gbp(ccy: str) -> float:
     """Returns GBP per 1 unit of `ccy` from live yfinance ({CCY}GBP=X), cached per process.
 
     GBP -> 1.0 and GBp/GBX (pence) -> 0.01 without a lookup; USD uses the same live GBPUSD=X anchor as
-    get_gbp_usd_rate() so every USD conversion in a run is consistent. Raises RuntimeError on failure.
+    get_gbp_usd_rate() so every USD conversion in a run is consistent. When Yahoo fails, the keyless
+    reference sources (_FX_REFERENCE_SOURCES) are tried; raises RuntimeError only when all of them fail.
     """
     raw = str(ccy or "").strip()
     if raw == "GBp" or raw.upper() in ("GBX", "PENCE", "GBPX"):
@@ -513,8 +587,12 @@ def get_fx_to_gbp(ccy: str) -> float:
         logger.warning("Failed to fetch live %s rate: %s", pair, e)
         rate = None
     if rate is None or rate <= 0:
-        _CACHED_FX_TO_GBP[code] = None
-        raise RuntimeError(f"Live {pair} rate unavailable")
+        fallback = _reference_fx_rate(code, "GBP")
+        if fallback is None:
+            _CACHED_FX_TO_GBP[code] = None
+            raise RuntimeError(f"Live {pair} rate unavailable (Yahoo and every reference FX source failed)")
+        rate, source = fallback
+        logger.warning("Using %s->GBP %.6f from %s because the Yahoo %s quote was unavailable.", code, rate, source, pair)
     _CACHED_FX_TO_GBP[code] = rate
     return rate
 

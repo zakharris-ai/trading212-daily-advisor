@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import math  # noqa: E402
 import py_compile  # noqa: E402
 import unittest  # noqa: E402
-from datetime import datetime, timedelta  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
 from unittest import mock  # noqa: E402
 
 import numpy as np  # noqa: E402
@@ -191,6 +191,7 @@ class EngineTestCase(unittest.TestCase):
         se.reset_runtime_caches()
         self._patches = [
             mock.patch.object(se.yf, "Ticker", side_effect=RuntimeError("network disabled in offline tests")),
+            mock.patch.object(se, "_fetch_json", side_effect=RuntimeError("network disabled in offline tests")),
             mock.patch.dict(se.REBALANCE_CONFIG, BASE_REBALANCE_CFG),
             mock.patch.object(config, "EARMARKED_TICKERS", set(), create=True),
             mock.patch.object(config, "OUTSIDE_HOLDINGS", {}, create=True),
@@ -316,6 +317,66 @@ class TestLiveFxRates(EngineTestCase):
         self.assertEqual(se.get_fx_to_gbp("GBp"), 0.01)
         se._CACHED_GBP_RATE = 1.25
         self.assertAlmostEqual(se.get_fx_to_gbp("USD"), 0.8)
+
+    # --- Fallback chain: Yahoo -> ECB (Frankfurter) -> ExchangeRate-API, never a static rate ---
+
+    @staticmethod
+    def fx_sources(frankfurter=None, er_api=None):
+        """Fake _fetch_json routing by host; an Exception value is raised, anything else is returned."""
+        def fake(url, timeout=10.0):
+            payload = frankfurter if "frankfurter" in url else er_api if "er-api" in url else None
+            if payload is None:
+                raise RuntimeError(f"unexpected URL {url}")
+            if isinstance(payload, Exception):
+                raise payload
+            return payload
+        return mock.Mock(side_effect=fake)
+
+    def test_gbp_usd_falls_back_to_ecb_reference_rate_and_caches_it(self):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        fetch = self.fx_sources(frankfurter={"amount": 1.0, "base": "GBP", "date": today, "rates": {"USD": 1.3331}})
+        with mock.patch.object(se, "_fetch_json", fetch):
+            self.assertAlmostEqual(se.get_gbp_usd_rate(), 1.3331)
+            self.assertAlmostEqual(se.get_gbp_usd_rate(), 1.3331)
+        self.assertEqual(fetch.call_count, 1)
+        self.assertIn("base=GBP&symbols=USD", fetch.call_args[0][0])
+
+    def test_gbp_usd_uses_second_reference_source_when_ecb_fails(self):
+        now_unix = int(datetime.now(timezone.utc).timestamp())
+        fetch = self.fx_sources(
+            frankfurter=RuntimeError("HTTP 503"),
+            er_api={"result": "success", "base_code": "GBP", "time_last_update_unix": now_unix, "rates": {"USD": 1.334, "EUR": 1.18}},
+        )
+        with mock.patch.object(se, "_fetch_json", fetch):
+            self.assertAlmostEqual(se.get_gbp_usd_rate(), 1.334)
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_gbp_usd_rejects_stale_and_implausible_reference_rates_then_fails_closed(self):
+        stale = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+        fetch = self.fx_sources(
+            frankfurter={"date": stale, "rates": {"USD": 1.30}},
+            er_api={"time_last_update_unix": int(datetime.now(timezone.utc).timestamp()), "rates": {"USD": 13.3}},
+        )
+        with mock.patch.object(se, "_fetch_json", fetch):
+            with self.assertRaises(RuntimeError):
+                se.get_gbp_usd_rate()
+        self.assertIsNone(se._CACHED_GBP_RATE)
+
+    def test_live_yahoo_quote_never_touches_reference_sources(self):
+        fetch = self.fx_sources(frankfurter={"date": "2000-01-01", "rates": {"USD": 9.9}})
+        self.use_tickers({"GBPUSD=X": FakeTicker(fast_info={"lastPrice": 1.27})})
+        with mock.patch.object(se, "_fetch_json", fetch):
+            self.assertAlmostEqual(se.get_gbp_usd_rate(), 1.27)
+        fetch.assert_not_called()
+
+    def test_fx_to_gbp_falls_back_to_reference_rate(self):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        fetch = self.fx_sources(frankfurter={"base": "EUR", "date": today, "rates": {"GBP": 0.84205}})
+        with mock.patch.object(se, "_fetch_json", fetch):
+            self.assertAlmostEqual(se.get_fx_to_gbp("EUR"), 0.84205)
+            self.assertAlmostEqual(se.get_fx_to_gbp("EUR"), 0.84205)  # cached
+        self.assertEqual(fetch.call_count, 1)
+        self.assertIn("base=EUR&symbols=GBP", fetch.call_args[0][0])
 
 
 # ---------------------------------------------------------------------------

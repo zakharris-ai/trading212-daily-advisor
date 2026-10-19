@@ -87,7 +87,9 @@ GitHub's own `schedule:` trigger is best-effort and can start runs hours late. F
 
 ## ⏰ Reliable 09:00 Delivery (External Scheduler)
 
-The workflow's cron ticks stay in place as a fallback, but GitHub can delay scheduled runs by hours. An external scheduler such as [cron-job.org](https://cron-job.org) (free) can start the workflow through GitHub's `workflow_dispatch` API at **09:00 Europe/London** every day. Whichever trigger runs first sends the email; every later run reads the sent-marker (`data/last_email_sent.json` on `origin/main`) and skips, so you still get **exactly one email per day**.
+The workflow's cron ticks stay in place as a fallback, but GitHub's `schedule:` trigger is best-effort: in practice scheduled runs are often several hours late, and on some days they don't happen at all. An external scheduler such as [cron-job.org](https://cron-job.org) (free) can start the workflow through GitHub's `workflow_dispatch` API at **09:00 Europe/London** every day. Whichever trigger runs first sends the email; every later run reads the sent-marker (`data/last_email_sent.json` on `origin/main`) and skips, so you still get **exactly one email per day**.
+
+If a run fails, you get **one alert email that day** saying which stage failed, with the last log lines and a link to the run (see [How the Daily GitHub Actions Run Works](#️-how-the-daily-github-actions-run-works)).
 
 In the steps below, replace `<your-github-user>/<your-repo>` with your own repository (e.g. your fork).
 
@@ -141,7 +143,7 @@ curl -i -X POST \
 | `403 Resource not accessible by personal access token` | Token lacks **Actions: Read and write**, or isn't scoped to this repository. | Edit the token's repository access and permissions. |
 | `404 Not Found` | Wrong owner/repo/workflow file name, or the token can't see the (private) repository. | Check the URL and the token's repository access. |
 | `422 Unprocessable Entity` | `ref` isn't a branch containing the workflow, or `workflow_dispatch` is missing on that branch. | Use `{"ref":"main"}` and make sure the workflow file is on `main`. |
-| `204` but no email | The run skipped (already sent today), failed closed (see below), or the SMTP login failed. | Open the run's logs under **Actions**; re-send with `force` if needed. |
+| `204` but no email | The run skipped (already sent today), failed closed (see below), or the SMTP login failed. | Check for the failure alert email, or open the run's logs under **Actions**; re-send with `force` if needed. |
 | Scheduled runs only, hours late | External job not running or wrong time zone. | Check the cron-job.org execution history and its `Europe/London` time zone. |
 
 ---
@@ -154,16 +156,17 @@ The workflow lives in `.github/workflows/daily_trading_digest.yml`:
 2. **Concurrency:** all runs share the `daily-digest` group (`cancel-in-progress: false`), so two runs never send or push at the same time; the job times out after 20 minutes.
 3. **Gatekeeper:** runs `git fetch origin main` and reads `data/last_email_sent.json` from `origin/main`. Scheduled ticks proceed only when the Europe/London hour is 9 or later and nothing has been sent today; dispatches skip the hour check but still respect the dedupe unless `force` is true.
 4. **Offline unit tests** run before the digest; a failing test fails the job before any email is sent.
-5. **`main.py`** runs (with `--force` only when the dispatch input `force` is true).
+5. **`main.py`** runs (with `--force` only when the dispatch input `force` is true). Test and digest output is also written to `logs/` (gitignored, never committed) so a failure alert can quote it.
 6. **Commit step:** `git add data/ dashboard.html`, then up to 3 attempts of `git pull --rebase origin main` + `git push`.
+7. **Failure alert (only when a step fails):** `scripts/failure_alert.py` emails `ALERT_EMAILS` with the stage that failed, whether today's digest had already gone out, the last 40 log lines of the failed step and a link to the run. It uses only the Python standard library (so it works even if the dependency install failed) and sends at most one alert per London day, remembered with the Actions cache key `failure-alert-YYYY-MM-DD`. If SMTP itself is broken the alert can't be emailed either; GitHub's own "Run failed" notification is the backstop.
 
 ## 🛑 Fail-Closed Behaviour
 
 When data is missing the engine stops rather than guessing. `main.py` exits with code 1 **before** writing any snapshot, trade log, email, sent-marker or ledger entry when:
 - no Trading 212 credentials are configured, or no account returned data;
-- Trading 212 positions are unavailable (API error, timeout or malformed response);
+- Trading 212 positions are unavailable (API error, timeout or malformed response), after the client's own retries with backoff;
 - an account reports invested capital but the positions endpoint returns none;
-- the live GBP/USD rate is unavailable.
+- no live GBP/USD rate is available. The rate comes from Yahoo first, then the ECB reference rate (Frankfurter), then ExchangeRate-API's open endpoint; rates older than 5 days or outside 0.5–3.0 are rejected and a static rate is never assumed. Other currencies (EUR, CHF, …) use the same fallback chain.
 
 It also exits with code 1, without writing the sent-marker, if the email fails to send, so the next scheduled tick retries. Inside the engine, a holding or watchlist idea with failed research, missing weekly data or an unconvertible price is never turned into a BUY; if a held position can't be valued in GBP, that account's plan is marked **DATA DEGRADED** and emits no orders. Missing metrics are shown as `n/a` instead of optimistic defaults.
 
@@ -252,6 +255,7 @@ The digest's day-over-day change also excludes deposits and withdrawals. The ema
 - **Fully offline:** stdlib `unittest` with all network access mocked (no Trading 212, Yahoo Finance or SMTP calls); storage tests use a temporary data directory, never `data/`.
 - **Independent of your `.env`:** behaviour is exercised through injected inputs, so your own settings never change the result.
 - **Runs in CI** before every digest; a failing test blocks the email. Python 3.9+.
+- **Workflow rules are tested too:** `tests/test_workflow.py` checks the workflow file's invariants (no `||` inside `${{ }}`, offset retry ticks, the hour ≥ 9 gatekeeper with dedupe, no gitignored files in `git add`, single-line `python -c`, `pipefail` with `tee`, and the failure-alert wiring).
 
 ## 🔬 Evidence: Strategy Backtest
 

@@ -36,6 +36,10 @@ jobs:
       contents: write
 
     steps:
+      - name: London date (keys the once-a-day failure alert)
+        id: london
+        run: echo "date=$(TZ=Europe/London date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
       - name: Check out repository
         uses: actions/checkout@v4
         with:
@@ -96,11 +100,17 @@ jobs:
           fi
 
       - name: Run offline unit tests (job fails before any email if these fail)
+        id: tests
         if: steps.time_gate.outputs.proceed == 'true'
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
-          python -m unittest discover -s tests -v
+          set -o pipefail
+          mkdir -p logs
+          python -m unittest discover -s tests -v 2>&1 | tee logs/unit_tests.log
 
       - name: Run Daily Portfolio Analysis & Dispatch Email
+        id: digest
         if: steps.time_gate.outputs.proceed == 'true'
         env:
           ACCOUNT_NAME: ${{ secrets.ACCOUNT_NAME }}
@@ -126,14 +136,19 @@ jobs:
           ACCOUNT_WRAPPER: ${{ secrets.ACCOUNT_WRAPPER }}
           ACCOUNT_WRAPPER_2: ${{ secrets.ACCOUNT_WRAPPER_2 }}
           FORCE_INPUT: ${{ github.event.inputs.force }}
+          PYTHONUNBUFFERED: "1"
         run: |
+          # Output is also written to logs/ (gitignored, never committed) so a failure alert can quote it.
+          set -o pipefail
+          mkdir -p logs
           if [ "$FORCE_INPUT" = "true" ]; then
-            python main.py --force
+            python main.py --force 2>&1 | tee logs/digest_run.log
           else
-            python main.py
+            python main.py 2>&1 | tee logs/digest_run.log
           fi
 
       - name: Commit updated snapshots, history, and dashboard
+        id: commit
         if: steps.time_gate.outputs.proceed == 'true'
         run: |
           git config --global user.name "github-actions[bot]"
@@ -151,3 +166,38 @@ jobs:
           done
           echo "Failed to push after 3 attempts."
           exit 1
+
+      # ---- Failure path: a failed run is never silent (at most one alert email per London day) ----
+      - name: Check whether today's failure alert was already emailed
+        id: alert_seen
+        if: failure()
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: .failure-alert
+          key: failure-alert-${{ steps.london.outputs.date }}
+          lookup-only: true
+
+      - name: Email a failure alert (failed stage, log tail and a link to this run)
+        id: alert
+        if: failure() && steps.alert_seen.outputs.cache-hit != 'true'
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_EMAILS: ${{ secrets.ALERT_EMAILS }}
+          OUTCOME_TESTS: ${{ steps.tests.outcome }}
+          OUTCOME_DIGEST: ${{ steps.digest.outcome }}
+          OUTCOME_COMMIT: ${{ steps.commit.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TRIGGER: ${{ github.event_name }}
+        run: python3 scripts/failure_alert.py
+
+      - name: Remember that today's failure alert was emailed
+        if: failure() && steps.alert.outputs.sent == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .failure-alert
+          key: failure-alert-${{ steps.london.outputs.date }}
