@@ -4250,7 +4250,13 @@ def build_rebalancing_plan(
         if shares <= 0:
             return None
 
-        order_val_gbp = shares * p_gbp
+        # The amount shown is typed straight into Trading 212 as a value order, so it is a whole number of
+        # pounds rounded DOWN: the displayed orders can never add up to more than the deployable cash. (A
+        # round-to-nearest display once let three orders dip 51p below an account's protected reserve.)
+        order_val_gbp = float(math.floor(shares * p_gbp + 1e-9))
+        if order_val_gbp <= 0 or order_val_gbp < min_ord_gbp * 0.95:
+            return None
+        shares = math.floor((order_val_gbp / p_gbp) * 10000.0) / 10000.0
         sym = candidate.get("search_symbol") or clean_search_symbol(c_ticker)
         name = candidate.get("name", c_ticker)
         held_here = any(

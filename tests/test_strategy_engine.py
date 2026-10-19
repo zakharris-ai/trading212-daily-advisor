@@ -1384,6 +1384,19 @@ class TestHouseholdPlan(EngineTestCase):
         self.assertIn("big tech", notes)
         self.assertTrue(all(b["is_new"] for b in plan["buy_orders"]))  # none of the bucket funds is held here
 
+    def test_buy_amounts_are_whole_pounds_rounded_down_and_never_breach_the_reserve(self):
+        # Round-to-nearest display let value orders add up to more than the cash above the reserve (e.g. three
+        # lines rounding up left the account 51p under its protected reserve once the orders were placed).
+        for free_cash in (4120.49, 5020.99, 6000.0, 3333.33):
+            plan = self.hh_plan(self.tech_heavy_book(), cash=free_cash)
+            buys = plan["buy_orders"]
+            self.assertTrue(buys, free_cash)
+            for b in buys:
+                self.assertEqual(b["estimated_gbp"], math.floor(b["estimated_gbp"]), b)
+                self.assertTrue(b["app_instruction"].endswith(f"Enter £{b['estimated_gbp']:,.0f}"), b["app_instruction"])
+            self.assertLessEqual(sum(b["estimated_gbp"] for b in buys), free_cash - 500.0, free_cash)
+            self.assertGreaterEqual(plan["final_cash_balance_gbp"], 500.0, free_cash)
+
     def test_monthly_cadence_defers_small_buys_until_buy_day(self):
         book = self.cap_compliant_book()
         plan = self.hh_plan(book, cash=2200.0)  # £1,700 deployable < £2,000 off-cycle threshold
