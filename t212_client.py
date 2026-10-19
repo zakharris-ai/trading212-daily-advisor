@@ -2,15 +2,65 @@
 
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional
 import requests
 from config import PENDING_SELLS_CONFIG, PENDING_BUYS_CONFIG
 
 logger = logging.getLogger(__name__)
 
+# --- Trading 212 -> Yahoo Finance exchange-code tables (GEMINI.md §3) ---
+# T212 equity tickers end in "_EQ". European listings append a lowercase exchange code directly to the
+# symbol ("RRl_EQ", "ASMLa_EQ", "KERpa_EQ"); US/Canadian listings use a separator ("AAPL_US_EQ").
+_EQ_SUFFIX_RE = re.compile(r"^(?P<body>.+)_EQ$", re.IGNORECASE)
+# Symbol (uppercase/digits/dots/dashes/underscores) followed by its maximal trailing lowercase run.
+_ATTACHED_LOWER_RE = re.compile(r"^(?P<base>.*[^a-z])(?P<code>[a-z]+)$")
+_BRK_B_RE = re.compile(r"^BRK_B(_US)?(_EQ)?$")
+
+# Lowercase codes attached to the symbol (T212's canonical European form). Matched exactly against the
+# whole trailing lowercase run, so multi-letter codes always win ('KERpa' is Paris, never 'KERp' + 'a').
+_ATTACHED_LOWER_CODES: Dict[str, str] = {
+    "l": ".L",                                 # London Stock Exchange
+    "d": ".DE",                                # Deutsche Boerse Xetra
+    "a": ".AS", "as": ".AS", "nl": ".AS",      # Euronext Amsterdam
+    "p": ".PA", "pa": ".PA", "fp": ".PA",      # Euronext Paris
+    "s": ".SW",                                # SIX Swiss Exchange
+    "m": ".MI",                                # Borsa Italiana (Milan)
+    "e": ".MC",                                # Bolsa de Madrid
+}
+
+# Codes written after an underscore separator ("VUAA_L_EQ", "SHOP_CA_EQ", "AAPL_US_EQ"); case-insensitive.
+_SEPARATED_CODES: Dict[str, str] = {
+    "US": "",
+    "CA": ".TO", "TO": ".TO",
+    "L": ".L",
+    "D": ".DE", "DE": ".DE",
+    "A": ".AS", "AS": ".AS", "NL": ".AS",
+    "P": ".PA", "PA": ".PA", "FP": ".PA",
+    "S": ".SW", "SW": ".SW",
+    "M": ".MI", "MI": ".MI",
+    "E": ".MC", "MC": ".MC",
+}
+
+# Case-folded attached codes (callers such as strategy_engine.tickers_match upper-case tickers before
+# normalising, e.g. 'SGLNl_EQ' -> 'SGLNL_EQ'). London and Xetra keep their legacy priority (so 'SGLNL'
+# stays SGLN.L rather than SGL + NL), then two-letter codes beat one-letter codes ('ORPA' -> OR.PA).
+_ATTACHED_UPPER_PRIORITY = ("L", "D", "PA", "FP", "AS", "NL", "A", "S", "P", "M", "E")
+
+
+def _yahoo_class_symbol(base: str) -> str:
+    """Formats a US/Canadian symbol for Yahoo, which writes share classes with '-' (BRK_B / BRK.B -> BRK-B)."""
+    return base.strip("._").replace("_", "-").replace(".", "-")
+
 
 def normalize_t212_ticker_for_yfinance(t212_ticker: str) -> str:
     """Converts Trading 212 ticker notation into a Yahoo Finance ticker.
+
+    Anchored parser for the trailing exchange code of "<SYMBOL><code>_EQ" / "<SYMBOL>_<CODE>_EQ" tickers
+    (London .L, Xetra .DE, Amsterdam .AS, Paris .PA, Swiss .SW, Milan .MI, Madrid .MC, US, Toronto .TO).
+    Inputs without an "_EQ" suffix (already Yahoo-style, e.g. "NVDA", "VUAA.L") are returned unchanged.
+    Unknown exchange codes are stripped (with a warning) and the bare symbol is returned; the result is
+    never an empty string for a non-empty input.
 
     Args:
         t212_ticker: Raw ticker symbol returned from Trading 212 API.
@@ -18,49 +68,61 @@ def normalize_t212_ticker_for_yfinance(t212_ticker: str) -> str:
     Returns:
         Cleaned ticker compatible with Yahoo Finance (e.g. RR.L, VUAA.L).
     """
-    raw = t212_ticker.strip()
-    
+    raw = str(t212_ticker or "").strip()
+    if not raw:
+        return raw
+
     # Specific known tickers
-    if "BRK_B" in raw:
+    if _BRK_B_RE.match(raw.upper()):
         return "BRK-B"
 
-    # London Stock Exchange (ends with l_EQ, _l_EQ, L_EQ, or _L_EQ)
-    if re.search(r"_?[lL]_EQ$", raw):
-        base = re.sub(r"_?[lL]_EQ$", "", raw).rstrip(".")
-        return f"{base}.L"
-    
-    # German XETRA (_d_EQ or d_EQ)
-    if re.search(r"_?[dD]_EQ$", raw):
-        base = re.sub(r"_?[dD]_EQ$", "", raw).rstrip(".")
-        return f"{base}.DE"
+    m = _EQ_SUFFIX_RE.match(raw)
+    if not m:
+        return raw  # Not Trading 212 notation (already a Yahoo-style or plain symbol).
+    body = m.group("body")
 
-    # Amsterdam (_as_EQ, as_EQ, _nl_EQ, a_EQ, _a_EQ)
-    if re.search(r"_?(as|nl|a|AS|NL|A)_EQ$", raw):
-        base = re.sub(r"_?(as|nl|a|AS|NL|A)_EQ$", "", raw).rstrip(".")
-        return f"{base}.AS"
+    # 1. Canonical European form: symbol + lowercase exchange code ("RRl", "ASMLa", "KERpa", "BT_Al").
+    lower = _ATTACHED_LOWER_RE.match(body)
+    if lower:
+        base = lower.group("base").rstrip("._")
+        suffix = _ATTACHED_LOWER_CODES.get(lower.group("code"))
+        if suffix is not None and base:
+            return f"{base}{suffix}"
+        return _unknown_suffix(raw, base or body)
 
-    # Paris (_fp_EQ, _pa_EQ, pa_EQ)
-    if re.search(r"_?(fp|pa|FP|PA)_EQ$", raw):
-        base = re.sub(r"_?(fp|pa|FP|PA)_EQ$", "", raw).rstrip(".")
-        return f"{base}.PA"
+    # 2. Separator form: "VUAA_L", "AAPL_US", "BRK_B_US", "SHOP_CA".
+    if "_" in body:
+        base, code = body.rsplit("_", 1)
+        base = base.rstrip("._")
+        suffix = _SEPARATED_CODES.get(code.upper())
+        if suffix is not None and base:
+            if suffix in ("", ".TO"):
+                return f"{_yahoo_class_symbol(base)}{suffix}"
+            return f"{base}{suffix}"
+        return _unknown_suffix(raw, base)
 
-    # Standard US equities (_US_EQ)
-    if re.search(r"_[uU][sS]_EQ$", raw):
-        base = re.sub(r"_[uU][sS]_EQ$", "", raw)
-        return base.replace("_", "-")
+    # 3. Case-folded attached code ("RRL", "ASMLA", "KERPA"): ambiguous by nature, resolved by priority.
+    for code in _ATTACHED_UPPER_PRIORITY:
+        if body.endswith(code) and len(body) > len(code):
+            base = body[: -len(code)].rstrip("._")
+            if base:
+                return f"{base}{_ATTACHED_LOWER_CODES[code.lower()]}"
 
-    # Swiss Exchange (_s_EQ or s_EQ)
-    if re.search(r"_?[sS]_EQ$", raw):
-        base = re.sub(r"_?[sS]_EQ$", "", raw).rstrip(".")
-        return f"{base}.SW"
+    return _unknown_suffix(raw, body)
 
-    # Fallback: strip any remaining _XX_EQ or XX_EQ suffix
-    return re.sub(r"_?[a-zA-Z0-9]+_EQ$", "", raw)
+
+def _unknown_suffix(raw: str, stripped_base: str) -> str:
+    """Fallback for unrecognised exchange codes: stripped base if non-empty, else the raw ticker (never '')."""
+    result = stripped_base.strip() if stripped_base and stripped_base.strip() else raw
+    logger.warning(
+        "Unrecognised Trading 212 exchange suffix in %r; using %r for market-data lookups.", raw, result
+    )
+    return result
 
 
 def resolve_canonical_ticker(ticker_str: str) -> str:
     """Resolves any user-configured or broker ticker into a canonical Yahoo Finance symbol."""
-    raw = ticker_str.strip()
+    raw = str(ticker_str or "").strip()
     u = raw.upper()
     if u in ("RR", "RR.L", "RRL_EQ", "RR_L_EQ"):
         return "RR.L"
@@ -120,28 +182,69 @@ class Trading212Client:
         """Returns True if valid credentials have been provided."""
         return bool(self.key_id and self.secret) or bool(self.key_id)
 
+    # HTTP statuses worth retrying: rate limiting (429), request timeout (408) and any 5xx server error.
+    _RETRYABLE_STATUS_CODES = frozenset({408, 429})
+    _MAX_RETRY_WAIT_SECONDS = 30.0
+
+    @classmethod
+    def _is_retryable_status(cls, status_code: int) -> bool:
+        return status_code in cls._RETRYABLE_STATUS_CODES or 500 <= status_code <= 599
+
+    @classmethod
+    def _retry_wait_seconds(cls, attempt: int, resp: Optional[requests.Response] = None) -> float:
+        """Backoff before the next attempt: 3s/6s/9s for 429, 2s/4s/8s otherwise; honours Retry-After (capped)."""
+        status = getattr(resp, "status_code", None)
+        wait = 3.0 * (attempt + 1) if status == 429 else 2.0 * (2 ** attempt)
+        try:
+            headers = getattr(resp, "headers", None) or {}
+            retry_after = float(headers.get("Retry-After"))
+            wait = max(wait, retry_after)
+        except (TypeError, ValueError):
+            pass
+        return min(wait, cls._MAX_RETRY_WAIT_SECONDS)
+
     def _get_with_retry(self, endpoint: str, timeout: int = 15, max_retries: int = 4) -> Optional[requests.Response]:
-        """Executes a GET request against Trading 212 API with automatic backoff for 429 rate limits."""
-        import time
+        """Executes a GET request against Trading 212 API with automatic backoff.
+
+        Retries 429 rate limits, 408/5xx server errors and timeouts/connection errors, up to
+        `max_retries` attempts in total. Returns the final response (which may still carry an error
+        status for the caller to inspect), or None if no response was received at all.
+        """
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        last_resp: Optional[requests.Response] = None
         for attempt in range(max_retries):
+            is_last_attempt = attempt == max_retries - 1
             try:
                 resp = self.session.get(url, timeout=timeout)
-                if resp.status_code == 429:
-                    wait_time = 3.0 * (attempt + 1)
-                    logger.warning(
-                        "Trading 212 rate limit (429) on %s. Backing off for %.1fs (attempt %d/%d)...",
-                        endpoint, wait_time, attempt + 1, max_retries
-                    )
-                    time.sleep(wait_time)
-                    continue
-                return resp
             except requests.RequestException as e:
-                if attempt == max_retries - 1:
-                    logger.warning("Request to %s failed after %d retries: %s", endpoint, max_retries, e)
+                if is_last_attempt:
+                    logger.warning("Request to %s failed after %d attempts: %s", endpoint, max_retries, e)
                     return None
-                time.sleep(2.0)
-        return None
+                wait_time = self._retry_wait_seconds(attempt)
+                logger.warning(
+                    "Request to %s failed (%s). Retrying in %.1fs (attempt %d/%d)...",
+                    endpoint, e, wait_time, attempt + 1, max_retries
+                )
+                time.sleep(wait_time)
+                continue
+
+            if self._is_retryable_status(resp.status_code):
+                last_resp = resp
+                if is_last_attempt:
+                    logger.warning(
+                        "Trading 212 %s still returning HTTP %s after %d attempts; giving up.",
+                        endpoint, resp.status_code, max_retries
+                    )
+                    return resp
+                wait_time = self._retry_wait_seconds(attempt, resp)
+                logger.warning(
+                    "Trading 212 returned HTTP %s on %s. Backing off for %.1fs (attempt %d/%d)...",
+                    resp.status_code, endpoint, wait_time, attempt + 1, max_retries
+                )
+                time.sleep(wait_time)
+                continue
+            return resp
+        return last_resp
 
     def get_account_cash(self) -> Optional[Dict[str, Any]]:
         """Fetches account balance, cash, and total portfolio valuation."""
@@ -151,7 +254,14 @@ class Trading212Client:
 
         resp = self._get_with_retry("equity/account/cash", timeout=15)
         if resp is not None and resp.status_code == 200:
-            cash_data = resp.json()
+            try:
+                cash_data = resp.json()
+            except Exception as ex:
+                logger.warning("Account cash endpoint returned unparseable JSON: %s", ex)
+                return None
+            if not isinstance(cash_data, dict):
+                logger.warning("Account cash endpoint returned unexpected format: %s", type(cash_data).__name__)
+                return None
             # Ensure blocked funds are explicitly recorded (e.g. pending limit orders)
             cash_data.setdefault("blocked", 0.0)
             # Fetch account info to resolve base currency dynamically
@@ -166,12 +276,15 @@ class Trading212Client:
             except Exception as ex:
                 logger.debug("Could not fetch account info currency: %s", ex)
                 cash_data.setdefault("currency", "GBP")
-            # Fetch recent cash transactions (withdrawals, deposits, interest)
+            # Fetch recent cash transactions (withdrawals, deposits, interest).
+            # recent_transactions_ok tells deposit-adjusted performance whether the list is trustworthy.
             try:
-                txs = self.get_cash_transactions(limit=10)
-                cash_data["recent_transactions"] = txs
+                txs = self._fetch_cash_transactions(limit=50)
             except Exception as ex:
                 logger.debug("Could not fetch recent transactions: %s", ex)
+                txs = None
+            cash_data["recent_transactions"] = txs if txs is not None else []
+            cash_data["recent_transactions_ok"] = txs is not None
             return cash_data
         elif resp is not None:
             logger.warning("Account cash endpoint returned status %s", resp.status_code)
@@ -184,14 +297,25 @@ class Trading212Client:
         """Fetches recent cash transactions including deposits, withdrawals, interest, and fees."""
         if not self.is_configured():
             return []
+        txs = self._fetch_cash_transactions(limit=limit)
+        return txs if txs is not None else []
+
+    def _fetch_cash_transactions(self, limit: int = 20) -> Optional[List[Dict[str, Any]]]:
+        """Like get_cash_transactions, but returns None (not []) when the endpoint fails or is unparseable."""
         resp = self._get_with_retry(f"equity/history/transactions?limit={limit}", timeout=15)
-        if resp is not None and resp.status_code == 200:
+        if resp is None or resp.status_code != 200:
+            return None
+        try:
             data = resp.json()
-            if isinstance(data, dict):
-                return data.get("items", [])
-            elif isinstance(data, list):
-                return data
-        return []
+        except Exception as ex:
+            logger.debug("Transactions endpoint returned unparseable JSON: %s", ex)
+            return None
+        if isinstance(data, dict):
+            items = data.get("items", [])
+            return items if isinstance(items, list) else None
+        elif isinstance(data, list):
+            return data
+        return None
 
     def get_pending_orders(self) -> Dict[str, Any]:
         """Fetches active pending orders from Trading 212 API.
@@ -343,28 +467,42 @@ class Trading212Client:
 
         return result
 
-    def get_open_positions(self) -> List[Dict[str, Any]]:
-        """Fetches all open positions for this account."""
+    def get_open_positions(self) -> Optional[List[Dict[str, Any]]]:
+        """Fetches all open positions for this account.
+
+        Returns:
+            The list of open positions (each enriched with 'yf_ticker'). An empty list is returned ONLY
+            when the API genuinely reports no positions. None is returned on ANY failure (missing
+            credentials, non-200 status, timeout/connection error, unparseable JSON, unexpected payload
+            type or a position without a ticker) so callers can fail closed instead of mistaking an
+            outage for an empty account.
+        """
         if not self.is_configured():
             logger.warning("Trading 212 credentials not configured.")
-            return []
+            return None
 
         resp = self._get_with_retry("equity/portfolio", timeout=15)
-        if resp is not None and resp.status_code == 200:
-            try:
-                positions = resp.json()
-                if isinstance(positions, list):
-                    for pos in positions:
-                        if isinstance(pos, dict):
-                            raw_ticker = pos.get("ticker", "")
-                            pos["yf_ticker"] = normalize_t212_ticker_for_yfinance(raw_ticker)
-                    return positions
-                logger.warning("Trading 212 portfolio endpoint returned unexpected format: %s", type(positions))
-                return []
-            except Exception as e:
-                logger.error("Error parsing Trading 212 positions response: %s", e)
-                return []
-        else:
-            logger.error("Failed to fetch Trading 212 positions: endpoint returned non-200 or timed out.")
-            return []
+        if resp is None:
+            logger.error("Failed to fetch Trading 212 positions: no response (timeout or connection error).")
+            return None
+        if resp.status_code != 200:
+            logger.error("Failed to fetch Trading 212 positions: endpoint returned HTTP %s.", resp.status_code)
+            return None
+        try:
+            positions = resp.json()
+        except Exception as e:
+            logger.error("Error parsing Trading 212 positions response: %s", e)
+            return None
+        if not isinstance(positions, list):
+            logger.error(
+                "Trading 212 portfolio endpoint returned unexpected format: %s", type(positions).__name__
+            )
+            return None
+        for pos in positions:
+            raw_ticker = pos.get("ticker") if isinstance(pos, dict) else None
+            if not isinstance(raw_ticker, str) or not raw_ticker.strip():
+                logger.error("Trading 212 portfolio endpoint returned a malformed position entry: %.200r", pos)
+                return None
+            pos["yf_ticker"] = normalize_t212_ticker_for_yfinance(raw_ticker)
+        return positions
 

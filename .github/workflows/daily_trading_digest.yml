@@ -15,17 +15,32 @@ on:
     - cron: '50 9 * * *'   # 09:50 GMT (Winter fallback 3)
     # Late morning safety catch-all
     - cron: '5 10 * * *'   # 11:05 BST / 10:05 GMT catch-all
-  workflow_dispatch: # Allows manual one-click execution from GitHub UI
+  workflow_dispatch: # Manual one-click run from the GitHub UI, and the optional external 09:00 Europe/London scheduler (see README)
+    inputs:
+      force:
+        description: "Force a re-send even if today's digest was already emailed"
+        type: boolean
+        required: false
+        default: false
+
+# Serialise runs: two ticks (or a tick plus an external dispatch) can never send or push at the same time.
+concurrency:
+  group: daily-digest
+  cancel-in-progress: false
 
 jobs:
   run-digest:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -40,10 +55,26 @@ jobs:
 
       - name: Timezone & Deduplication Gatekeeper (Ensure 09:00 London Time, exactly 1 run daily)
         id: time_gate
+        env:
+          FORCE_INPUT: ${{ github.event.inputs.force }}
         run: |
+          # Read the sent-marker from the freshest origin/main (another run may have pushed since checkout).
+          git fetch origin main
+          MARKER_JSON=$(git show origin/main:data/last_email_sent.json 2>/dev/null) || MARKER_JSON='{}'
+          echo "Sent-marker on origin/main: $MARKER_JSON"
+          ALREADY_SENT=$(printf '%s' "$MARKER_JSON" | python -c "import json, sys, datetime, zoneinfo; today = datetime.datetime.now(zoneinfo.ZoneInfo('Europe/London')).strftime('%Y-%m-%d'); raw = sys.stdin.read().strip(); d = json.loads(raw) if raw else {}; print('yes' if isinstance(d, dict) and d.get('date') == today else 'no')") || ALREADY_SENT="no"
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual execution: bypassing time gatekeeper."
-            echo "proceed=true" >> $GITHUB_OUTPUT
+            if [ "$FORCE_INPUT" = "true" ]; then
+              echo "Dispatch with force=true: bypassing the time gate and the daily dedupe."
+              echo "proceed=true" >> $GITHUB_OUTPUT
+            elif [ "$ALREADY_SENT" = "yes" ]; then
+              echo "Dispatch: today's digest has already been sent. Skipping duplicate (dispatch with force=true to override)."
+              echo "proceed=false" >> $GITHUB_OUTPUT
+            else
+              echo "Dispatch: no digest sent yet today. Proceeding (time gate not applied to dispatches)."
+              echo "proceed=true" >> $GITHUB_OUTPUT
+            fi
             exit 0
           fi
 
@@ -56,8 +87,6 @@ jobs:
             exit 0
           fi
 
-          ALREADY_SENT=$(python -c "import json, os, datetime, zoneinfo; today = datetime.datetime.now(zoneinfo.ZoneInfo('Europe/London')).strftime('%Y-%m-%d'); d = json.load(open('data/last_email_sent.json')) if os.path.exists('data/last_email_sent.json') else {}; print('yes' if d.get('date') == today else 'no')")
-
           if [ "$ALREADY_SENT" = "yes" ]; then
             echo "Today digest has already been sent. Skipping duplicate run."
             echo "proceed=false" >> $GITHUB_OUTPUT
@@ -65,6 +94,11 @@ jobs:
             echo "London hour $LONDON_HOUR >= 9 and no digest sent yet today. Proceeding with daily digest."
             echo "proceed=true" >> $GITHUB_OUTPUT
           fi
+
+      - name: Run offline unit tests (job fails before any email if these fail)
+        if: steps.time_gate.outputs.proceed == 'true'
+        run: |
+          python -m unittest discover -s tests -v
 
       - name: Run Daily Portfolio Analysis & Dispatch Email
         if: steps.time_gate.outputs.proceed == 'true'
@@ -84,8 +118,20 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           ALERT_EMAILS: ${{ secrets.ALERT_EMAILS }}
+          # Optional settings (see README "Optional settings"); unset secrets keep the generic defaults
+          EARMARKED_TICKERS: ${{ secrets.EARMARKED_TICKERS }}
+          OUTSIDE_HOLDINGS_JSON: ${{ secrets.OUTSIDE_HOLDINGS_JSON }}
+          RESERVE_TOPUPS_JSON: ${{ secrets.RESERVE_TOPUPS_JSON }}
+          MAX_LEVERAGED_ETF_PCT: ${{ secrets.MAX_LEVERAGED_ETF_PCT }}
+          ACCOUNT_WRAPPER: ${{ secrets.ACCOUNT_WRAPPER }}
+          ACCOUNT_WRAPPER_2: ${{ secrets.ACCOUNT_WRAPPER_2 }}
+          FORCE_INPUT: ${{ github.event.inputs.force }}
         run: |
-          python main.py
+          if [ "$FORCE_INPUT" = "true" ]; then
+            python main.py --force
+          else
+            python main.py
+          fi
 
       - name: Commit updated snapshots, history, and dashboard
         if: steps.time_gate.outputs.proceed == 'true'
@@ -94,5 +140,14 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add data/ dashboard.html
           git commit -m "chore: automated daily snapshot & dashboard update [skip ci]" || exit 0
-          git pull --rebase origin main
-          git push origin main
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push origin main; then
+              echo "Pushed snapshot commit on attempt $attempt."
+              exit 0
+            fi
+            echo "Push attempt $attempt failed; aborting any in-progress rebase and retrying..."
+            git rebase --abort 2>/dev/null || true
+            sleep $((attempt * 5))
+          done
+          echo "Failed to push after 3 attempts."
+          exit 1

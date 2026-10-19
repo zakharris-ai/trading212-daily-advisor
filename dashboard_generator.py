@@ -6,10 +6,299 @@ tables, and historical equity progression.
 """
 
 from datetime import datetime
+import html as _html
 import json
+import math
 import os
-from typing import Any, Dict, List, Optional
-from config import WATCHLIST, EXCLUDED_TICKERS, ACCOUNTS
+from typing import Any, Dict, Iterable, List, Optional
+import config as _config
+from config import WATCHLIST, EXCLUDED_TICKERS, ACCOUNTS, REBALANCE_CONFIG
+
+# Funds, gold and cash lines: single-company metrics (quality checklist, Altman Z) and the mechanical R:R do not apply
+_FUND_TICKER_KEYS = (
+    "VUAA", "VUSA", "VUAG", "CSPX", "VWRP", "VWRA", "SMGB", "CNDX", "CNX1",
+    "DFND", "QQQ3", "SGLN", "IGLN", "GLD", "CSH2",
+)
+_GOLD_TICKER_KEYS = ("SGLN", "IGLN", "GLD")
+
+
+def _num(val: Any, default: Optional[float] = None) -> Optional[float]:
+    """Finite float from `val` (a real 0 stays 0); `default` only when val is missing, NaN or non-numeric."""
+    if val is None or isinstance(val, bool):
+        return default
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
+
+
+def _first_num(*vals: Any) -> Optional[float]:
+    """First value that is a finite number (explicit None checks, so 0 is kept)."""
+    for v in vals:
+        n = _num(v)
+        if n is not None:
+            return n
+    return None
+
+
+def _gbp(val: Optional[float], decimals: int = 0) -> str:
+    """'£1,234' / '-£1,234', or 'N/A' when missing."""
+    if val is None:
+        return "N/A"
+    sign = "-" if val < 0 else ""
+    return f"{sign}£{abs(val):,.{decimals}f}"
+
+
+def _pct(val: Optional[float], decimals: int = 0, signed: bool = True) -> str:
+    if val is None:
+        return "N/A"
+    return f"{val:+.{decimals}f}%" if signed else f"{val:.{decimals}f}%"
+
+
+def _regime_badge_class(text: Any, score: Optional[float] = None) -> str:
+    """Badge colour that follows the actual regime text (emoji/keywords), falling back to the macro score."""
+    t = str(text or "")
+    up = t.upper()
+    if "⚪" in t or "UNAVAILABLE" in up:
+        return "badge-slate"
+    if "🔴" in t or "RISK-OFF" in up or "DEFCON 1" in up:
+        return "badge-rose"
+    if "🟠" in t or "DEFCON 2" in up:
+        return "badge-orange"
+    if "🟡" in t or "DEFCON 3" in up:
+        return "badge-amber"
+    if "🟢" in t:
+        return "badge-emerald"
+    if score is not None:
+        if score >= 58:
+            return "badge-emerald"
+        if score >= 42:
+            return "badge-amber"
+        if score >= 28:
+            return "badge-orange"
+        return "badge-rose"
+    return "badge-slate"
+
+
+def _is_isa_wrapper(val: Any) -> bool:
+    if isinstance(val, dict):
+        val = val.get("wrapper") or val.get("type") or val.get("account_type")
+    return "ISA" in str(val or "").upper()
+
+
+def _wrapper_footer_line(account_names: Iterable[str]) -> str:
+    """'Accounts: Stocks & Shares ISA (no CGT on trades)' when config.ACCOUNT_WRAPPERS says ISA for every account."""
+    wrappers = getattr(_config, "ACCOUNT_WRAPPERS", {}) or {}
+    if not isinstance(wrappers, dict):
+        return ""
+    names = [n for n in account_names if n and n != "ALL"]
+    if names and all(_is_isa_wrapper(wrappers.get(n)) for n in names):
+        return "Accounts: Stocks & Shares ISA (no CGT on trades)"
+    return ""
+
+
+def _reserve_status(plan: Optional[Dict[str, Any]], cash_info: Optional[Dict[str, Any]], acc_name: str) -> Dict[str, float]:
+    """Reserve floor vs what free cash actually funds (C5 keys first, legacy keys as fallback)."""
+    plan = plan or {}
+    cash_info = cash_info or {}
+    floor = _num(plan.get("reserve_floor_gbp"))
+    if floor is None:
+        floor = _num(plan.get("buffer_reserve_gbp"))
+        if floor is None or floor <= 0:
+            floor = _num(
+                (ACCOUNTS.get(acc_name) or {}).get("min_cash_reserve_gbp"),
+                1500.0,
+            )
+    free = _num(plan.get("available_cash_gbp"))
+    if free is None:
+        free = _first_num(cash_info.get("free_gbp"), cash_info.get("free"))
+    if free is None:
+        free = 0.0
+    funded = _num(plan.get("reserve_funded_gbp"))
+    if funded is None:
+        funded = max(0.0, min(floor, free))
+    shortfall = _num(plan.get("reserve_shortfall_gbp"))
+    if shortfall is None:
+        shortfall = max(0.0, floor - funded)
+    return {"floor": floor, "funded": funded, "shortfall": max(0.0, shortfall), "free": free}
+
+
+def _reserve_text(rs: Dict[str, float]) -> str:
+    if rs["shortfall"] > 0.005:
+        return (
+            f"⚠️ UNFUNDED — £{rs['shortfall']:,.0f} short "
+            f"(free cash covers £{rs['funded']:,.0f} of the £{rs['floor']:,.0f} floor)"
+        )
+    return f"✅ Funded from free cash (£{rs['funded']:,.0f} of £{rs['floor']:,.0f})"
+
+
+def _earmark_line(plan: Optional[Dict[str, Any]], analyses: Optional[List[Dict[str, Any]]] = None) -> str:
+    """'🔒 Ring-fenced (excluded from portfolio maths): CSH2.L £X' from plan earmarked_gbp / earmarked_tickers.
+
+    Falls back to analyses flagged `is_earmarked` when the plan does not carry the earmark keys.
+    """
+    plan = plan or {}
+    amount = _num(plan.get("earmarked_gbp"))
+    tickers = plan.get("earmarked_tickers") or []
+    if amount is None and not tickers and analyses:
+        marked = [a for a in analyses if isinstance(a, dict) and a.get("is_earmarked")]
+        if marked:
+            tickers = [str(a.get("ticker", "")) for a in marked]
+            amount = sum(_num(a.get("value_gbp"), 0.0) for a in marked)
+    if isinstance(tickers, dict):
+        parts = []
+        for t, v in tickers.items():
+            v_num = _num(v)
+            parts.append(f"{t} £{v_num:,.0f}" if v_num is not None else str(t))
+        body = ", ".join(parts)
+    else:
+        if isinstance(tickers, str):
+            tickers = [tickers]
+        names = []
+        for t in tickers:
+            if isinstance(t, dict):
+                t = t.get("ticker") or t.get("symbol") or ""
+            if t:
+                names.append(str(t))
+        if isinstance(tickers, (set, frozenset)):
+            names.sort()
+        body = ", ".join(names)
+        if amount is not None and (amount > 0 or names):
+            body = f"{body} £{amount:,.0f}".strip()
+    if not body or (not tickers and not (amount is not None and amount > 0)):
+        return ""
+    return f"🔒 Ring-fenced (excluded from portfolio maths): {body}"
+
+
+def _outside_holdings_line(consolidated_view: Optional[Dict[str, Any]]) -> str:
+    cv = consolidated_view or {}
+    vested = _num(cv.get("outside_vested_gbp_total"))
+    unvested = _num(cv.get("outside_unvested_gbp_total"))
+    has_amounts = (vested is not None and vested > 0) or (unvested is not None and unvested > 0)
+    if not cv.get("outside_holdings") and not has_amounts:
+        return ""
+    vested_v = vested if vested is not None else 0.0
+    unvested_v = unvested if unvested is not None else 0.0
+    labels = sorted({
+        str(row.get("ticker") or row.get("name") or "").strip()
+        for row in (cv.get("outside_holdings") or [])
+        if isinstance(row, dict)
+    } - {""})
+    label_txt = f" ({_html.escape(', '.join(labels))})" if labels else ""
+    return (
+        f"Holdings outside Trading 212{label_txt}: vested £{vested_v:,.0f} (counted in concentration caps)"
+        f" + unvested £{unvested_v:,.0f} (not counted)"
+    )
+
+
+def _crash_delta_text(delta: Optional[float]) -> str:
+    """Signed C6 crash_delta_gbp: negative means the plan adds 2022-style stress."""
+    if delta is None:
+        return ""
+    if delta < -0.5:
+        return f"plan adds £{abs(delta):,.0f} of 2022-style stress"
+    if delta > 0.5:
+        return f"plan removes £{delta:,.0f} of 2022-style stress"
+    return "plan leaves 2022-style stress unchanged"
+
+
+def _risk_kpi_texts(rp: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Pre-rendered risk KPI strings (one source of truth for the server render and the JS account switch)."""
+    rp = rp or {}
+
+    def arrow(cur: Optional[float], post: Optional[float], fmt) -> str:
+        if cur is None and post is None:
+            return "N/A"
+        if cur is None:
+            return f"after plan {fmt(post)}"
+        if post is None or abs(post - cur) < 1e-9:
+            return fmt(cur)
+        return f"{fmt(cur)} ➔ {fmt(post)}"
+
+    cur_sort, post_sort = _num(rp.get("current_sortino_5y")), _num(rp.get("post_sortino_5y"))
+    cur_cagr, post_cagr = _num(rp.get("current_cagr_5y_pct")), _num(rp.get("post_cagr_5y_pct"))
+    cur_beta, post_beta = _num(rp.get("current_beta_5y")), _num(rp.get("post_beta_5y"))
+    cur_st, post_st = _num(rp.get("current_stress_2022_pct")), _num(rp.get("post_stress_2022_pct"))
+    cur_st_gbp, post_st_gbp = _num(rp.get("current_stress_2022_gbp")), _num(rp.get("post_stress_2022_gbp"))
+    cur_sh, post_sh = _num(rp.get("current_shield_pct")), _num(rp.get("post_shield_pct"))
+    cur_def, post_def = _num(rp.get("current_defensive_pct")), _num(rp.get("post_defensive_pct"))
+    cur_def_gbp, post_def_gbp = _num(rp.get("current_defensive_gbp")), _num(rp.get("post_defensive_gbp"))
+
+    sortino = arrow(cur_sort, post_sort, lambda v: f"{v:.2f}")
+    if sortino != "N/A":
+        sortino += " Sortino"
+
+    cagr_parts = []
+    if cur_cagr is not None:
+        cagr_parts.append(f"now {cur_cagr:+.0f}%/yr")
+    if post_cagr is not None:
+        cagr_parts.append(f"after plan {post_cagr:+.0f}%/yr")
+    cagr = "Est. 5Y CAGR (blended hist./model): " + (" ➔ ".join(cagr_parts) if cagr_parts else "N/A")
+    beta_txt = arrow(cur_beta, post_beta, lambda v: f"{v:.2f}")
+    if beta_txt != "N/A":
+        cagr += f" · Beta {beta_txt}"
+
+    crash = arrow(cur_st, post_st, lambda v: f"{v:+.1f}%")
+    crash_sub = "2022-style sim: " + arrow(cur_st_gbp, post_st_gbp, lambda v: _gbp(v))
+    delta_txt = _crash_delta_text(_num(rp.get("crash_delta_gbp")))
+    if delta_txt:
+        crash_sub += f" · {delta_txt}"
+
+    shield = arrow(cur_sh, post_sh, lambda v: f"{v:.1f}%")
+    defensive = arrow(cur_def, post_def, lambda v: f"{v:.0f}%")
+    def_gbp = arrow(cur_def_gbp, post_def_gbp, lambda v: _gbp(v))
+    defensive_txt = f"True defensive (cash, money-market, gold): {defensive}"
+    if def_gbp != "N/A":
+        defensive_txt += f" ({def_gbp})"
+    shield_sub = str(rp.get("crash_readiness_grade") or "N/A")
+
+    bear, base, bull = (_num(rp.get(f"projected_5y_{k}_gbp")) for k in ("bear", "base", "bull"))
+    if bear is not None or base is not None or bull is not None:
+        proj = f"Bear {_gbp(bear)} · Base {_gbp(base)} · Bull {_gbp(bull)}"
+        rates = [_num(rp.get(f"projected_5y_{k}_cagr_pct")) for k in ("bear", "base", "bull")]
+        proj_sub = "5-yr scenarios: " + " · ".join(
+            f"{name} {_pct(r)}/yr" for name, r in zip(("bear", "base", "bull"), rates)
+        )
+    else:
+        cons, target = _num(rp.get("projected_5y_conservative_gbp")), _num(rp.get("projected_5y_target_gbp"))
+        if cons is None and target is None:
+            proj, proj_sub = "N/A", "5-year projection unavailable"
+        else:
+            proj = f"{_gbp(cons)} – {_gbp(target)}"
+            proj_sub = "Legacy conservative–target range (no bear case)"
+
+    return {
+        "sortino": sortino,
+        "cagr": cagr,
+        "crash": crash,
+        "crash_sub": crash_sub,
+        "shield": shield,
+        "shield_sub": shield_sub,
+        "defensive": defensive_txt,
+        "proj": proj,
+        "proj_sub": proj_sub,
+    }
+
+
+def _all_stage2_verified(analyses: List[Dict[str, Any]]) -> bool:
+    """True only when every position is confirmed weekly Stage 2 on non-degraded data."""
+    if not analyses:
+        return False
+    return all(
+        a.get("is_weekly_stage_2") is True and a.get("data_ok") is not False
+        for a in analyses
+        if isinstance(a, dict)
+    )
+
+
+def _signal_prefix(action_text: str, is_trim: bool) -> str:
+    """Avoid double emoji when the action text already carries one (e.g. '🔴 SELL (LEVERAGE POLICY — 0% CAP)')."""
+    if action_text.startswith(("🔴", "🟠", "🟢", "🟡", "🔒", "⚪", "🏦", "⏳")):
+        return ""
+    return "🟠 " if is_trim else "🔴 "
 
 
 def generate_dashboard_html(
@@ -18,94 +307,149 @@ def generate_dashboard_html(
     macro_regime: Dict[str, Any],
     gbp_rate: float,
     history: Optional[List[Dict[str, Any]]] = None,
+    watchlist_scan: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    """Renders the comprehensive interactive HTML dashboard."""
+    """Renders the comprehensive interactive HTML dashboard.
+
+    `watchlist_scan` (optional, C10): per-ticker analysis dicts for the WATCHLIST (e.g. analyze_position()
+    results). Cards show their real values; without it every card reads N/A / NOT SCANNED.
+    """
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     today_date = datetime.now().strftime("%Y-%m-%d")
+    consolidated_view = consolidated_view or {}
+    macro_regime = macro_regime or {}
+    results_by_account = results_by_account or {}
+    model_version = getattr(_config, "MODEL_VERSION", "dev")
+    accounts_title_label = " & ".join(_html.escape(str(k)) for k in results_by_account.keys() if k != "ALL") or "Portfolio"
+    excluded_badge_html = (
+        f'<span class="badge badge-indigo">Excluded: {_html.escape(", ".join(sorted(EXCLUDED_TICKERS)))}</span>'
+        if EXCLUDED_TICKERS
+        else '<span class="badge badge-indigo">5-Year High-Sortino Universe</span>'
+    )
+    gbp_rate_val = _num(gbp_rate)
+    gbp_rate_txt = f"1 GBP = ${gbp_rate_val:.4f} USD" if gbp_rate_val is not None else "GBP/USD N/A"
 
-    tot_net_worth = consolidated_view.get("total_net_worth_gbp", 0.0)
-    tot_invested = consolidated_view.get("total_invested_gbp", 0.0)
-    tot_cash = consolidated_view.get("total_liquid_cash_gbp", 0.0)
-    tot_blocked = consolidated_view.get("total_blocked_cash_gbp", 0.0)
-    tot_ppl = consolidated_view.get("total_ppl_gbp", 0.0)
-    dod = consolidated_view.get("day_over_day", {})
+    tot_net_worth = _num(consolidated_view.get("total_net_worth_gbp"), 0.0)
+    tot_invested = _num(consolidated_view.get("total_invested_gbp"), 0.0)
+    tot_cash = _num(consolidated_view.get("total_liquid_cash_gbp"), 0.0)
+    tot_blocked = _num(consolidated_view.get("total_blocked_cash_gbp"), 0.0)
+    tot_ppl = _num(consolidated_view.get("total_ppl_gbp"), 0.0)
+    dod = consolidated_view.get("day_over_day") or {}
 
-    dod_gbp = dod.get("combined_delta_gbp", 0.0)
-    dod_pct = dod.get("combined_delta_pct", 0.0)
+    dod_gbp = _num(dod.get("combined_delta_gbp"), 0.0)
+    dod_pct = _num(dod.get("combined_delta_pct"), 0.0)
     dod_sign = "+" if dod_gbp >= 0 else ""
     dod_color = "#10b981" if dod_gbp >= 0 else "#ef4444"
 
-    # Macro parameters (null-safe)
-    vix = float(macro_regime.get("vix") or 15.0)
-    macro_score = int(macro_regime.get("macro_score") or 75)
-    climate = macro_regime.get("risk_climate") or "🟢 RISK-ON / HIGH-BETA FAVORABLE"
-    us10y = float(macro_regime.get("us10y_yield") or 4.5)
-    curve_spread = float(macro_regime.get("yield_curve_spread") or 0.70)
-    term_struct = float(macro_regime.get("vix_term_structure") or 0.85)
-    oil = float(macro_regime.get("crude_oil_price") or 80.0)
-    spy_dist = int(macro_regime.get("spy_dist_days") or 0)
-    qqq_dist = int(macro_regime.get("qqq_dist_days") or 0)
-    hb_ratio = float(macro_regime.get("high_beta_ratio") or 2.15)
-    semi_ratio = float(macro_regime.get("semi_leadership_ratio") or 0.80)
+    # Macro parameters (null-safe, explicit None checks; inputs listed in macro_missing_keys display as N/A)
+    macro_missing_keys = set(macro_regime.get("macro_missing_keys") or [])
+
+    def _mval(key: str) -> Optional[float]:
+        if key in macro_missing_keys:
+            return None
+        return _num(macro_regime.get(key))
+
+    vix = _mval("vix")
+    macro_score = _num(macro_regime.get("macro_score"))
+    climate = macro_regime.get("risk_climate") or "⚪ MACRO DATA UNAVAILABLE (NEUTRAL)"
+    crash_defcon = macro_regime.get("crash_defcon") or "⚪ DEFCON N/A"
+    us10y = _mval("us10y_yield")
+    curve_spread = _mval("yield_curve_spread")
+    term_struct = _mval("vix_term_structure")
+    oil = _mval("crude_oil_price")
+    spy_dist = _mval("spy_dist_days")
+    qqq_dist = _mval("qqq_dist_days")
+    hb_ratio = _mval("high_beta_ratio")
+    semi_ratio = _mval("semi_leadership_ratio")
+
+    climate_badge_cls = _regime_badge_class(climate, macro_score)
+    defcon_badge_cls = _regime_badge_class(crash_defcon, macro_score)
+    score_txt = f" ({macro_score:.0f}/100)" if macro_score is not None else ""
+    vix_txt = f"{vix:.1f}" if vix is not None else "N/A"
+    term_txt = f"{term_struct:.2f}x term" if term_struct is not None else "term N/A"
+    us10y_txt = f"{us10y:.2f}%" if us10y is not None else "N/A"
+    spread_txt = f"{curve_spread:+.2f}%" if curve_spread is not None else "N/A"
+    spy_dist_txt = f"{spy_dist:.0f}d" if spy_dist is not None else "N/A"
+    qqq_dist_txt = f"{qqq_dist:.0f}d" if qqq_dist is not None else "N/A"
+    hb_txt = f"{hb_ratio:.2f}x" if hb_ratio is not None else "N/A"
+    semi_txt = f"{semi_ratio:.3f}x" if semi_ratio is not None else "N/A"
+    oil_txt = f"${oil:.1f}" if oil is not None else "N/A"
+    macro_missing = [str(m) for m in (macro_regime.get("macro_missing") or [])]
+    partial_macro_html = ""
+    if macro_regime.get("macro_data_ok") is not False and macro_missing:
+        partial_macro_html = f"""
+      <div class="macro-item">
+        <span class="macro-label">Partial data:</span>
+        <span class="macro-val" style="color: var(--amber);">{_html.escape(", ".join(macro_missing))} unavailable (scored neutral)</span>
+      </div>"""
 
     # Historical Performance Data for SVG Chart
     history_points = []
     if history:
         for entry in history[-14:]:  # last 14 sessions
-            acc_map = {k.lower(): float(v or 0.0) for k, v in entry.get("accounts", {}).items()}
-            history_points.append({
-                "date": entry.get("date", ""),
-                "total": float(entry.get("combined_total", 0.0)),
-                "ppl": float(entry.get("total_ppl", 0.0)),
-                **acc_map,
-            })
+            accs = entry.get("accounts") or {}
+            point = {
+                "date": str(entry.get("date", "")),
+                "total": _num(entry.get("combined_total"), 0.0),
+                "ppl": _num(entry.get("total_ppl"), 0.0),
+            }
+            for acc_key, acc_val in (accs.items() if isinstance(accs, dict) else []):
+                point.setdefault(str(acc_key).lower(), _num(acc_val, 0.0))
+            for acc_key in results_by_account.keys():
+                point.setdefault(str(acc_key).lower(), 0.0)
+            history_points.append(point)
+    n_sessions = len(history_points)
+    sessions_label = f"(Trailing {n_sessions} Session{'s' if n_sessions != 1 else ''})"
 
     # Prepare positions data across accounts
     all_positions = []
     for acc_name, acc_data in results_by_account.items():
-        plan = acc_data.get("rebalancing_plan", {})
-        analyses = acc_data.get("analyses", [])
+        plan = acc_data.get("rebalancing_plan") or {}
+        analyses = acc_data.get("analyses") or []
         for pos in analyses:
+            research = pos.get("research") or {}
             p_dict = {
                 "account": acc_name,
                 "ticker": pos.get("ticker", ""),
                 "symbol": pos.get("search_symbol", pos.get("ticker", "")),
                 "name": pos.get("name", pos.get("ticker", "")),
-                "price": float(pos.get("price", 0.0) or 0.0),
+                "price": _num(pos.get("price"), 0.0),
                 "currency": pos.get("currency", "USD"),
-                "avg_price": float(pos.get("avg_price", 0.0) or 0.0),
-                "quantity": float(pos.get("quantity", 0.0) or 0.0),
-                "value_gbp": float(pos.get("value_gbp", 0.0) or 0.0),
-                "unrealized_pnl": float(pos.get("unrealized_pnl", 0.0) or 0.0),
-                "weight_pct": float(pos.get("portfolio_weight_pct", 0.0) or 0.0),
-                "signal": pos.get("signal", "🟢 HOLD"),
+                "avg_price": _num(pos.get("avg_price"), 0.0),
+                "quantity": _num(pos.get("quantity"), 0.0),
+                "value_gbp": _num(pos.get("value_gbp"), 0.0),
+                "unrealized_pnl": _num(pos.get("unrealized_pnl"), 0.0),
+                "weight_pct": _num(pos.get("portfolio_weight_pct"), 0.0),
+                "signal": pos.get("signal") or "",
                 "action_short": pos.get("action_short", "HOLD"),
-                "plan_status": pos.get("plan_status", "HOLD"),
+                "plan_status": pos.get("plan_status") or "HOLD",
                 "badge_color": pos.get("plan_badge_color", "#6366f1"),
-                "conviction_score": int(pos.get("conviction_score", 50) or 50),
-                "piotroski": pos.get("piotroski_score"),
-                "altman_z": pos.get("altman_z"),
-                "roic": pos.get("roic") or pos.get("research", {}).get("roic"),
-                "roic_label": pos.get("roic_label") or pos.get("research", {}).get("roic_label", "N/A"),
-                "insider_label": pos.get("insider_label") or pos.get("research", {}).get("insider_label", "Neutral"),
-                "options_pcr_vol": pos.get("options_pcr_vol") or pos.get("research", {}).get("options_pcr_vol"),
-                "options_pcr_label": pos.get("options_pcr_label") or pos.get("research", {}).get("options_pcr_label", "N/A"),
-                "inst_flow_label": pos.get("institutional_flow_label") or pos.get("research", {}).get("institutional_flow_label", "Stable"),
-                "stage": pos.get("minervini_stage", "Stage 2 Bull"),
-                "trailing_stop": float(pos.get("trailing_stop", 0.0) or 0.0),
-                "target_price": float(pos.get("target_price", 0.0) or 0.0),
+                "conviction_score": int(_num(pos.get("conviction_score"), 50.0)),
+                "piotroski": _first_num(pos.get("piotroski_score"), research.get("piotroski_score")),
+                "altman_z": _first_num(pos.get("altman_z"), research.get("altman_z")),
+                "roic": _first_num(pos.get("roic"), research.get("roic")),
+                "roic_label": pos.get("roic_label") or research.get("roic_label", "N/A"),
+                "insider_label": pos.get("insider_label") or research.get("insider_label", "Neutral"),
+                "options_pcr_vol": _first_num(pos.get("options_pcr_vol"), research.get("options_pcr_vol")),
+                "options_pcr_label": pos.get("options_pcr_label") or research.get("options_pcr_label", "N/A"),
+                "inst_flow_label": pos.get("institutional_flow_label") or research.get("institutional_flow_label", "Stable"),
+                "stage": pos.get("minervini_stage") or "N/A",
+                "trailing_stop": _num(pos.get("trailing_stop"), 0.0),
+                "target_price": _num(pos.get("target_price"), 0.0),
                 "theme": pos.get("theme", "Growth"),
                 "macro_cluster": pos.get("macro_cluster", "Technology"),
-                "earnings_streak_label": pos.get("earnings_streak_label") or pos.get("research", {}).get("earnings_streak_label", "N/A"),
-                "fcf_yield_pct": pos.get("fcf_yield_pct") or pos.get("research", {}).get("fcf_yield_pct"),
-                "institutional_ownership_pct": pos.get("institutional_ownership_pct") or pos.get("research", {}).get("institutional_ownership_pct"),
-                "rs_alpha": pos.get("rs_alpha", 0.0),
-                "bearish_divergence": pos.get("bearish_divergence", False),
-                "risk_reward": float(pos.get("risk_reward_ratio", 3.0) or 3.0),
-                "cagr_5y_pct": float(pos.get("cagr_5y_pct", 18.0) or 18.0),
-                "sortino_5y": float(pos.get("sortino_5y", 1.5) or 1.5),
-                "crash_2022_ret_pct": float(pos.get("crash_2022_ret_pct", -15.0) or -15.0),
-                "crash_role_label": pos.get("crash_role_label", "📈 Core Compounder"),
+                "earnings_streak_label": pos.get("earnings_streak_label") or research.get("earnings_streak_label", "N/A"),
+                "fcf_yield_pct": _first_num(pos.get("fcf_yield_pct"), research.get("fcf_yield_pct")),
+                "institutional_ownership_pct": _first_num(pos.get("institutional_ownership_pct"), research.get("institutional_ownership_pct")),
+                "rs_alpha": _num(pos.get("rs_alpha"), 0.0),
+                "bearish_divergence": bool(pos.get("bearish_divergence", False)),
+                # Explicit None checks: a genuine 0 stays 0 and a missing value renders as N/A (no fake defaults)
+                "risk_reward": _num(pos.get("risk_reward_ratio")),
+                "cagr_5y_pct": _num(pos.get("cagr_5y_pct")),
+                "sortino_5y": _num(pos.get("sortino_5y")),
+                "crash_2022_ret_pct": _num(pos.get("crash_2022_ret_pct")),
+                "crash_role_label": pos.get("crash_role_label") or "",
+                "data_ok": pos.get("data_ok"),
             }
             if p_dict["avg_price"] > 0:
                 p_dict["gain_pct"] = round(((p_dict["price"] - p_dict["avg_price"]) / p_dict["avg_price"]) * 100.0, 1)
@@ -116,85 +460,174 @@ def generate_dashboard_html(
     # Sort positions by value descending
     all_positions.sort(key=lambda x: x["value_gbp"], reverse=True)
 
-    # JSON payloads for client interactivity
-    positions_json = json.dumps(all_positions)
-    history_json = json.dumps(history_points)
-    # Calculate dynamic accounts metadata and total reserve floor
+    # Calculate dynamic accounts metadata, reserve floor funding (C5) and pre-rendered risk KPIs (C6)
     accounts_meta = {}
+    reserve_by_account: Dict[str, Dict[str, float]] = {}
     tot_reserve = 0.0
+    tot_reserve_shortfall = 0.0
+    short_accounts: List[str] = []
     for acc_name, acc_data in results_by_account.items():
-        plan = acc_data.get("rebalancing_plan", {})
-        analyses = acc_data.get("analyses", [])
-        cash_info = acc_data.get("cash", {})
+        plan = acc_data.get("rebalancing_plan") or {}
+        analyses = acc_data.get("analyses") or []
+        cash_info = acc_data.get("cash") or {}
+        account_shares = consolidated_view.get("account_shares") or {}
+        acc_share = account_shares.get(acc_name) or {}
 
-        invested_gbp = sum(float(pos.get("value_gbp", 0.0) or 0.0) for pos in analyses)
-        cash_free_gbp = float(cash_info.get("free_gbp", cash_info.get("free", 0.0)) or 0.0)
+        invested_gbp = sum(_num(pos.get("value_gbp"), 0.0) for pos in analyses)
+        cash_free_gbp = _first_num(cash_info.get("free_gbp"), cash_info.get("free"))
+        if cash_free_gbp is None:
+            cash_free_gbp = 0.0
 
-        total_val = float(consolidated_view.get("account_shares", {}).get(acc_name, {}).get("total_value_gbp", 0.0) or 0.0)
+        total_val = _num(acc_share.get("total_value_gbp"), 0.0)
         if total_val <= 0:
-            total_val = float(cash_info.get("total", 0.0) or 0.0)
+            total_val = _num(cash_info.get("total"), 0.0)
         if total_val <= 0:
             total_val = invested_gbp + cash_free_gbp
 
-        share_pct = float(consolidated_view.get("account_shares", {}).get(acc_name, {}).get("share_of_total_pct", 0.0) or 0.0)
+        share_pct = _num(acc_share.get("share_of_total_pct"), 0.0)
         if share_pct <= 0 and tot_net_worth > 0:
             share_pct = round((total_val / tot_net_worth) * 100.0, 1)
 
-        reserve_floor = float(plan.get("buffer_reserve_gbp", 0.0) or 0.0)
-        if reserve_floor <= 0:
-            reserve_floor = float(ACCOUNTS.get(acc_name, {}).get("min_cash_reserve_gbp", 1500.0))
+        rs = _reserve_status(plan, cash_info, acc_name)
+        reserve_by_account[acc_name] = rs
+        tot_reserve += rs["floor"]
+        tot_reserve_shortfall += rs["shortfall"]
+        if rs["shortfall"] > 0.005:
+            short_accounts.append(acc_name)
 
-        tot_reserve += reserve_floor
-
+        risk_5y = plan.get("portfolio_5y_risk_profile") or {}
         accounts_meta[acc_name] = {
             "total_value_gbp": total_val,
             "invested_gbp": invested_gbp,
             "cash_free_gbp": cash_free_gbp,
-            "reserve_floor": reserve_floor,
+            "reserve_floor": rs["floor"],
+            "reserve_funded": rs["funded"],
+            "reserve_shortfall": rs["shortfall"],
+            "reserve_text": _reserve_text(rs),
             "share_pct": share_pct,
-            "risk_5y": plan.get("portfolio_5y_risk_profile", {}),
+            "risk_5y": risk_5y,
+            "kpi": _risk_kpi_texts(risk_5y),
+            "data_degraded_reason": plan.get("data_degraded_reason"),
         }
 
+    if tot_reserve <= 0:
+        tot_reserve = sum(
+            _num(a.get("min_cash_reserve_gbp"), 1500.0) for k, a in ACCOUNTS.items()
+        )
+
+    if tot_reserve_shortfall > 0.005:
+        reserve_all_text = f"⚠️ UNFUNDED — £{tot_reserve_shortfall:,.0f} short ({', '.join(short_accounts)})"
+    else:
+        reserve_all_text = "✅ Funded from free cash in every account"
+    reserve_color = "#f59e0b" if tot_reserve_shortfall > 0.005 else "#38bdf8"
+
+    consolidated_risk = consolidated_view.get("portfolio_5y_risk_profile") or {}
     accounts_meta["ALL"] = {
         "total_value_gbp": tot_net_worth,
         "invested_gbp": tot_invested,
         "cash_free_gbp": tot_cash,
         "reserve_floor": tot_reserve,
+        "reserve_shortfall": tot_reserve_shortfall,
+        "reserve_text": reserve_all_text,
         "share_pct": 100.0,
-        "risk_5y": consolidated_view.get("portfolio_5y_risk_profile", {}),
+        "risk_5y": consolidated_risk,
+        "kpi": _risk_kpi_texts(consolidated_risk),
     }
+    all_kpi = accounts_meta["ALL"]["kpi"]
 
-    if tot_reserve <= 0:
-        tot_reserve = sum(float(a.get("min_cash_reserve_gbp", 1500.0)) for k, a in ACCOUNTS.items())
+    # Data-quality banner (degraded plans or unavailable macro inputs)
+    dq_msgs: List[str] = []
+    for acc_name, acc_data in results_by_account.items():
+        reason = (acc_data.get("rebalancing_plan") or {}).get("data_degraded_reason")
+        if reason:
+            dq_msgs.append(f"{acc_name}: {reason}")
+    if macro_regime.get("macro_data_ok") is False:
+        miss_txt = ", ".join(macro_missing) if macro_missing else "key inputs"
+        dq_msgs.append(f"Macro: {miss_txt} unavailable — regime treated as neutral, not risk-on")
+    data_quality_banner_html = ""
+    if dq_msgs:
+        dq_items = "".join(f"<li>{_html.escape(str(m))}</li>" for m in dq_msgs)
+        data_quality_banner_html = f"""
+    <div class="dq-banner">
+      <div class="dq-title">⚠️ DATA QUALITY WARNING — treat today's output with caution</div>
+      <ul>{dq_items}</ul>
+    </div>"""
+
+    # Household notes: ring-fenced (earmarked) money per account and outside holdings
+    household_notes: List[str] = []
+    for acc_name, acc_data in results_by_account.items():
+        line = _earmark_line(acc_data.get("rebalancing_plan"), acc_data.get("analyses"))
+        if line:
+            household_notes.append(f"👤 {acc_name}: {line}")
+    outside_line = _outside_holdings_line(consolidated_view)
+    if outside_line:
+        household_notes.append(outside_line)
+    household_notes_html = ""
+    if household_notes:
+        notes_items = "".join(f'<div class="note-item">{n}</div>' for n in household_notes)
+        household_notes_html = f'\n    <div class="household-notes">{notes_items}</div>'
 
     # Build dynamic action cards and status badges per account
     action_cards_by_account: Dict[str, List[str]] = {}
     action_badges_by_account: Dict[str, Dict[str, str]] = {}
 
     for acc_name, acc_data in results_by_account.items():
-        plan = acc_data.get("rebalancing_plan", {})
+        plan = acc_data.get("rebalancing_plan") or {}
+        analyses = acc_data.get("analyses") or []
         actionable_sells = [s for s in plan.get("sell_orders", []) if not s.get("is_pending")]
         pending_sells = plan.get("pending_sell_orders", [])
         buy_orders = plan.get("buy_orders", [])
-        reserve_val = accounts_meta.get(acc_name, {}).get("reserve_floor", 0.0)
-        avail_cash = float(plan.get("available_cash_gbp", 0.0) or 0.0)
+        rs = reserve_by_account.get(acc_name) or _reserve_status(plan, acc_data.get("cash"), acc_name)
+        reserve_val = rs["floor"]
+        avail_cash = rs["free"]
 
         cards = []
         step = 1
+
+        degraded_reason = plan.get("data_degraded_reason")
+        if degraded_reason:
+            cards.append(f"""
+        <div class="action-card trim">
+          <div class="action-header">
+            <span style="font-weight: 800; font-size: 14px; color: var(--amber);">👤 [{acc_name.upper()}] ⚠️ DATA DEGRADED</span>
+            <span class="action-badge" style="background: var(--amber-glow); color: var(--amber);">CHECK INPUTS</span>
+          </div>
+          <div class="action-why"><b>Reason:</b> {_html.escape(str(degraded_reason))}</div>
+        </div>""")
 
         if not actionable_sells and not buy_orders and not pending_sells:
             action_badges_by_account[acc_name] = {
                 "text": "✅ ALL SET — SIT BACK & RELAX",
                 "class": "badge-emerald"
             }
+            status_parts = []
+            if _all_stage2_verified(analyses):
+                status_parts.append("All positions are in confirmed weekly Stage 2 uptrends.")
+            if rs["shortfall"] > 0.005:
+                status_parts.append(
+                    f"⚠️ Cash reserve UNFUNDED — £{rs['shortfall']:,.0f} short of the £{reserve_val:,.0f} floor "
+                    f"(£{avail_cash:,.2f} free cash), so it is not available to withdraw until rebuilt."
+                )
+                card_badge = '<span class="action-badge" style="background: var(--amber-glow); color: var(--amber);">⚠️ RESERVE UNFUNDED</span>'
+            else:
+                status_parts.append(
+                    f"Cash reserve floor of £{reserve_val:,.0f} is funded from free cash (£{avail_cash:,.2f} free)."
+                )
+                card_badge = '<span class="action-badge" style="background: var(--emerald-glow); color: var(--emerald);">PORTFOLIO BALANCED</span>'
+            status_txt = " ".join(status_parts)
+            instruction_txt = (
+                "✨ No action required today."
+                if rs["shortfall"] > 0.005
+                else "✨ No action required today. Portfolio is fully balanced and compounding."
+            )
             cards.append(f"""
         <div class="action-card reserve">
           <div class="action-header">
             <span style="font-weight: 800; font-size: 14px; color: var(--emerald);">👤 [{acc_name.upper()}] ✅ ALL SET — SIT BACK & RELAX</span>
-            <span class="action-badge" style="background: var(--emerald-glow); color: var(--emerald);">PORTFOLIO BALANCED</span>
+            {card_badge}
           </div>
-          <div class="action-instruction">✨ No action required today. Portfolio is fully balanced and compounding.</div>
-          <div class="action-why"><b>Status:</b> All positions are in confirmed Stage 2 uptrends with healthy risk/reward profiles. Protected cash floor of £{reserve_val:,.0f} is fully preserved and liquid (£{avail_cash:,.2f} total cash). Sit back and let your winners run.</div>
+          <div class="action-instruction">{instruction_txt}</div>
+          <div class="action-why"><b>Status:</b> {status_txt}</div>
         </div>""")
         else:
             has_trims = any("TRIM" in s.get("action", "") for s in actionable_sells)
@@ -205,14 +638,14 @@ def generate_dashboard_html(
             }
 
             for pso in pending_sells:
-                lim_p = pso.get("limit_price", 0.0)
+                lim_p = _num(pso.get("limit_price"), 0.0)
                 curr = pso.get("currency", "USD")
                 curr_sym = "$" if curr == "USD" else "£"
                 lim_str = f" @ limit {curr_sym}{lim_p:,.2f}" if lim_p > 0 else ""
-                pso_val = float(pso.get("estimated_gbp", 0.0) or 0.0)
+                pso_val = _num(pso.get("estimated_gbp"), 0.0)
                 s_name = pso.get("name", pso.get("ticker"))
                 s_sym = pso.get("search_symbol", pso.get("ticker"))
-                shares_amt = pso.get("shares", 0.0)
+                shares_amt = _num(pso.get("shares"), 0.0)
                 cards.append(f"""
         <div class="action-card" style="border-left: 5px solid var(--primary); background: linear-gradient(135deg, rgba(59, 130, 246, 0.06), var(--card-bg) 60%);">
           <div class="action-header">
@@ -224,13 +657,14 @@ def generate_dashboard_html(
         </div>""")
 
             for so in actionable_sells:
-                is_trim = "TRIM" in so.get("action", "")
+                action_txt = str(so.get("action") or "SELL")
+                is_trim = "TRIM" in action_txt
                 card_class = "trim" if is_trim else "sell"
                 h_color = "var(--amber)" if is_trim else "var(--rose)"
                 b_bg = "var(--amber-glow)" if is_trim else "var(--rose-glow)"
                 b_col = "var(--amber)" if is_trim else "var(--rose)"
-                act_label = f"STEP {step}: 🟠 {so.get('action', 'TRIM')}" if is_trim else f"STEP {step}: 🔴 {so.get('action', 'SELL')}"
-                est_val = float(so.get("estimated_gbp", 0.0) or 0.0)
+                act_label = f"STEP {step}: {_signal_prefix(action_txt, is_trim)}{action_txt}"
+                est_val = _num(so.get("estimated_gbp"), 0.0)
                 cards.append(f"""
         <div class="action-card {card_class}">
           <div class="action-header">
@@ -245,7 +679,7 @@ def generate_dashboard_html(
             for bo in buy_orders:
                 b_sym = bo.get("search_symbol", bo.get("ticker"))
                 b_name = bo.get("name", bo.get("ticker"))
-                b_est = float(bo.get("estimated_gbp", 0.0) or 0.0)
+                b_est = _num(bo.get("estimated_gbp"), 0.0)
                 b_why = bo.get("plain_english_why", "")
                 b_inst = bo.get("app_instruction", "")
                 act_label = f"STEP {step}: 🟢 BUY {b_name} ({b_sym})"
@@ -281,7 +715,7 @@ def generate_dashboard_html(
         }
     action_cards_by_account["ALL"] = all_cards
 
-    # Build dynamic account tabs
+    # Build dynamic account tabs (the consolidated "ALL" view is the first button, never an account tab)
     tabs_buttons_html = f"""
       <button class="tab-btn active" onclick="switchAccount('ALL')">
         <span>🌐 Consolidated (£{tot_net_worth:,.0f})</span>
@@ -297,18 +731,26 @@ def generate_dashboard_html(
     # JSON payloads for client interactivity
     positions_json = json.dumps(all_positions)
     history_json = json.dumps(history_points)
-    accounts_meta_json = json.dumps(accounts_meta)
+    accounts_meta_json = json.dumps(accounts_meta, default=str)
     action_cards_json = json.dumps(action_cards_by_account)
     action_badges_json = json.dumps(action_badges_by_account)
 
-    # Thematic Clusters
-    thematic_clusters = consolidated_view.get("thematic_breakdown", [])
-    accounts_title_label = " & ".join(results_by_account.keys()) or "Portfolio"
-    excluded_badge_html = (
-        f'<span class="badge badge-indigo">Excluded: {", ".join(sorted(EXCLUDED_TICKERS))}</span>'
-        if EXCLUDED_TICKERS
-        else '<span class="badge badge-indigo">5-Year High-Sortino Universe</span>'
-    )
+    # Thematic Clusters (cap label follows the engine's configured cluster cap, C9)
+    thematic_clusters = consolidated_view.get("thematic_breakdown") or []
+    cap_raw = _num(REBALANCE_CONFIG.get("max_cluster_pct", 0.24), 0.24)
+    cluster_cap_pct = cap_raw * 100.0 if cap_raw <= 1.0 else cap_raw
+
+    # Watchlist cards: real per-ticker values from the scan (C10)
+    scan_index: Dict[str, Dict[str, Any]] = {}
+    for entry in (watchlist_scan or []):
+        if not isinstance(entry, dict):
+            continue
+        for key in (entry.get("ticker"), entry.get("yf_ticker"), entry.get("search_symbol")):
+            if key:
+                scan_index.setdefault(str(key).upper(), entry)
+
+    footer_wrapper_line = _wrapper_footer_line(list(results_by_account.keys()) or list(ACCOUNTS.keys()))
+    footer_wrapper_html = f"<div>{footer_wrapper_line}</div>" if footer_wrapper_line else ""
 
     # HTML Document
     html = f"""<!DOCTYPE html>
@@ -384,6 +826,33 @@ def generate_dashboard_html(
     .badge-amber {{ background: var(--amber-glow); color: var(--amber); border: 1px solid var(--amber); }}
     .badge-rose {{ background: var(--rose-glow); color: var(--rose); border: 1px solid var(--rose); }}
     .badge-indigo {{ background: rgba(99, 102, 241, 0.15); color: #a5b4fc; border: 1px solid #6366f1; }}
+    .badge-orange {{ background: rgba(249, 115, 22, 0.15); color: #fb923c; border: 1px solid #f97316; }}
+    .badge-slate {{ background: rgba(148, 163, 184, 0.12); color: #cbd5e1; border: 1px solid #64748b; }}
+
+    /* Data-quality banner & household notes */
+    .dq-banner {{
+      background: rgba(245, 158, 11, 0.10);
+      border: 1px solid var(--amber);
+      border-radius: 12px;
+      padding: 12px 18px;
+      margin-bottom: 20px;
+      color: #fde68a;
+      font-size: 13px;
+    }}
+    .dq-title {{ font-weight: 800; margin-bottom: 6px; color: var(--amber); }}
+    .dq-banner ul {{ margin-left: 18px; }}
+    .household-notes {{
+      background: #0d1322;
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 10px 16px;
+      margin: -12px 0 24px 0;
+      font-size: 12.5px;
+      color: var(--text-muted);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }}
 
     /* Macro Marquee */
     .macro-bar {{
@@ -709,45 +1178,46 @@ def generate_dashboard_html(
         <p>{accounts_title_label} Trading 212 Portfolio • Daily Buy/Sell Recommendations, Trims, & Risk Parity Engine</p>
       </div>
       <div style="text-align: right;">
-        <div style="font-size: 13px; font-weight: 700; color: #fff;">Anchor FX: 1 GBP = ${gbp_rate:.4f} USD</div>
+        <div style="font-size: 13px; font-weight: 700; color: #fff;">Anchor FX: {gbp_rate_txt}</div>
         <div style="font-size: 11.5px; color: var(--text-muted); margin-top: 2px;">Last Audit: {now_str}</div>
       </div>
     </header>
+{data_quality_banner_html}
 
     <!-- Macro Telemetry Bar -->
     <div class="macro-bar">
       <div class="macro-item">
         <span class="macro-label">Backdrop:</span>
-        <span class="badge badge-emerald">{climate} ({macro_score}/100)</span>
+        <span class="badge {climate_badge_cls}">{climate}{score_txt}</span>
       </div>
       <div class="macro-item">
         <span class="macro-label">Crash Defcon:</span>
-        <span class="badge badge-emerald">{macro_regime.get('crash_defcon', '🟢 DEFCON 5 — CALM EXPANSION')}</span>
+        <span class="badge {defcon_badge_cls}">{crash_defcon}</span>
       </div>
       <div class="macro-item">
         <span class="macro-label">VIX:</span>
-        <span class="macro-val">{vix:.1f} ({term_struct:.2f}x term)</span>
+        <span class="macro-val">{vix_txt} ({term_txt})</span>
       </div>
       <div class="macro-item">
         <span class="macro-label">10Y Yield:</span>
-        <span class="macro-val">{us10y:.2f}% (Spread: {curve_spread:+.2f}%)</span>
+        <span class="macro-val">{us10y_txt} (10Y–3M Spread: {spread_txt})</span>
       </div>
       <div class="macro-item">
         <span class="macro-label">Dist. Days:</span>
-        <span class="macro-val">SPY {spy_dist}d / QQQ {qqq_dist}d</span>
+        <span class="macro-val">SPY {spy_dist_txt} / QQQ {qqq_dist_txt}</span>
       </div>
       <div class="macro-item">
         <span class="macro-label">High-Beta:</span>
-        <span class="macro-val">{hb_ratio:.2f}x</span>
+        <span class="macro-val">{hb_txt}</span>
       </div>
       <div class="macro-item">
         <span class="macro-label">Semi Lead:</span>
-        <span class="macro-val">{semi_ratio:.3f}x</span>
+        <span class="macro-val">{semi_txt}</span>
       </div>
       <div class="macro-item">
         <span class="macro-label">Crude Oil:</span>
-        <span class="macro-val">${oil:.1f}</span>
-      </div>
+        <span class="macro-val">{oil_txt}</span>
+      </div>{partial_macro_html}
     </div>
 
     <!-- Top KPI Row -->
@@ -791,12 +1261,13 @@ def generate_dashboard_html(
           <span>Protected Cash Floor</span>
           <span>🛡️</span>
         </div>
-        <div class="kpi-value" style="color: #38bdf8;" id="kpiReserve">£{tot_reserve:,.2f}</div>
-        <div class="kpi-sub">
-          <span>100% Ring-fenced safe to withdraw</span>
+        <div class="kpi-value" style="color: {reserve_color};" id="kpiReserve">£{tot_reserve:,.2f}</div>
+        <div class="kpi-sub" id="kpiReserveSub">
+          <span>{reserve_all_text}</span>
         </div>
       </div>
     </div>
+{household_notes_html}
 
     <!-- Account View Selector Tabs -->
     <div class="tabs-bar">
@@ -810,9 +1281,9 @@ def generate_dashboard_html(
           <span>5-Year Sortino & CAGR</span>
           <span>🚀</span>
         </div>
-        <div class="kpi-value" style="color: var(--emerald); font-size: 22px;" id="kpiSortino5Y">{consolidated_view.get('portfolio_5y_risk_profile', {}).get('current_sortino_5y', 1.5):.2f} Sortino</div>
+        <div class="kpi-value" style="color: var(--emerald); font-size: 22px;" id="kpiSortino5Y">{all_kpi['sortino']}</div>
         <div class="kpi-sub" id="kpiCagr5Y">
-          <span>Hist. 5Y CAGR: +{consolidated_view.get('portfolio_5y_risk_profile', {}).get('current_cagr_5y_pct', 20.0):.1f}%/yr</span>
+          <span>{all_kpi['cagr']}</span>
         </div>
       </div>
 
@@ -821,9 +1292,9 @@ def generate_dashboard_html(
           <span>2022 Crash Stress-Test</span>
           <span>🛡️</span>
         </div>
-        <div class="kpi-value" style="color: var(--amber); font-size: 22px;" id="kpiCrash2022">{consolidated_view.get('portfolio_5y_risk_profile', {}).get('current_stress_2022_pct', -25.0):+.1f}%</div>
+        <div class="kpi-value" style="color: var(--amber); font-size: 22px;" id="kpiCrash2022">{all_kpi['crash']}</div>
         <div class="kpi-sub" id="kpiCrash2022Sub">
-          <span>Simulated 2022 Bear Drawdown (£{consolidated_view.get('portfolio_5y_risk_profile', {}).get('current_stress_2022_gbp', 0.0):,.0f})</span>
+          <span>{all_kpi['crash_sub']}</span>
         </div>
       </div>
 
@@ -832,20 +1303,23 @@ def generate_dashboard_html(
           <span>All-Weather Crash Shield</span>
           <span>🏰</span>
         </div>
-        <div class="kpi-value" style="color: var(--primary); font-size: 22px;" id="kpiShield5Y">{consolidated_view.get('portfolio_5y_risk_profile', {}).get('current_shield_pct', 0.0):.1f}%</div>
+        <div class="kpi-value" style="color: var(--primary); font-size: 22px;" id="kpiShield5Y">{all_kpi['shield']}</div>
         <div class="kpi-sub" id="kpiShield5YSub">
-          <span>{consolidated_view.get('portfolio_5y_risk_profile', {}).get('crash_readiness_grade', '🟢 ALL-WEATHER READY')}</span>
+          <span>{all_kpi['shield_sub']}</span>
+        </div>
+        <div class="kpi-sub" id="kpiDefensive5Y">
+          <span>{all_kpi['defensive']}</span>
         </div>
       </div>
 
       <div class="kpi-card" style="border-color: rgba(139, 92, 246, 0.35);">
         <div class="kpi-title">
-          <span>5-Year (2031) Wealth Target</span>
+          <span>5-Year (2031) Projection</span>
           <span>🔮</span>
         </div>
-        <div class="kpi-value" style="color: #c4b5fd; font-size: 20px;" id="kpiProj5Y">£{consolidated_view.get('portfolio_5y_risk_profile', {}).get('projected_5y_conservative_gbp', 0.0):,.0f} – £{consolidated_view.get('portfolio_5y_risk_profile', {}).get('projected_5y_target_gbp', 0.0):,.0f}</div>
-        <div class="kpi-sub">
-          <span>5-Year Horizon Compounding Range</span>
+        <div class="kpi-value" style="color: #c4b5fd; font-size: 17px;" id="kpiProj5Y">{all_kpi['proj']}</div>
+        <div class="kpi-sub" id="kpiProj5YSub">
+          <span>{all_kpi['proj_sub']}</span>
         </div>
       </div>
     </div>
@@ -863,18 +1337,18 @@ def generate_dashboard_html(
     <!-- MPT Thematic Concentration Meters -->
     <div class="section-title">
       <span>🌐 Modern Portfolio Theory (MPT) Thematic Risk Exposure</span>
-      <span style="font-size: 12px; color: var(--text-muted); font-weight: normal;">(35.0% Maximum Correlation Cap)</span>
+      <span style="font-size: 12px; color: var(--text-muted); font-weight: normal;">({cluster_cap_pct:.0f}% Maximum Cluster Cap)</span>
     </div>
 
     <div class="mpt-grid">
 """
     for tb in thematic_clusters:
-        c_name = tb["cluster"]
-        c_val = tb["value_gbp"]
-        c_pct = tb["weight_pct"]
-        is_sat = c_pct >= 35.0
+        c_name = tb.get("cluster", "Unclassified")
+        c_val = _num(tb.get("value_gbp"), 0.0)
+        c_pct = _num(tb.get("weight_pct"), 0.0)
+        is_sat = c_pct >= cluster_cap_pct
         bar_color = "#ef4444" if is_sat else ("#10b981" if c_pct >= 15.0 else "#f59e0b")
-        status_label = "🔴 SATURATED (>35% CAP)" if is_sat else ("🟢 CORE PILLAR" if c_pct >= 15.0 else "🟡 UNDERWEIGHTED")
+        status_label = f"🔴 AT/ABOVE {cluster_cap_pct:.0f}% CAP" if is_sat else ("🟢 CORE PILLAR" if c_pct >= 15.0 else "🟡 UNDERWEIGHTED")
         html += f"""
       <div class="mpt-card">
         <div class="mpt-header">
@@ -898,7 +1372,7 @@ def generate_dashboard_html(
     <div class="chart-box">
       <div class="section-title" style="margin-bottom: 12px;">
         <span>📈 Historical Portfolio Equity Curve & Trajectory</span>
-        <span style="font-size: 12px; color: var(--text-muted); font-weight: normal;">(Trailing 8 Sessions)</span>
+        <span style="font-size: 12px; color: var(--text-muted); font-weight: normal;">{sessions_label}</span>
       </div>
       <div class="chart-container" id="chartContainer">
         <!-- Rendered via inline SVG -->
@@ -929,7 +1403,7 @@ def generate_dashboard_html(
             <th onclick="sortTable('weight_pct')">Weight</th>
             <th onclick="sortTable('sortino_5y')">5Y Sortino</th>
             <th onclick="sortTable('crash_2022_ret_pct')">2022 Crash</th>
-            <th onclick="sortTable('piotroski')">Piotroski</th>
+            <th onclick="sortTable('piotroski')">Quality Checklist (0-9)</th>
             <th onclick="sortTable('altman_z')">Altman Z</th>
             <th onclick="sortTable('risk_reward')">R:R</th>
             <th>Signal & Strategy Status</th>
@@ -953,7 +1427,51 @@ def generate_dashboard_html(
         t = w["ticker"]
         name = w["name"]
         theme = w["theme"]
-        # Basic metadata badges
+        entry = scan_index.get(str(t).upper())
+        research = (entry or {}).get("research") or {}
+        t_up = str(t).upper()
+        is_gold = any(k in t_up for k in _GOLD_TICKER_KEYS)
+        is_fund = bool(research.get("is_etf") or (entry or {}).get("is_etf")) or any(k in t_up for k in _FUND_TICKER_KEYS)
+        fund_na = "N/A (gold)" if is_gold else "N/A (fund)"
+
+        data_ok = (entry or {}).get("data_ok")
+        if data_ok is None and entry is not None:
+            data_ok = research.get("data_ok")
+        if entry is None:
+            badge_html = '<span class="badge badge-slate">NOT SCANNED</span>'
+        elif data_ok is True:
+            badge_html = '<span class="badge badge-indigo">SCREENED</span>'
+        elif data_ok is False:
+            badge_html = '<span class="badge badge-amber">DATA UNAVAILABLE</span>'
+        else:
+            badge_html = '<span class="badge badge-slate">UNVERIFIED</span>'
+
+        if entry is None or data_ok is False:
+            quality_txt = solvency_txt = trend_txt = rr_txt = "N/A"
+        else:
+            if is_fund:
+                quality_txt = solvency_txt = fund_na
+            else:
+                p_score = _first_num(entry.get("piotroski_score"), research.get("piotroski_score"))
+                quality_txt = f"{p_score:.0f}/9" if p_score is not None else "N/A"
+                z_val = _first_num(entry.get("altman_z"), research.get("altman_z"))
+                solvency_txt = f"Altman Z {z_val:.1f}" if z_val is not None else "N/A"
+            stage2 = entry.get("is_weekly_stage_2")
+            trend_label = str(entry.get("weekly_trend_label") or "").split("(")[0].strip()
+            if trend_label:
+                trend_txt = trend_label
+            elif stage2 is True:
+                trend_txt = "Weekly Stage 2"
+            elif stage2 is False:
+                trend_txt = "Not Weekly Stage 2"
+            else:
+                trend_txt = "N/A"
+            rr_val = _num(entry.get("risk_reward_ratio"))
+            if is_fund:
+                rr_txt = fund_na
+            else:
+                rr_txt = f"R:R {rr_val:.1f}:1" if rr_val is not None else "N/A"
+
         html += f"""
       <div class="watch-card">
         <div class="watch-top">
@@ -961,25 +1479,25 @@ def generate_dashboard_html(
             <div class="watch-title">{t}</div>
             <div style="font-size: 12px; color: #fff;">{name}</div>
           </div>
-          <span class="badge badge-indigo">SCREENED</span>
+          {badge_html}
         </div>
         <div class="watch-theme">{theme}</div>
         <div class="watch-metrics">
           <div class="watch-m-item">
-            <span class="watch-m-label">Balance Sheet</span>
-            <span class="watch-m-val">Piotroski 8–9/9</span>
+            <span class="watch-m-label">Quality Checklist (0-9)</span>
+            <span class="watch-m-val">{quality_txt}</span>
           </div>
           <div class="watch-m-item">
             <span class="watch-m-label">Solvency</span>
-            <span class="watch-m-val">Altman Z > 6.0</span>
+            <span class="watch-m-val">{solvency_txt}</span>
           </div>
           <div class="watch-m-item">
             <span class="watch-m-label">Trend Structure</span>
-            <span class="watch-m-val">Weekly Stage 2</span>
+            <span class="watch-m-val">{trend_txt}</span>
           </div>
           <div class="watch-m-item">
             <span class="watch-m-label">Expectancy</span>
-            <span class="watch-m-val">R:R > 5.0:1</span>
+            <span class="watch-m-val">{rr_txt}</span>
           </div>
         </div>
       </div>
@@ -990,8 +1508,9 @@ def generate_dashboard_html(
 
     <!-- Footer -->
     <footer class="footer">
-      <div>Trading 212 Daily Recommendation & Rebalancing Engine • {accounts_title_label}</div>
+      <div>Trading 212 Daily Recommendation & Rebalancing Engine • {accounts_title_label} • Model version: {_html.escape(str(model_version))}</div>
       <div>Capital Isolation Enforced: Execute orders directly inside your Trading 212 app.</div>
+      {footer_wrapper_html}
     </footer>
 
   </div>
@@ -1007,7 +1526,20 @@ def generate_dashboard_html(
     let sortAsc = false;
 
     function formatGBP(val) {{
-      return '£' + Number(val).toLocaleString('en-GB', {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }});
+      return '£' + Number(val ?? 0).toLocaleString('en-GB', {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }});
+    }}
+
+    function setText(id, val) {{
+      const el = document.getElementById(id);
+      if (el) el.textContent = val ?? 'N/A';
+    }}
+
+    function setSpan(id, val) {{
+      const el = document.getElementById(id);
+      if (!el) return;
+      const span = document.createElement('span');
+      span.textContent = val ?? 'N/A';
+      el.replaceChildren(span);
     }}
 
     function switchAccount(acc) {{
@@ -1040,24 +1572,23 @@ def generate_dashboard_html(
         kpiReserve.textContent = formatGBP(acc.reserve_floor);
       }}
 
-      const accMeta = ACCOUNTS_META[currentAccount] || ACCOUNTS_META['ALL'];
-      if (accMeta && accMeta.risk_5y) {{
-        const r = accMeta.risk_5y;
-        const sortEl = document.getElementById('kpiSortino5Y');
-        const cagrEl = document.getElementById('kpiCagr5Y');
-        const crashEl = document.getElementById('kpiCrash2022');
-        const crashSubEl = document.getElementById('kpiCrash2022Sub');
-        const shieldEl = document.getElementById('kpiShield5Y');
-        const shieldSubEl = document.getElementById('kpiShield5YSub');
-        const projEl = document.getElementById('kpiProj5Y');
-
-        if (sortEl) sortEl.textContent = (r.current_sortino_5y || 1.5).toFixed(2) + (r.post_sortino_5y && r.post_sortino_5y !== r.current_sortino_5y ? ' ➔ ' + r.post_sortino_5y.toFixed(2) : ' Sortino');
-        if (cagrEl) cagrEl.innerHTML = `<span>Hist. 5Y CAGR: +${{(r.post_cagr_5y_pct || r.current_cagr_5y_pct || 20).toFixed(1)}}%/yr (Beta ${{(r.post_beta_5y || r.current_beta_5y || 1.0).toFixed(2)}})</span>`;
-        if (crashEl) crashEl.textContent = (r.current_stress_2022_pct || -25).toFixed(1) + '%' + (r.post_stress_2022_pct && r.post_stress_2022_pct !== r.current_stress_2022_pct ? ' ➔ ' + r.post_stress_2022_pct.toFixed(1) + '%' : '');
-        if (crashSubEl) crashSubEl.innerHTML = `<span>2022 Crash Sim: £${{Math.round(r.post_stress_2022_gbp || r.current_stress_2022_gbp || 0).toLocaleString('en-GB')}}</span>`;
-        if (shieldEl) shieldEl.textContent = (r.current_shield_pct || 0).toFixed(1) + '%' + (r.post_shield_pct && r.post_shield_pct !== r.current_shield_pct ? ' ➔ ' + r.post_shield_pct.toFixed(1) + '%' : '');
-        if (shieldSubEl) shieldSubEl.innerHTML = `<span>${{r.crash_readiness_grade || '🟢 ALL-WEATHER READY'}}</span>`;
-        if (projEl) projEl.textContent = '£' + Math.round(r.projected_5y_conservative_gbp || 0).toLocaleString('en-GB') + ' – £' + Math.round(r.projected_5y_target_gbp || 0).toLocaleString('en-GB');
+      const accMeta = ACCOUNTS_META[currentAccount] ?? ACCOUNTS_META['ALL'];
+      if (accMeta) {{
+        const unfunded = (accMeta.reserve_shortfall ?? 0) > 0.005;
+        kpiReserve.style.color = unfunded ? '#f59e0b' : '#38bdf8';
+        setSpan('kpiReserveSub', accMeta.reserve_text);
+      }}
+      if (accMeta && accMeta.kpi) {{
+        const k = accMeta.kpi;
+        setText('kpiSortino5Y', k.sortino);
+        setSpan('kpiCagr5Y', k.cagr);
+        setText('kpiCrash2022', k.crash);
+        setSpan('kpiCrash2022Sub', k.crash_sub);
+        setText('kpiShield5Y', k.shield);
+        setSpan('kpiShield5YSub', k.shield_sub);
+        setSpan('kpiDefensive5Y', k.defensive);
+        setText('kpiProj5Y', k.proj);
+        setSpan('kpiProj5YSub', k.proj_sub);
       }}
     }}
 
@@ -1087,6 +1618,9 @@ def generate_dashboard_html(
       filtered.sort((a, b) => {{
         let vA = a[sortCol];
         let vB = b[sortCol];
+        const aMissing = (vA === null || vA === undefined);
+        const bMissing = (vB === null || vB === undefined);
+        if (aMissing || bMissing) return aMissing === bMissing ? 0 : (aMissing ? 1 : -1);
         if (typeof vA === 'string') vA = vA.toLowerCase();
         if (typeof vB === 'string') vB = vB.toLowerCase();
         if (vA < vB) return sortAsc ? -1 : 1;
@@ -1096,17 +1630,27 @@ def generate_dashboard_html(
 
       document.getElementById('visibleCount').textContent = filtered.length;
 
+      const naSpan = '<span style="color:#64748b">N/A</span>';
+      const normSig = (s) => String(s ?? '').toUpperCase().replace(/[^A-Z0-9%]+/g, ' ').trim();
+
       let html = '';
       for (const p of filtered) {{
         const pnlColor = p.unrealized_pnl >= 0 ? '#10b981' : '#f43f5e';
         const pnlSign = p.unrealized_pnl >= 0 ? '+' : '';
         const gainSign = p.gain_pct >= 0 ? '+' : '';
         
-        const pioBadge = (p.piotroski !== null && p.piotroski !== undefined) ? `<span class="badge ${{p.piotroski >= 8 ? 'badge-emerald' : 'badge-amber'}}">${{p.piotroski}}/9</span>` : '<span style="color:#64748b">N/A</span>';
-        const altBadge = (p.altman_z !== null && p.altman_z !== undefined) ? `<span style="font-weight:700; color:${{p.altman_z >= 3.0 ? '#10b981' : '#f59e0b'}}">${{p.altman_z.toFixed(1)}}</span>` : '<span style="color:#64748b">N/A</span>';
-        const sort5Badge = `<span style="font-weight:700; color:${{p.sortino_5y >= 1.5 ? '#10b981' : (p.sortino_5y >= 0.9 ? '#38bdf8' : '#f43f5e')}}">${{(p.sortino_5y || 1.5).toFixed(2)}}</span> <span style="font-size:10px; color:#94a3b8;">(${{(p.cagr_5y_pct || 18) >= 0 ? '+' : ''}}${{(p.cagr_5y_pct || 18).toFixed(0)}}%/y)</span>`;
-        const crash22Color = (p.crash_2022_ret_pct || -15) >= 0 ? '#10b981' : ((p.crash_2022_ret_pct || -15) >= -20 ? '#38bdf8' : '#f43f5e');
-        const crash22Badge = `<span style="font-weight:700; color:${{crash22Color}}">${{(p.crash_2022_ret_pct || -15) >= 0 ? '+' : ''}}${{(p.crash_2022_ret_pct || -15).toFixed(1)}}%</span>`;
+        const pioBadge = (p.piotroski !== null && p.piotroski !== undefined) ? `<span class="badge ${{p.piotroski >= 8 ? 'badge-emerald' : 'badge-amber'}}">${{p.piotroski}}/9</span>` : naSpan;
+        const altBadge = (p.altman_z !== null && p.altman_z !== undefined) ? `<span style="font-weight:700; color:${{p.altman_z >= 3.0 ? '#10b981' : '#f59e0b'}}">${{p.altman_z.toFixed(1)}}</span>` : naSpan;
+        const sortVal = p.sortino_5y ?? null;
+        const cagrVal = p.cagr_5y_pct ?? null;
+        const cagrSpan = cagrVal !== null ? ` <span style="font-size:10px; color:#94a3b8;">(${{cagrVal >= 0 ? '+' : ''}}${{cagrVal.toFixed(0)}}%/y)</span>` : '';
+        const sort5Badge = sortVal !== null ? `<span style="font-weight:700; color:${{sortVal >= 1.5 ? '#10b981' : (sortVal >= 0.9 ? '#38bdf8' : '#f43f5e')}}">${{sortVal.toFixed(2)}}</span>${{cagrSpan}}` : naSpan + cagrSpan;
+        const crashVal = p.crash_2022_ret_pct ?? null;
+        const crash22Color = crashVal === null ? '#64748b' : (crashVal >= 0 ? '#10b981' : (crashVal >= -20 ? '#38bdf8' : '#f43f5e'));
+        const crash22Badge = crashVal !== null ? `<span style="font-weight:700; color:${{crash22Color}}">${{crashVal >= 0 ? '+' : ''}}${{crashVal.toFixed(1)}}%</span>` : naSpan;
+        const rrVal = p.risk_reward ?? null;
+        const rrCell = rrVal !== null ? `<b>${{rrVal.toFixed(1)}}:1</b>` : naSpan;
+        const signalLine = (p.signal && normSig(p.signal) !== normSig(p.plan_status)) ? `<div style="font-size: 10.5px; color: #94a3b8; margin-top: 4px;">${{p.signal}}</div>` : '';
 
         let statusBadgeClass = 'badge-indigo';
         if (p.plan_status.includes('TRIM')) statusBadgeClass = 'badge-amber';
@@ -1141,9 +1685,10 @@ def generate_dashboard_html(
             <td>${{crash22Badge}}</td>
             <td>${{pioBadge}}</td>
             <td>${{altBadge}}</td>
-            <td><b>${{(p.risk_reward || 3.0).toFixed(1)}}:1</b></td>
+            <td>${{rrCell}}</td>
             <td>
               <span class="badge ${{statusBadgeClass}}">${{p.plan_status}}</span>
+              ${{signalLine}}
             </td>
           </tr>
         `;

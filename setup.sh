@@ -124,6 +124,14 @@ SECOND_ACCOUNT_NAME=
 T212_KEY_ID_2=
 T212_SECRET_2=
 MIN_CASH_RESERVE_2=500.0
+
+# --- OPTIONAL SETTINGS (blank = off; see README "Optional Settings") ---
+EARMARKED_TICKERS=
+OUTSIDE_HOLDINGS_JSON=
+RESERVE_TOPUPS_JSON=
+ACCOUNT_WRAPPER=
+ACCOUNT_WRAPPER_2=
+MAX_LEVERAGED_ETF_PCT=0.08
 EOF
     chmod 600 .env
     echo "✅ Saved configuration to .env (permissions locked to 600)."

@@ -25,25 +25,126 @@ def _clean_num(val: Any, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
-def _get_fin_fx_divisor(info: Dict[str, Any]) -> float:
-    """Normalizes financial statement currency (e.g. TWD for TSM, EUR for ASML ADR) into quote marketCap currency."""
+# Per-process cache of live FX rates keyed by Yahoo pair symbol (e.g. "USDTWD=X"). Failed lookups are cached as
+# None so a broken pair is not re-queried for every ticker in the same run.
+_FX_RATE_CACHE: Dict[str, Optional[float]] = {}
+
+# Quote-currency aliases whose marketCap is denominated in the major unit (e.g. LSE pence lines report GBP caps)
+_CURRENCY_ALIASES = {"GBX": "GBP"}
+
+
+def _fetch_fx_rate(base: str, quote: str) -> Optional[float]:
+    """Returns the live price of 1 `base` unit in `quote` units from Yahoo's f"{base}{quote}=X" pair.
+
+    Cached per process. Returns None when the pair is unknown or unavailable; never a static or 1.0 fallback.
+    """
+    base = str(base or "").upper().strip()
+    quote = str(quote or "").upper().strip()
+    if not base or not quote:
+        return None
+    if base == quote:
+        return 1.0
+    pair = f"{base}{quote}=X"
+    if pair in _FX_RATE_CACHE:
+        return _FX_RATE_CACHE[pair]
+
+    rate: Optional[float] = None
+    error: Optional[str] = None
+    try:
+        fx_obj = yf.Ticker(pair)
+        try:
+            fi = fx_obj.fast_info
+            rate = _clean_num(fi.get("lastPrice") if hasattr(fi, "get") else fi["lastPrice"])
+        except Exception as e:
+            error = str(e)
+            rate = None
+        if rate is None or rate <= 0:
+            hist = fx_obj.history(period="5d", interval="1d")
+            if hist is not None and not hist.empty and "Close" in hist.columns:
+                closes = hist["Close"].dropna()
+                if len(closes) > 0:
+                    rate = _clean_num(closes.iloc[-1])
+    except Exception as e:
+        error = str(e)
+        rate = None
+
+    if rate is None or rate <= 0:
+        logger.warning(
+            "Live FX rate unavailable for %s (%s); FX-dependent metrics will be N/A.", pair, error or "no quote"
+        )
+        rate = None
+    _FX_RATE_CACHE[pair] = rate
+    return rate
+
+
+def _get_fin_fx_divisor(info: Dict[str, Any]) -> Optional[float]:
+    """Normalizes financial statement currency (e.g. TWD for TSM, EUR for ASML ADR) into quote marketCap currency.
+
+    Returns the number of financial-statement currency units per 1 unit of quote currency, using the live Yahoo
+    f"{quote}{financial}=X" rate (cached per process). So `statement_value / divisor` is in quote currency and
+    `quote_value * divisor` is in statement currency. Returns 1.0 only when both currencies are the same.
+    Returns None when either currency is unknown or the live rate is unavailable: callers must then treat
+    FX-dependent metrics (FCF yield, Altman X4) as None rather than assuming parity.
+    """
     fin_curr = str(info.get("financialCurrency") or "").upper().strip()
     mkt_curr = str(info.get("currency") or "").upper().strip()
-    if not fin_curr or not mkt_curr or fin_curr == mkt_curr:
+    if not fin_curr or not mkt_curr:
+        return None
+    fin_curr = _CURRENCY_ALIASES.get(fin_curr, fin_curr)
+    mkt_curr = _CURRENCY_ALIASES.get(mkt_curr, mkt_curr)
+    # Handle GBP vs GBp (pence): upper-casing maps GBp to GBP, and marketCap on Yahoo is already in GBP
+    # even when the price is quoted in GBp.
+    if fin_curr == mkt_curr:
         return 1.0
-    # Handle GBP vs GBp (pence)
-    if fin_curr == "GBP" and str(info.get("currency")) == "GBp":
-        return 1.0  # marketCap on Yahoo is already in GBP even when price is GBp
-    fx_approx = {
-        ("TWD", "USD"): 32.0,
-        ("JPY", "USD"): 152.0,
-        ("DKK", "USD"): 6.9,
-        ("EUR", "USD"): 0.92,
-        ("GBP", "USD"): 0.76,
-        ("CHF", "USD"): 0.88,
-        ("CNY", "USD"): 7.2,
-    }
-    return fx_approx.get((fin_curr, mkt_curr), 1.0)
+    return _fetch_fx_rate(mkt_curr, fin_curr)
+
+
+def _fetch_last_price(symbol: str, positive_only: bool = True) -> Optional[float]:
+    """Fetches the latest price/level for a macro symbol via yfinance fast_info.
+
+    Returns None (and logs a warning) on any failure or non-finite value, never a hardcoded default.
+    Set positive_only=False for yields, which can legitimately be zero.
+    """
+    raw: Any = None
+    try:
+        fi = yf.Ticker(symbol).fast_info
+        raw = fi.get("lastPrice") if hasattr(fi, "get") else fi["lastPrice"]
+        val = _clean_num(raw)
+    except Exception as e:
+        logger.warning("Macro input %s unavailable: %s", symbol, e)
+        return None
+    if val is None or (positive_only and val <= 0):
+        logger.warning("Macro input %s returned no usable value (%r).", symbol, raw)
+        return None
+    return val
+
+
+def _count_distribution_days(symbol: str, lookback: int = 25) -> Tuple[int, bool]:
+    """Counts O'Neil distribution days (close down >= 0.2% on higher volume) over the last `lookback` sessions.
+
+    Returns (count, ok). ok is False (and a warning is logged) when the daily history could not be fetched or
+    is too short; the count is then 0 and must not be read as "no selling pressure".
+    """
+    try:
+        df_d = yf.Ticker(symbol).history(period="60d", interval="1d")
+    except Exception as e:
+        logger.warning("Macro input %s daily history unavailable: %s", symbol, e)
+        return 0, False
+    try:
+        rows = 0 if df_d is None else len(df_d)
+        if rows < lookback + 1 or "Close" not in df_d.columns or "Volume" not in df_d.columns:
+            logger.warning("Macro input %s daily history unavailable or too short (%d rows).", symbol, rows)
+            return 0, False
+        count = 0
+        for i in range(-lookback, 0):
+            ret = (df_d["Close"].iloc[i] - df_d["Close"].iloc[i - 1]) / df_d["Close"].iloc[i - 1]
+            vol_higher = df_d["Volume"].iloc[i] > df_d["Volume"].iloc[i - 1]
+            if ret <= -0.002 and vol_higher:
+                count += 1
+        return count, True
+    except Exception as e:
+        logger.warning("Macro input %s distribution-day calculation failed: %s", symbol, e)
+        return 0, False
 
 
 # Macro Benchmark Tickers for Intermarket & Quantitative Regime Analysis
@@ -52,7 +153,8 @@ MACRO_TICKERS = {
     "NASDAQ": "^NDX",
     "VIX": "^VIX",
     "US10Y": "^TNX",
-    "US02Y": "^IRX",
+    "US02Y": "^IRX",  # Legacy key name only: ^IRX is the 13-week (3-month) T-bill yield, not the 2-year note
+    "US3M": "^IRX",   # 13-week (3-month) T-bill yield used for the 10Y–3M curve spread
     "DXY": "DX-Y.NYB",
     "DXY_ETF": "UUP",
     "HYG": "HYG",
@@ -69,6 +171,10 @@ MACRO_TICKERS = {
     "SPLV": "SPLV",
     "SMH": "SMH",
 }
+
+# Key macro inputs: if any of these cannot be fetched, get_macro_regime() forces a neutral regime (never risk-on).
+# "SPY trend" is the SPY daily history that drives the distribution-day / selling-pressure read.
+MACRO_KEY_INPUTS = ("VIX", "SPY trend")
 
 # Thematic Classifications & Macro Clusters for institutional Modern Portfolio Theory (MPT) concentration control
 THEMATIC_CATEGORIES = {
@@ -114,8 +220,12 @@ THEMATIC_CATEGORIES = {
     # Diversified Index Foundations
     "VUAA.L": "US Large-Cap S&P 500 Secular Core",
     "VUSA.L": "US Large-Cap S&P 500 Secular Core",
+    "VUAG.L": "US Large-Cap S&P 500 Secular Core",
+    "CSPX.L": "US Large-Cap S&P 500 Secular Core",
     "VWRP.L": "Global Equities Core Foundation",
+    "VWRA.L": "Global Equities Core Foundation",
     "CNDX.L": "Nasdaq-100 High-Beta Tech Leaders",
+    "CNX1.L": "Nasdaq-100 High-Beta Tech Leaders",
     "DFND.SW": "Global Aerospace & Defense",
     "QQQ3.L": "Nasdaq-100 3x Leveraged Tech",
 }
@@ -293,7 +403,7 @@ INSTITUTIONAL_DOSSIERS = {
     "TSM": {
         "sector_theme": "Semiconductor Foundry Monopoly (Critical Global Infrastructure)",
         "moat": "Wide Economic Moat (90%+ global market share in advanced sub-3nm node manufacturing)",
-        "catalysts": "Irreplaceable sole foundry partner for Nvidia, Apple, AMD, Qualcomm, and Broadcom; superior pricing power supporting >53% gross margins and >60% operating margins; attractive PEG ratio (0.81) offering premier growth at reasonable price.",
+        "catalysts": "Irreplaceable sole foundry partner for Nvidia, Apple, AMD, Qualcomm, and Broadcom; superior pricing power supporting industry-leading gross and operating margins; attractive PEG ratio (0.81) offering premier growth at reasonable price.",
         "risks": "Geopolitical cross-strait tensions between China and Taiwan; overseas fab expansion capital expenditure drag.",
     },
     "LLY": {
@@ -323,6 +433,26 @@ INSTITUTIONAL_DOSSIERS = {
 }
 
 
+# Broad index ETFs, physical commodity ETCs and cash funds that get the tailored ETF profile (substring match).
+# VUAG/CSPX (S&P 500), CNX1 (Nasdaq-100) and VWRA (FTSE All-World) are sister lines of VUAA/CNDX/VWRP.
+KNOWN_ETF_TICKER_KEYS = (
+    "VUAA", "VUSA", "VUAG", "CSPX", "VWRP", "VWRA", "SMGB", "CNDX", "CNX1",
+    "DFND", "QQQ3", "SGLN", "IGLN", "GLD", "CSH2",
+)
+
+# Core Yahoo fundamentals: a stock deep dive is only data_ok when at least _MIN_CORE_FUNDAMENTALS are present.
+_CORE_FUNDAMENTAL_KEYS = (
+    "marketCap", "forwardPE", "trailingPE", "revenueGrowth", "earningsGrowth", "operatingMargins",
+    "grossMargins", "returnOnEquity", "freeCashflow", "totalRevenue", "operatingCashflow",
+)
+_MIN_CORE_FUNDAMENTALS = 3
+
+
+def _is_known_etf_ticker(yf_ticker: str) -> bool:
+    """True when the ticker matches the hardcoded ETF/ETC list (substring match, e.g. 'VUAG.L')."""
+    t = str(yf_ticker or "").upper()
+    return any(etf in t for etf in KNOWN_ETF_TICKER_KEYS)
+
 
 class DeepResearchAgent:
     """Institutional Research Agent analyzing macro regime, corporate fundamentals, and street sentiment."""
@@ -333,67 +463,101 @@ class DeepResearchAgent:
     def get_macro_regime(self) -> Dict[str, Any]:
         """Analyzes comprehensive global macro and intermarket regime:
         - Volatility structure (VIX)
-        - Yield curve dynamics (10Y-2Y Treasury Curve Spread)
+        - Yield curve dynamics (10Y Treasury vs 3-month T-bill spread; ^IRX is the 13-week bill, not the 2-year)
         - Global currency liquidity (US Dollar Index DXY)
         - Credit risk appetite & spreads (HYG vs LQD)
         - Macro growth vs fear barometer (Copper / Gold ratio)
         - Market breadth participation (RSP Equal-Weight vs SPY Cap-Weight)
+
+        Fail-closed data handling (C3): every input that cannot be fetched is logged at warning level, listed in
+        "macro_missing" (affected regime keys in "macro_missing_keys") and contributes nothing to the score.
+        If a key input (VIX or the SPY daily trend history) is missing, "macro_data_ok" is False and the regime is
+        forced to a neutral "MACRO DATA UNAVAILABLE" state (score 50, DEFCON-3-style text). It never defaults to
+        risk-on. Numeric fields of missing inputs are display placeholders only.
         """
         if self._macro_cache:
             return self._macro_cache
 
-        regime = {
+        na_status = "⚪ N/A (data unavailable)"
+        regime: Dict[str, Any] = {
             "vix": 15.0,
-            "vix_status": "Low Volatility (Risk-On)",
+            "vix_status": "N/A (data unavailable)",
             "vix3m": 17.5,
             "vix_term_structure": 0.86,
-            "vix_term_structure_status": "🟢 Deep Contango (0.86x) — Institutional Calm",
+            "vix_term_structure_status": na_status,
             "us10y_yield": 4.50,
-            "us02y_yield": 3.80,
+            "us02y_yield": 3.80,  # Legacy key name: holds the 3-month T-bill yield (^IRX); see "us3m_yield"
+            "us3m_yield": 3.80,
             "yield_curve_spread": 0.70,
-            "yield_curve_status": "Normalizing / Steepening (+0.70%)",
+            "yield_curve_label": "10Y–3M spread",
+            "yield_curve_status": na_status,
             "real_rate_ratio": 1.16,
-            "real_rate_status": "🟢 Easing Real Rates — Valuation Tailwind",
+            "real_rate_status": na_status,
             "crude_oil_price": 80.0,
-            "crude_oil_status": "🟡 Stable Energy Baseline ($80.0)",
+            "crude_oil_status": na_status,
             "dxy_index": 100.0,
-            "dxy_status": "Neutral Currency Liquidity",
+            "dxy_status": na_status,
             "credit_spread_ratio": 0.75,
-            "credit_status": "🟢 Tight Spreads (High Risk Appetite)",
+            "credit_status": na_status,
             "copper_gold_ratio": 1.50,
-            "copper_gold_status": "Industrial Expansion",
+            "copper_gold_status": na_status,
             "breadth_ratio": 0.28,
-            "breadth_status": "Broad Market Participation",
+            "breadth_status": na_status,
             "high_beta_ratio": 2.15,
-            "high_beta_status": "🟢 High-Beta Leadership — Risk Appetite Strong",
+            "high_beta_status": na_status,
             "semi_leadership_ratio": 0.80,
-            "semi_leadership_status": "🟢 Semiconductor Leadership — Tech Bullish",
+            "semi_leadership_status": na_status,
             "sp500_price": 0.0,
             "nasdaq_price": 0.0,
-            "macro_score": 75,
-            "risk_climate": "🟢 RISK-ON / EXPANSIONARY",
-            "crash_defcon": "🟢 DEFCON 5 — LOW CRASH RISK (ALL-WEATHER EXPANSION)",
-            "crash_probability_pct": 12,
-            "crash_shield_directive": "Maintain 15%+ Crash Shield allocation (Physical Gold SGLN.L, Berkshire BRK-B, Healthcare LLY/ABBV, & Core Cash Floor) while letting 5-year secular compounders run.",
-            "regime_summary": "Favorable global liquidity, volatility structure, and credit conditions support disciplined equity momentum.",
+            "spy_dist_days": 0,
+            "qqq_dist_days": 0,
+            "max_dist_days": 0,
+            "dist_status": na_status,
+            "sector_momentum": {},
+            "macro_data_ok": False,
+            "macro_missing": [],
+            "macro_missing_keys": [],
         }
+        # Neutral until the key inputs are confirmed: never start from a risk-on default.
+        self._apply_neutral_macro_regime(regime, list(MACRO_KEY_INPUTS))
+
+        missing: List[str] = []
+        missing_keys: List[str] = []
+        prices: Dict[str, Optional[float]] = {}
+        key_missing: List[str] = []
+        pipeline_error: Optional[str] = None
+
+        def _miss(label: str, keys: List[str]) -> None:
+            if label not in missing:
+                missing.append(label)
+            for k in keys:
+                if k not in missing_keys:
+                    missing_keys.append(k)
+
+        def _px(key: str, positive_only: bool = True) -> Optional[float]:
+            symbol = MACRO_TICKERS.get(key, key)
+            if symbol not in prices:
+                prices[symbol] = _fetch_last_price(symbol, positive_only=positive_only)
+            return prices[symbol]
 
         try:
             # 1. Volatility Regime (VIX)
-            try:
-                vix_obj = yf.Ticker(MACRO_TICKERS["VIX"])
-                vix = float(vix_obj.fast_info.get("lastPrice", 15.0))
+            vix = _px("VIX")
+            vix_ok = vix is not None
+            if vix_ok:
                 regime["vix"] = round(vix, 2)
-            except Exception as e:
-                logger.debug("VIX fetch error: %s", e)
-                vix = 15.0
+            else:
+                _miss("VIX", ["vix", "vix_term_structure"])
 
             # 1b. CBOE Volatility Term Structure (VIX vs VIX3M Contango/Backwardation)
-            try:
-                vix3m_obj = yf.Ticker(MACRO_TICKERS["VIX3M"])
-                vix3m = float(vix3m_obj.fast_info.get("lastPrice", 17.5))
+            vix3m = _px("VIX3M")
+            if vix3m is not None:
                 regime["vix3m"] = round(vix3m, 2)
-                vix_ts = round(vix / vix3m, 2) if vix3m > 0 else 0.86
+            else:
+                _miss("VIX3M (term structure)", ["vix3m", "vix_term_structure"])
+            term_ok = vix_ok and vix3m is not None and vix3m > 0
+            if term_ok:
+                vix_ts = round(vix / vix3m, 2)
                 regime["vix_term_structure"] = vix_ts
                 if vix_ts < 0.88:
                     regime["vix_term_structure_status"] = f"🟢 Deep Contango ({vix_ts:.2f}x) — Institutional Calm"
@@ -401,40 +565,40 @@ class DeepResearchAgent:
                     regime["vix_term_structure_status"] = f"🟢 Normal Contango ({vix_ts:.2f}x) — Orderly Structure"
                 else:
                     regime["vix_term_structure_status"] = f"🔴 Inverted / Backwardation ({vix_ts:.2f}x) — Hedging Spike"
-            except Exception as e:
-                logger.debug("VIX3M fetch error: %s", e)
 
-            # 2. Treasury Yield Curve (10Y vs 2Y)
-            try:
-                us10y_obj = yf.Ticker(MACRO_TICKERS["US10Y"])
-                us10y = float(us10y_obj.fast_info.get("lastPrice", 4.5))
+            # 2. Treasury Yield Curve (10Y vs 3-month T-bill; ^IRX is the 13-week bill)
+            us10y = _px("US10Y", positive_only=False)
+            if us10y is not None:
                 regime["us10y_yield"] = round(us10y, 2)
-            except Exception:
-                us10y = 4.50
-
-            try:
-                us02y_obj = yf.Ticker(MACRO_TICKERS["US02Y"])
-                us02y = float(us02y_obj.fast_info.get("lastPrice", 3.8))
-                regime["us02y_yield"] = round(us02y, 2)
-            except Exception:
-                us02y = 3.80
-
-            spread = round(us10y - us02y, 2)
-            regime["yield_curve_spread"] = spread
-            if spread > 0.40:
-                regime["yield_curve_status"] = f"🟢 Steepening / Expansionary (+{spread:.2f}%)"
-            elif 0.0 <= spread <= 0.40:
-                regime["yield_curve_status"] = f"🟡 Flat / Normalizing (+{spread:.2f}%)"
             else:
-                regime["yield_curve_status"] = f"🔴 Inverted ({spread:.2f}%) — Late Cycle Warning"
+                _miss("US 10Y yield", ["us10y_yield", "yield_curve_spread"])
+
+            us3m = _px("US3M", positive_only=False)
+            if us3m is not None:
+                regime["us3m_yield"] = round(us3m, 2)
+                regime["us02y_yield"] = regime["us3m_yield"]
+            else:
+                _miss("US 3M T-bill yield", ["us3m_yield", "us02y_yield", "yield_curve_spread"])
+
+            curve_ok = us10y is not None and us3m is not None
+            spread = 0.0
+            if curve_ok:
+                spread = round(us10y - us3m, 2)
+                regime["yield_curve_spread"] = spread
+                if spread > 0.40:
+                    regime["yield_curve_status"] = f"🟢 10Y–3M Steepening / Expansionary (+{spread:.2f}%)"
+                elif 0.0 <= spread <= 0.40:
+                    regime["yield_curve_status"] = f"🟡 10Y–3M Flat / Normalizing (+{spread:.2f}%)"
+                else:
+                    regime["yield_curve_status"] = f"🔴 10Y–3M Inverted ({spread:.2f}%) — Late Cycle Warning"
 
             # 3. US Dollar Index (DXY)
-            try:
-                dxy_obj = yf.Ticker(MACRO_TICKERS["DXY"])
-                dxy = float(dxy_obj.fast_info.get("lastPrice", 0.0))
-                if dxy == 0.0:
-                    dxy_uup = yf.Ticker(MACRO_TICKERS["DXY_ETF"])
-                    dxy = float(dxy_uup.fast_info.get("lastPrice", 28.0)) * 3.55
+            dxy = _px("DXY")
+            if dxy is None:
+                dxy_uup = _px("DXY_ETF")
+                dxy = (dxy_uup * 3.55) if dxy_uup is not None else None
+            dxy_ok = dxy is not None
+            if dxy_ok:
                 regime["dxy_index"] = round(dxy, 2)
                 if dxy < 101.0:
                     regime["dxy_status"] = f"🟢 Soft Dollar ({dxy:.1f}) — Liquidity Tailwind"
@@ -442,16 +606,15 @@ class DeepResearchAgent:
                     regime["dxy_status"] = f"🟡 Moderate Dollar ({dxy:.1f}) — Stable Liquidity"
                 else:
                     regime["dxy_status"] = f"🟠 Surging Dollar ({dxy:.1f}) — Liquidity Drag"
-            except Exception as e:
-                logger.debug("DXY fetch error: %s", e)
+            else:
+                _miss("DXY", ["dxy_index"])
 
             # 4. Credit Risk Appetite (HYG / LQD Ratio)
-            try:
-                hyg_obj = yf.Ticker(MACRO_TICKERS["HYG"])
-                lqd_obj = yf.Ticker(MACRO_TICKERS["LQD"])
-                hyg_p = float(hyg_obj.fast_info.get("lastPrice", 79.0))
-                lqd_p = float(lqd_obj.fast_info.get("lastPrice", 105.0))
-                credit_ratio = round(hyg_p / lqd_p, 3) if lqd_p > 0 else 0.75
+            hyg_p = _px("HYG")
+            lqd_p = _px("LQD")
+            credit_ok = hyg_p is not None and lqd_p is not None
+            if credit_ok:
+                credit_ratio = round(hyg_p / lqd_p, 3)
                 regime["credit_spread_ratio"] = credit_ratio
                 if credit_ratio >= 0.740:
                     regime["credit_status"] = f"🟢 Tight Spreads ({credit_ratio:.3f}) — High Risk Appetite"
@@ -459,16 +622,15 @@ class DeepResearchAgent:
                     regime["credit_status"] = f"🟡 Stable Credit Conditions ({credit_ratio:.3f})"
                 else:
                     regime["credit_status"] = f"🔴 Credit Stress ({credit_ratio:.3f}) — Spread Widening"
-            except Exception as e:
-                logger.debug("Credit ratio error: %s", e)
+            else:
+                _miss("Credit spreads (HYG/LQD)", ["credit_spread_ratio"])
 
             # 5. Global Growth vs Fear (Copper / Gold Ratio)
-            try:
-                cop_obj = yf.Ticker(MACRO_TICKERS["COPPER"])
-                gld_obj = yf.Ticker(MACRO_TICKERS["GOLD"])
-                cop_p = float(cop_obj.fast_info.get("lastPrice", 4.5))
-                gld_p = float(gld_obj.fast_info.get("lastPrice", 2600.0))
-                cg_ratio = round((cop_p / gld_p) * 1000.0, 2) if gld_p > 0 else 1.50
+            cop_p = _px("COPPER")
+            gld_p = _px("GOLD")
+            cg_ok = cop_p is not None and gld_p is not None
+            if cg_ok:
+                cg_ratio = round((cop_p / gld_p) * 1000.0, 2)
                 regime["copper_gold_ratio"] = cg_ratio
                 if cg_ratio >= 1.45:
                     regime["copper_gold_status"] = f"🟢 Growth Resilient ({cg_ratio:.2f})"
@@ -476,43 +638,41 @@ class DeepResearchAgent:
                     regime["copper_gold_status"] = f"🟡 Balanced Industrial / Monetary ({cg_ratio:.2f})"
                 else:
                     regime["copper_gold_status"] = f"🟠 Defensive / Flight to Gold ({cg_ratio:.2f})"
-            except Exception as e:
-                logger.debug("Copper/Gold ratio error: %s", e)
+            else:
+                _miss("Copper/Gold", ["copper_gold_ratio"])
 
             # 6. Market Breadth (RSP vs SPY)
-            try:
-                rsp_obj = yf.Ticker(MACRO_TICKERS["RSP"])
-                spy_obj = yf.Ticker(MACRO_TICKERS["SPY"])
-                rsp_p = float(rsp_obj.fast_info.get("lastPrice", 180.0))
-                spy_p = float(spy_obj.fast_info.get("lastPrice", 550.0))
-                breadth = round(rsp_p / spy_p, 3) if spy_p > 0 else 0.28
+            rsp_p = _px("RSP")
+            spy_p = _px("SPY")
+            breadth_ok = rsp_p is not None and spy_p is not None
+            if breadth_ok:
+                breadth = round(rsp_p / spy_p, 3)
                 regime["breadth_ratio"] = breadth
                 if breadth > 0.280:
                     regime["breadth_status"] = f"🟢 Broad Market Participation ({breadth:.3f})"
                 else:
                     regime["breadth_status"] = f"🟡 Mega-Cap Concentration Dominant ({breadth:.3f})"
-            except Exception as e:
-                logger.debug("Breadth ratio error: %s", e)
+            else:
+                _miss("Breadth (RSP/SPY)", ["breadth_ratio"])
 
             # 7. Real Rates & Inflation Barometer (TIP vs IEF)
-            try:
-                tip_obj = yf.Ticker(MACRO_TICKERS["TIP"])
-                ief_obj = yf.Ticker(MACRO_TICKERS["IEF"])
-                tip_p = float(tip_obj.fast_info.get("lastPrice", 107.0))
-                ief_p = float(ief_obj.fast_info.get("lastPrice", 92.0))
-                tip_ief = round(tip_p / ief_p, 3) if ief_p > 0 else 1.16
+            tip_p = _px("TIP")
+            ief_p = _px("IEF")
+            real_ok = tip_p is not None and ief_p is not None
+            if real_ok:
+                tip_ief = round(tip_p / ief_p, 3)
                 regime["real_rate_ratio"] = tip_ief
                 if tip_ief >= 1.15:
                     regime["real_rate_status"] = f"🟢 Easing Real Rates ({tip_ief:.3f}) — Multiple Expansion Tailwind"
                 else:
                     regime["real_rate_status"] = f"🟡 Restrictive Real Rates ({tip_ief:.3f}) — Valuation Caution"
-            except Exception as e:
-                logger.debug("TIP/IEF ratio error: %s", e)
+            else:
+                _miss("Real rates (TIP/IEF)", ["real_rate_ratio"])
 
             # 8. Crude Oil Energy Drag (CL=F)
-            try:
-                oil_obj = yf.Ticker(MACRO_TICKERS["CRUDE"])
-                oil_p = float(oil_obj.fast_info.get("lastPrice", 80.0))
+            oil_p = _px("CRUDE")
+            oil_ok = oil_p is not None
+            if oil_ok:
                 regime["crude_oil_price"] = round(oil_p, 2)
                 if oil_p > 92.0:
                     regime["crude_oil_status"] = f"🔴 High Energy Tax (${oil_p:.1f}) — Inflation Drag"
@@ -520,41 +680,37 @@ class DeepResearchAgent:
                     regime["crude_oil_status"] = f"🟢 Low Energy Cost (${oil_p:.1f}) — Disinflationary"
                 else:
                     regime["crude_oil_status"] = f"🟡 Stable Energy (${oil_p:.1f})"
-            except Exception as e:
-                logger.debug("Crude oil fetch error: %s", e)
+            else:
+                _miss("Crude oil", ["crude_oil_price"])
 
             # 9. Benchmarks
-            try:
-                sp_obj = yf.Ticker(MACRO_TICKERS["SP500"])
-                regime["sp500_price"] = round(float(sp_obj.fast_info.get("lastPrice", 0.0)), 2)
-                ndx_obj = yf.Ticker(MACRO_TICKERS["NASDAQ"])
-                regime["nasdaq_price"] = round(float(ndx_obj.fast_info.get("lastPrice", 0.0)), 2)
-            except Exception:
-                pass
+            sp_lvl = _px("SP500")
+            if sp_lvl is not None:
+                regime["sp500_price"] = round(sp_lvl, 2)
+            else:
+                _miss("S&P 500 level", ["sp500_price"])
+            ndx_lvl = _px("NASDAQ")
+            if ndx_lvl is not None:
+                regime["nasdaq_price"] = round(ndx_lvl, 2)
+            else:
+                _miss("Nasdaq-100 level", ["nasdaq_price"])
 
             # 9b. Institutional Distribution Day Tracking (William O'Neil / IBD Rule)
-            spy_dist = 0
-            qqq_dist = 0
-            try:
-                for symbol, d_key in [("SPY", "spy_dist"), ("QQQ", "qqq_dist")]:
-                    df_d = yf.Ticker(symbol).history(period="60d", interval="1d")
-                    if len(df_d) >= 26:
-                        count = 0
-                        for i in range(-25, 0):
-                            ret = (df_d["Close"].iloc[i] - df_d["Close"].iloc[i - 1]) / df_d["Close"].iloc[i - 1]
-                            vol_higher = df_d["Volume"].iloc[i] > df_d["Volume"].iloc[i - 1]
-                            if ret <= -0.002 and vol_higher:
-                                count += 1
-                        if d_key == "spy_dist": spy_dist = count
-                        else: qqq_dist = count
-            except Exception as e:
-                logger.debug("Distribution days error: %s", e)
+            # The SPY daily history doubles as the "SPY trend" key input.
+            spy_dist, spy_hist_ok = _count_distribution_days("SPY")
+            qqq_dist, qqq_hist_ok = _count_distribution_days("QQQ")
+            if not spy_hist_ok:
+                _miss("SPY trend", ["spy_dist_days"])
+            if not qqq_hist_ok:
+                _miss("QQQ distribution history", ["qqq_dist_days"])
 
             max_dist = max(spy_dist, qqq_dist)
             regime["spy_dist_days"] = spy_dist
             regime["qqq_dist_days"] = qqq_dist
             regime["max_dist_days"] = max_dist
-            if max_dist >= 6:
+            if not (spy_hist_ok or qqq_hist_ok):
+                regime["dist_status"] = na_status
+            elif max_dist >= 6:
                 regime["dist_status"] = f"🔴 Heavy Institutional Selling ({max_dist} Days / 25 Sessions)"
             elif max_dist >= 4:
                 regime["dist_status"] = f"🟡 Elevated Distribution ({max_dist} Days / 25 Sessions)"
@@ -571,98 +727,111 @@ class DeepResearchAgent:
                 "Energy": "XLE",
             }
             sector_momentum = {}
+            failed_sectors: List[str] = []
             for s_cluster, s_sym in sector_etfs.items():
                 try:
                     s_hist = yf.Ticker(s_sym).history(period="3mo", interval="1d")
-                    if len(s_hist) >= 15 and float(s_hist["Close"].iloc[0]) > 0:
+                    if s_hist is not None and len(s_hist) >= 15 and float(s_hist["Close"].iloc[0]) > 0:
                         s_ret = round(float((s_hist["Close"].iloc[-1] / s_hist["Close"].iloc[0] - 1.0) * 100), 1)
                         sector_momentum[s_cluster] = s_ret
                         sector_momentum[s_sym] = s_ret
+                    else:
+                        failed_sectors.append(s_sym)
+                        logger.warning("Sector momentum history unavailable or too short for %s.", s_sym)
                 except Exception as e:
-                    logger.debug("Sector momentum fetch error for %s: %s", s_sym, e)
+                    failed_sectors.append(s_sym)
+                    logger.warning("Sector momentum fetch error for %s: %s", s_sym, e)
             regime["sector_momentum"] = sector_momentum
+            if failed_sectors:
+                _miss("Sector momentum (" + ", ".join(failed_sectors) + ")", [])
 
             # 9d. Institutional Risk Appetite Barometer: High-Beta vs Low-Volatility (SPHB / SPLV)
-            try:
-                sphb_obj = yf.Ticker(MACRO_TICKERS["SPHB"])
-                splv_obj = yf.Ticker(MACRO_TICKERS["SPLV"])
-                sphb_p = float(sphb_obj.fast_info.get("lastPrice", 0.0) or 0.0)
-                splv_p = float(splv_obj.fast_info.get("lastPrice", 0.0) or 0.0)
-                if sphb_p > 0 and splv_p > 0:
-                    hb_ratio = round(sphb_p / splv_p, 3)
-                    regime["high_beta_ratio"] = hb_ratio
-                    if hb_ratio >= 2.10:
-                        regime["high_beta_status"] = f"🟢 High-Beta Leadership ({hb_ratio:.2f}x) — Aggressive Risk Appetite"
-                    elif 1.85 <= hb_ratio < 2.10:
-                        regime["high_beta_status"] = f"🟡 Neutral Beta Equilibrium ({hb_ratio:.2f}x)"
-                    else:
-                        regime["high_beta_status"] = f"🔴 Defensive Flight to Low-Vol ({hb_ratio:.2f}x) — Risk-Off"
-            except Exception as e:
-                logger.debug("High-Beta/Low-Vol ratio error: %s", e)
+            sphb_p = _px("SPHB")
+            splv_p = _px("SPLV")
+            hb_ok = sphb_p is not None and splv_p is not None
+            if hb_ok:
+                hb_ratio = round(sphb_p / splv_p, 3)
+                regime["high_beta_ratio"] = hb_ratio
+                if hb_ratio >= 2.10:
+                    regime["high_beta_status"] = f"🟢 High-Beta Leadership ({hb_ratio:.2f}x) — Aggressive Risk Appetite"
+                elif 1.85 <= hb_ratio < 2.10:
+                    regime["high_beta_status"] = f"🟡 Neutral Beta Equilibrium ({hb_ratio:.2f}x)"
+                else:
+                    regime["high_beta_status"] = f"🔴 Defensive Flight to Low-Vol ({hb_ratio:.2f}x) — Risk-Off"
+            else:
+                _miss("High-beta / low-vol (SPHB/SPLV)", ["high_beta_ratio"])
 
             # 9e. Tech Canary & Business Cycle Leadership Barometer: Semiconductor Outperformance (SMH / SPY)
-            try:
-                smh_obj = yf.Ticker(MACRO_TICKERS["SMH"])
-                spy_obj = yf.Ticker(MACRO_TICKERS["SPY"])
-                smh_p = float(smh_obj.fast_info.get("lastPrice", 0.0) or 0.0)
-                spy_p = float(spy_obj.fast_info.get("lastPrice", 0.0) or 0.0)
-                if smh_p > 0 and spy_p > 0:
-                    semi_ratio = round(smh_p / spy_p, 3)
-                    regime["semi_leadership_ratio"] = semi_ratio
-                    if semi_ratio >= 0.78:
-                        regime["semi_leadership_status"] = f"🟢 Semi Outperformance ({semi_ratio:.3f}x) — Secular Growth Leading"
-                    elif 0.70 <= semi_ratio < 0.78:
-                        regime["semi_leadership_status"] = f"🟡 Semi Market In-Line ({semi_ratio:.3f}x)"
-                    else:
-                        regime["semi_leadership_status"] = f"🔴 Semiconductor Laggard ({semi_ratio:.3f}x) — Cyclical Slowdown"
-            except Exception as e:
-                logger.debug("Semiconductor/SPY ratio error: %s", e)
+            smh_p = _px("SMH")
+            semi_ok = smh_p is not None and spy_p is not None
+            if semi_ok:
+                semi_ratio = round(smh_p / spy_p, 3)
+                regime["semi_leadership_ratio"] = semi_ratio
+                if semi_ratio >= 0.78:
+                    regime["semi_leadership_status"] = f"🟢 Semi Outperformance ({semi_ratio:.3f}x) — Secular Growth Leading"
+                elif 0.70 <= semi_ratio < 0.78:
+                    regime["semi_leadership_status"] = f"🟡 Semi Market In-Line ({semi_ratio:.3f}x)"
+                else:
+                    regime["semi_leadership_status"] = f"🔴 Semiconductor Laggard ({semi_ratio:.3f}x) — Cyclical Slowdown"
+            else:
+                _miss("Semis vs SPY (SMH/SPY)", ["semi_leadership_ratio"])
 
             # 10. Multi-Factor Macro Scoring (0 to 100)
+            # Missing inputs contribute nothing (neutral) instead of their old optimistic defaults.
             score = 50
             # VIX component (max +/- 18)
-            if vix < 16.0: score += 18
-            elif vix < 20.0: score += 10
-            elif vix > 28.0: score -= 25
-            elif vix > 22.0: score -= 12
+            if vix_ok:
+                if vix < 16.0: score += 18
+                elif vix < 20.0: score += 10
+                elif vix > 28.0: score -= 25
+                elif vix > 22.0: score -= 12
 
             # VIX term structure component (max +/- 8)
-            if regime["vix_term_structure"] < 0.88: score += 8
-            elif regime["vix_term_structure"] > 1.0: score -= 12
+            if term_ok:
+                if regime["vix_term_structure"] < 0.88: score += 8
+                elif regime["vix_term_structure"] > 1.0: score -= 12
 
             # Yield curve component (max +/- 8)
-            if spread > 0.40: score += 8
-            elif spread < 0.0: score -= 12
+            if curve_ok:
+                if spread > 0.40: score += 8
+                elif spread < 0.0: score -= 12
 
             # Credit component (max +/- 8)
-            if regime["credit_spread_ratio"] >= 0.740: score += 8
-            elif regime["credit_spread_ratio"] < 0.710: score -= 14
+            if credit_ok:
+                if regime["credit_spread_ratio"] >= 0.740: score += 8
+                elif regime["credit_spread_ratio"] < 0.710: score -= 14
 
             # Real rates liquidity component (max +/- 5)
-            if regime["real_rate_ratio"] >= 1.15: score += 5
-            elif regime["real_rate_ratio"] < 1.12: score -= 6
+            if real_ok:
+                if regime["real_rate_ratio"] >= 1.15: score += 5
+                elif regime["real_rate_ratio"] < 1.12: score -= 6
 
             # Dollar component (max +/- 5)
-            if regime["dxy_index"] < 101.5: score += 5
-            elif regime["dxy_index"] > 105.0: score -= 8
+            if dxy_ok:
+                if regime["dxy_index"] < 101.5: score += 5
+                elif regime["dxy_index"] > 105.0: score -= 8
 
             # Copper/Gold growth component (max +/- 4)
-            if regime["copper_gold_ratio"] >= 1.45: score += 4
-            elif regime["copper_gold_ratio"] < 1.20: score -= 5
+            if cg_ok:
+                if regime["copper_gold_ratio"] >= 1.45: score += 4
+                elif regime["copper_gold_ratio"] < 1.20: score -= 5
 
             # Energy drag component (max +/- 4)
-            if regime["crude_oil_price"] > 92.0: score -= 6
-            elif regime["crude_oil_price"] < 75.0: score += 4
+            if oil_ok:
+                if regime["crude_oil_price"] > 92.0: score -= 6
+                elif regime["crude_oil_price"] < 75.0: score += 4
 
             # High-Beta Risk Appetite Component (max +/- 4)
-            hb_r = regime.get("high_beta_ratio", 2.0)
-            if hb_r >= 2.10: score += 4
-            elif hb_r < 1.85: score -= 5
+            if hb_ok:
+                hb_r = regime["high_beta_ratio"]
+                if hb_r >= 2.10: score += 4
+                elif hb_r < 1.85: score -= 5
 
             # Semiconductor Leadership Component (max +/- 3)
-            semi_r = regime.get("semi_leadership_ratio", 0.75)
-            if semi_r >= 0.78: score += 3
-            elif semi_r < 0.70: score -= 4
+            if semi_ok:
+                semi_r = regime["semi_leadership_ratio"]
+                if semi_r >= 0.78: score += 3
+                elif semi_r < 0.70: score -= 4
 
             # Institutional Distribution Day Penalty (max -12)
             if max_dist >= 6:
@@ -670,90 +839,154 @@ class DeepResearchAgent:
             elif max_dist >= 4:
                 score -= 5
 
-            macro_score = max(5, min(98, score))
-            regime["macro_score"] = macro_score
-
-            # Regime Synthesis Label & Narrative
-            if macro_score >= 75:
-                regime["vix_status"] = "Low Volatility (Complacent / Bullish)"
-                regime["risk_climate"] = "🟢 RISK-ON / HIGH-BETA FAVORABLE"
-                regime["crash_defcon"] = "🟢 DEFCON 5 — LOW CRASH RISK (ALL-WEATHER EXPANSION)"
-                regime["crash_probability_pct"] = 10
-                regime["crash_shield_directive"] = (
-                    "Market internals and VIX contango confirm institutional calm. Maintain 15%+ Crash Shield allocation "
-                    "(Physical Gold SGLN.L, Berkshire BRK-B, Healthcare LLY/ABBV, & Core Cash Floor) while letting 5-year secular compounders run."
-                )
-                regime["regime_summary"] = (
-                    f"VIX ({vix:.1f}) in {regime['vix_term_structure_status']} and credit spreads ({regime['credit_spread_ratio']:.3f}) confirm institutional risk appetite. "
-                    f"Yield curve ({regime['yield_curve_spread']:+.2f}%) and real rates ({regime['real_rate_ratio']:.3f}) provide liquidity tailwinds for 5-year secular compounders."
-                )
-            elif 58 <= macro_score < 75:
-                regime["vix_status"] = "Moderate Volatility (Normal Equilibrium)"
-                regime["risk_climate"] = "🟢 SELECTIVE QUALITY MOMENTUM"
-                regime["crash_defcon"] = "🟢 DEFCON 4 — ORDERLY UPTREND (STANDARD HEDGING)"
-                regime["crash_probability_pct"] = 18
-                regime["crash_shield_directive"] = (
-                    "Orderly institutional regime. Cap 3x daily leveraged ETFs (QQQ3.L <= 8%) to eliminate variance decay and accumulate "
-                    "uncorrelated crisis hedges (SGLN.L, BRK-B, LLY, ABBV) alongside 5-year compounders."
-                )
-                regime["regime_summary"] = (
-                    f"Equities supported by orderly volatility structure ({regime['vix_term_structure']:.2f}x) and stable credit. Deploy into high-Sortino 5-year compounders and maintain 15%+ Crash Shield."
-                )
-            elif 42 <= macro_score < 58:
-                regime["vix_status"] = "Normal-to-Elevated Volatility"
-                regime["risk_climate"] = "🟡 BALANCED / HEDGED EQUILIBRIUM"
-                regime["crash_defcon"] = "🟡 DEFCON 3 — ELEVATED DISTRIBUTION (RAISE SHIELD TO 20%)"
-                regime["crash_probability_pct"] = 35
-                regime["crash_shield_directive"] = (
-                    "Cross-currents in breadth or distribution days. Rotate excess high-beta tech (>24% cluster) into Physical Gold (SGLN.L), "
-                    "Berkshire (BRK-B), and All-World Core (VWRP.L)."
-                )
-                regime["regime_summary"] = (
-                    f"Macro indicators show cross-currents. Enforce strict position limits, balance beta with crash-shield anchors, and avoid chasing extended breakouts."
-                )
-            elif 28 <= macro_score < 42:
-                regime["vix_status"] = "Elevated Volatility (Correction Warning)"
-                regime["risk_climate"] = "🟠 ELEVATED RISK / CAPITAL DEFENSE"
-                regime["crash_defcon"] = "🟠 DEFCON 2 — CORRECTION WARNING (DEFENSIVE POSTURE)"
-                regime["crash_probability_pct"] = 60
-                regime["crash_shield_directive"] = (
-                    "Credit spreads or VIX term structure signaling institutional hedging. Prioritize capital preservation, reduce 3x leveraged ETFs, "
-                    "and overweight Crisis Alpha (SGLN.L, BRK-B)."
-                )
-                regime["regime_summary"] = (
-                    f"Warning signs in credit spreads or rate volatility ({regime['vix_term_structure_status']}). Ring-fence cash buffers, trim oversized 3x leverage, and bolster Crash Shield."
-                )
+            key_missing = [k for k in MACRO_KEY_INPUTS if k in missing]
+            if key_missing:
+                # Fail closed: without VIX or the SPY trend the regime is neutral, never risk-on.
+                self._apply_neutral_macro_regime(regime, key_missing, missing)
             else:
-                regime["vix_status"] = "High Volatility (Panic / Liquidity Squeeze)"
-                regime["risk_climate"] = "🔴 RISK-OFF / HIGH CASH BUFFER"
-                regime["crash_defcon"] = "🔴 DEFCON 1 — LIQUIDITY SQUEEZE / CRASH PROTECTION ACTIVE"
-                regime["crash_probability_pct"] = 85
-                regime["crash_shield_directive"] = (
-                    "Active market stress regime. Ring-fence cash reserves, hold Physical Gold (SGLN.L) & Cash Fortress (BRK-B) ballast, "
-                    "and avoid panic-selling 5-year secular monopolies."
-                )
-                regime["regime_summary"] = (
-                    f"Elevated stress regime (VIX {vix:.1f}, term structure {regime['vix_term_structure']:.2f}x). Protect cash reserves and pause discretionary aggressive long positions until volatility normalizes."
-                )
+                macro_score = max(5, min(98, score))
+                regime["macro_score"] = macro_score
+
+                # Narrative values for inputs that were not fetched read "n/a" instead of placeholders
+                term_txt = f"{regime['vix_term_structure']:.2f}x" if term_ok else "n/a"
+                credit_txt = f"{regime['credit_spread_ratio']:.3f}" if credit_ok else "n/a"
+                curve_txt = f"{regime['yield_curve_spread']:+.2f}%" if curve_ok else "n/a"
+                real_txt = f"{regime['real_rate_ratio']:.3f}" if real_ok else "n/a"
+
+                # Regime Synthesis Label & Narrative
+                if macro_score >= 75:
+                    regime["vix_status"] = "Low Volatility (Complacent / Bullish)"
+                    regime["risk_climate"] = "🟢 RISK-ON / HIGH-BETA FAVORABLE"
+                    regime["crash_defcon"] = "🟢 DEFCON 5 — LOW CRASH RISK (ALL-WEATHER EXPANSION)"
+                    regime["crash_probability_pct"] = 10
+                    regime["crash_shield_directive"] = (
+                        "Market internals and VIX contango confirm institutional calm. Maintain 15%+ Crash Shield allocation "
+                        "(Physical Gold SGLN.L, Berkshire BRK-B, Healthcare LLY/ABBV, & Core Cash Floor) while letting 5-year secular compounders run."
+                    )
+                    regime["regime_summary"] = (
+                        f"VIX ({vix:.1f}) in {regime['vix_term_structure_status']} and credit spreads ({credit_txt}) confirm institutional risk appetite. "
+                        f"10Y–3M curve ({curve_txt}) and real rates ({real_txt}) provide liquidity tailwinds for 5-year secular compounders."
+                    )
+                elif 58 <= macro_score < 75:
+                    regime["vix_status"] = "Moderate Volatility (Normal Equilibrium)"
+                    regime["risk_climate"] = "🟢 SELECTIVE QUALITY MOMENTUM"
+                    regime["crash_defcon"] = "🟢 DEFCON 4 — ORDERLY UPTREND (STANDARD HEDGING)"
+                    regime["crash_probability_pct"] = 18
+                    regime["crash_shield_directive"] = (
+                        "Orderly institutional regime. Keep 3x daily leveraged ETFs within your configured leverage cap and maintain "
+                        "genuinely defensive assets (cash, money-market, gold) alongside 5-year compounders."
+                    )
+                    regime["regime_summary"] = (
+                        f"Equities supported by orderly volatility structure ({term_txt}) and stable credit. Deploy into high-Sortino 5-year compounders and maintain 15%+ Crash Shield."
+                    )
+                elif 42 <= macro_score < 58:
+                    regime["vix_status"] = "Normal-to-Elevated Volatility"
+                    regime["risk_climate"] = "🟡 BALANCED / HEDGED EQUILIBRIUM"
+                    regime["crash_defcon"] = "🟡 DEFCON 3 — ELEVATED DISTRIBUTION (RAISE SHIELD TO 20%)"
+                    regime["crash_probability_pct"] = 35
+                    regime["crash_shield_directive"] = (
+                        "Cross-currents in breadth or distribution days. Rotate excess high-beta tech (>24% cluster) into Physical Gold (SGLN.L), "
+                        "Berkshire (BRK-B), and All-World Core (VWRP.L)."
+                    )
+                    regime["regime_summary"] = (
+                        f"Macro indicators show cross-currents. Enforce strict position limits, balance beta with crash-shield anchors, and avoid chasing extended breakouts."
+                    )
+                elif 28 <= macro_score < 42:
+                    regime["vix_status"] = "Elevated Volatility (Correction Warning)"
+                    regime["risk_climate"] = "🟠 ELEVATED RISK / CAPITAL DEFENSE"
+                    regime["crash_defcon"] = "🟠 DEFCON 2 — CORRECTION WARNING (DEFENSIVE POSTURE)"
+                    regime["crash_probability_pct"] = 60
+                    regime["crash_shield_directive"] = (
+                        "Credit spreads or VIX term structure signaling institutional hedging. Prioritize capital preservation, reduce 3x leveraged ETFs, "
+                        "and overweight Crisis Alpha (SGLN.L, BRK-B)."
+                    )
+                    regime["regime_summary"] = (
+                        f"Warning signs in credit spreads or rate volatility ({regime['vix_term_structure_status']}). Ring-fence cash buffers, trim oversized 3x leverage, and bolster Crash Shield."
+                    )
+                else:
+                    regime["vix_status"] = "High Volatility (Panic / Liquidity Squeeze)"
+                    regime["risk_climate"] = "🔴 RISK-OFF / HIGH CASH BUFFER"
+                    regime["crash_defcon"] = "🔴 DEFCON 1 — LIQUIDITY SQUEEZE / CRASH PROTECTION ACTIVE"
+                    regime["crash_probability_pct"] = 85
+                    regime["crash_shield_directive"] = (
+                        "Active market stress regime. Ring-fence cash reserves, hold Physical Gold (SGLN.L) & Cash Fortress (BRK-B) ballast, "
+                        "and avoid panic-selling 5-year secular monopolies."
+                    )
+                    regime["regime_summary"] = (
+                        f"Elevated stress regime (VIX {vix:.1f}, term structure {term_txt}). Protect cash reserves and pause discretionary aggressive long positions until volatility normalizes."
+                    )
+
+                if missing:
+                    regime["regime_summary"] += (
+                        " Partial data: " + ", ".join(missing) + " unavailable (scored as neutral, not as a tailwind)."
+                    )
 
         except Exception as e:
+            pipeline_error = str(e)
             logger.warning("Could not fetch full macro regime: %s", e)
+
+        if pipeline_error is not None:
+            _miss(f"Macro pipeline error ({pipeline_error})", [])
+            self._apply_neutral_macro_regime(regime, ["macro pipeline error"], missing)
+            macro_data_ok = False
+        else:
+            macro_data_ok = not key_missing
+
+        regime["macro_data_ok"] = macro_data_ok
+        regime["macro_missing"] = list(missing)
+        regime["macro_missing_keys"] = list(missing_keys)
+        if not macro_data_ok:
+            logger.warning(
+                "Macro regime degraded to neutral (missing: %s).", ", ".join(missing) if missing else "key inputs"
+            )
 
         self._macro_cache = regime
         return regime
+
+    @staticmethod
+    def _apply_neutral_macro_regime(
+        regime: Dict[str, Any], reasons: List[str], missing: Optional[List[str]] = None
+    ) -> None:
+        """Forces the fail-closed neutral regime used whenever key macro inputs are unavailable (never risk-on)."""
+        reason_txt = ", ".join(reasons) if reasons else "key inputs"
+        missing_txt = ", ".join(missing) if missing else reason_txt
+        regime["macro_score"] = 50
+        regime["risk_climate"] = "⚪ MACRO DATA UNAVAILABLE (NEUTRAL)"
+        regime["crash_defcon"] = "⚪ DEFCON 3 — MACRO DATA UNAVAILABLE (NEUTRAL STANCE)"
+        regime["crash_probability_pct"] = 35
+        regime["crash_shield_directive"] = (
+            f"Key macro inputs unavailable ({reason_txt}). The regime is treated as neutral rather than risk-on; "
+            "do not read today's macro panel as a signal in either direction."
+        )
+        regime["regime_summary"] = (
+            f"Macro data unavailable (missing: {missing_txt}). The regime is treated as neutral "
+            "(score 50, DEFCON-3-style stance) instead of defaulting to risk-on."
+        )
+        if "VIX" in reasons or "macro pipeline error" in reasons:
+            regime["vix_status"] = "N/A (VIX unavailable)" if "VIX" in reasons else "N/A (macro pipeline error)"
+        else:
+            vix_val = _clean_num(regime.get("vix"))
+            vix_txt = f"VIX {vix_val:.1f}" if vix_val is not None else "VIX n/a"
+            regime["vix_status"] = f"{vix_txt} (regime neutral: {reason_txt} unavailable)"
 
     def _extract_earnings_calendar(self, ticker_obj: yf.Ticker, info: Dict[str, Any]) -> Tuple[Optional[str], Optional[int], str]:
         """Extracts next scheduled earnings date and returns (date_str, days_to_earnings, status_label)."""
         today = datetime.date.today()
         target_date = None
+        calendar_failed = False
 
-        cal = getattr(ticker_obj, "calendar", None)
-        if isinstance(cal, dict) and "Earnings Date" in cal:
-            edates = cal["Earnings Date"]
-            if isinstance(edates, list) and edates:
-                target_date = edates[0]
-            elif isinstance(edates, (datetime.date, datetime.datetime)):
-                target_date = edates
+        try:
+            cal = getattr(ticker_obj, "calendar", None)
+            if isinstance(cal, dict) and "Earnings Date" in cal:
+                edates = cal["Earnings Date"]
+                if isinstance(edates, list) and edates:
+                    target_date = edates[0]
+                elif isinstance(edates, (datetime.date, datetime.datetime)):
+                    target_date = edates
+        except Exception as e:
+            calendar_failed = True
+            target_date = None
+            logger.warning("Earnings calendar unavailable for %s: %s", info.get("symbol") or "ticker", e)
 
         if target_date is None and info.get("earningsTimestamp"):
             try:
@@ -762,10 +995,14 @@ class DeepResearchAgent:
                 pass
 
         if target_date:
-            if isinstance(target_date, datetime.datetime):
-                target_date = target_date.date()
-            days_diff = (target_date - today).days
-            date_formatted = target_date.strftime("%b %d, %Y")
+            try:
+                if isinstance(target_date, datetime.datetime):
+                    target_date = target_date.date()
+                days_diff = (target_date - today).days
+                date_formatted = target_date.strftime("%b %d, %Y")
+            except Exception as e:
+                logger.warning("Unparseable earnings date %r: %s", target_date, e)
+                return None, None, "⚪ Unknown (earnings date unparseable)"
 
             if 0 <= days_diff <= 7:
                 return date_formatted, days_diff, f"⚠️ High Risk (Earnings in {days_diff}d)"
@@ -774,10 +1011,16 @@ class DeepResearchAgent:
             else:
                 return date_formatted, days_diff, f"Recent ({abs(days_diff)}d ago)"
 
+        if calendar_failed:
+            return None, None, "⚪ Unknown (earnings calendar unavailable)"
         return None, None, "✅ Clear (No imminent date)"
 
     def _compute_piotroski_score(self, info: Dict[str, Any]) -> Tuple[int, str, List[str]]:
-        """Computes a 9-factor Piotroski and Earnings Quality score.
+        """Computes the static 9-point Quality Checklist (0-9) from point-in-time fundamentals.
+
+        Shown to users as "Quality Checklist (0-9)": it is NOT the academic Piotroski F-score, which is built on
+        year-on-year changes. Variable/key names keep "piotroski" for backward compatibility. Missing data never
+        earns a point.
         Returns (score_out_of_9, grade_label, bullet_factors).
         """
         score = 0
@@ -806,11 +1049,12 @@ class DeepResearchAgent:
         elif net_income > 0 and ocf < (net_income * 0.7):
             checks.append("⚠️ Accrual Warning: Cash flow trails reported earnings")
 
-        # 4. Positive Free Cash Flow
+        # 4. Positive Free Cash Flow (reported in the financial-statement currency)
         fcf = info.get("freeCashflow") or 0
         if fcf > 0:
             score += 1
-            checks.append(f"Positive FCF (${fcf/1e9:.1f}B)")
+            fin_ccy = str(info.get("financialCurrency") or "").upper().strip() or "statement ccy"
+            checks.append(f"Positive FCF ({fcf/1e9:.1f}B {fin_ccy})")
 
         # 5. Elite Pricing Power (Operating Margin > 20% or Gross Margin > 45%)
         op_m = info.get("operatingMargins") or 0
@@ -827,19 +1071,27 @@ class DeepResearchAgent:
             score += 1
             checks.append(f"High Return on Equity ({roe*100:.1f}%)")
 
-        # 7. Short-Term Liquidity (Current Ratio >= 1.2)
-        cur_ratio = info.get("currentRatio") or 1.0
-        if cur_ratio >= 1.2:
+        # 7. Short-Term Liquidity (Current Ratio >= 1.2). A missing current ratio earns no point.
+        cur_ratio = _clean_num(info.get("currentRatio"))
+        if cur_ratio is None:
+            checks.append("⚪ Current ratio not reported (no point)")
+        elif cur_ratio >= 1.2:
             score += 1
             checks.append(f"Strong Liquidity (Current Ratio: {cur_ratio:.2f})")
         elif cur_ratio >= 1.0:
             score += 1
 
-        # 8. Prudent Capital Structure (Debt-to-Equity < 120 or fortress cash)
-        debt_eq = info.get("debtToEquity")
-        if debt_eq is None or debt_eq < 120 or (info.get("totalCash", 0) > info.get("totalDebt", 0)):
+        # 8. Prudent Capital Structure (Debt-to-Equity < 120 or fortress cash).
+        # A missing D/E only earns the point when reported cash exceeds reported debt.
+        debt_eq = _clean_num(info.get("debtToEquity"))
+        total_cash = _clean_num(info.get("totalCash"))
+        total_debt = _clean_num(info.get("totalDebt"))
+        cash_exceeds_debt = total_cash is not None and total_debt is not None and total_cash > total_debt
+        if (debt_eq is not None and debt_eq < 120) or cash_exceeds_debt:
             score += 1
             checks.append("Conservative Leverage / Fortress Balance Sheet")
+        elif debt_eq is None:
+            checks.append("⚪ Leverage not verifiable (D/E not reported, cash does not exceed debt)")
         else:
             checks.append(f"Elevated Leverage (D/E: {debt_eq:.1f}%)")
 
@@ -968,6 +1220,9 @@ class DeepResearchAgent:
                 return None, "N/A (Zero/invalid total assets)", "#64748b"
 
             fx_div = _get_fin_fx_divisor(info)
+            if fx_div is None or fx_div <= 0:
+                # X4 needs market cap in the statement currency; without a live FX rate X4 (and so Z) is unknown.
+                return None, "N/A (Live FX rate unavailable for X4)", "#64748b"
 
             # 1. Working Capital = Current Assets - Current Liabilities or direct row
             wc = None
@@ -1255,7 +1510,9 @@ class DeepResearchAgent:
         peg = _clean_num(research.get("peg_ratio"))
         fcf_y = _clean_num(research.get("fcf_yield_pct"))
         r40 = _clean_num(research.get("rule_of_40"))
-        eps_mom = _clean_num(research.get("eps_revision_momentum_pct"), 50.0) or 50.0
+        eps_mom = _clean_num(research.get("eps_revision_momentum_pct"))
+        if eps_mom is None:  # explicit None check: a genuine 0% (all downgrades) must stay 0
+            eps_mom = 50.0
 
         # 1. Estimate Sustainable 5-Year Organic Earnings Compounding Rate (g_organic)
         # Blend ROIC-backed reinvestment rate, revenue growth, and winsorized forward EPS growth
@@ -1317,9 +1574,16 @@ class DeepResearchAgent:
                 val_label = f"🔴 Rich Multiple Compression Risk ({f_pe:.1f}x vs {fair_pe:.0f}x Fair P/E)"
                 val_score_impact = -7
 
-        expected_5y_cagr = round(max(5.5, min(28.5, g_organic + cash_yield + mult_change_ann_pct)), 1)
+        raw_5y_cagr = g_organic + cash_yield + mult_change_ann_pct
+        cagr_capped: Optional[str] = None
+        if raw_5y_cagr > 28.5:
+            cagr_capped = "cap"
+        elif raw_5y_cagr < 5.5:
+            cagr_capped = "floor"
+        expected_5y_cagr = round(max(5.5, min(28.5, raw_5y_cagr)), 1)
         return {
             "expected_5y_cagr_pct": expected_5y_cagr,
+            "expected_5y_cagr_capped": cagr_capped,
             "fair_pe_multiple": fair_pe,
             "multiple_reversion_ann_pct": round(mult_change_ann_pct, 1),
             "valuation_regime_label": val_label,
@@ -1456,23 +1720,30 @@ class DeepResearchAgent:
             logger.debug("Institutional flow parse error: %s", e)
         return res
 
-    def conduct_deep_dive(self, yf_ticker: str) -> Dict[str, Any]:
-        """Conducts a comprehensive institutional research audit on a specific company."""
-        # For broad index ETFs and physical commodity ETCs, return tailored ETF fundamental profile
-        if any(etf in yf_ticker for etf in ["VUAA", "VUSA", "VWRP", "SMGB", "CNDX", "DFND", "QQQ3", "SGLN", "IGLN", "GLD", "CSH2"]):
-            return self._build_etf_profile(yf_ticker)
+    def _base_research_profile(
+        self,
+        yf_ticker: str,
+        default_theme: str = "Secular Technology Leader",
+        default_cluster: str = "Enterprise Cloud & Software",
+    ) -> Dict[str, Any]:
+        """Neutral research skeleton used before (and instead of) live fundamentals.
 
+        Fail-closed defaults (C2): data_ok False, fundamental_score 50, quality_grade / street_consensus "N/A" and
+        no expected CAGR. Never an optimistic placeholder such as "A-", 70 or "Moderate Buy".
+        """
         # Resolve Theme & Macro Cluster
-        theme_name = THEMATIC_CATEGORIES.get(yf_ticker, "Secular Technology Leader")
-        macro_cluster = THEME_MACRO_CLUSTER.get(theme_name, "Enterprise Cloud & Software")
+        theme_name = THEMATIC_CATEGORIES.get(yf_ticker, default_theme)
+        macro_cluster = THEME_MACRO_CLUSTER.get(theme_name, default_cluster)
 
-        research = {
+        return {
             "ticker": yf_ticker,
             "company_name": yf_ticker,
             "sector": "Equities",
             "industry": "General",
             "theme": theme_name,
             "macro_cluster": macro_cluster,
+            "data_ok": False,
+            "data_error": None,
             "market_cap_b": 0.0,
             "forward_pe": None,
             "trailing_pe": None,
@@ -1485,7 +1756,7 @@ class DeepResearchAgent:
             "current_ratio": None,
             "debt_to_equity": None,
             "free_cashflow_b": None,
-            "street_consensus": "Moderate Buy",
+            "street_consensus": "N/A",
             "target_mean_price": 0.0,
             "target_high_price": 0.0,
             "target_low_price": 0.0,
@@ -1500,11 +1771,12 @@ class DeepResearchAgent:
             "eps_revision_label": "Neutral Consensus",
             "eps_revision_badge_color": "#64748b",
             "eps_momentum_score": 0,
-            "quality_grade": "A-",
-            "fundamental_score": 70,
-            "expected_5y_cagr_pct": 12.5,
-            "fair_pe_multiple": 22.0,
-            "valuation_regime_label": "🟢 Fairly Valued Compounder",
+            "quality_grade": "N/A",
+            "fundamental_score": 50,
+            "expected_5y_cagr_pct": None,
+            "expected_5y_cagr_capped": None,
+            "fair_pe_multiple": None,
+            "valuation_regime_label": "⚪ Valuation N/A (fundamentals unavailable)",
             "piotroski_score": None,
             "piotroski_label": "N/A (Data Pending)",
             "piotroski_factors": [],
@@ -1530,7 +1802,7 @@ class DeepResearchAgent:
             "insider_ownership_pct": None,
             "earnings_date_str": None,
             "days_to_earnings": None,
-            "earnings_catalyst_status": "✅ Clear",
+            "earnings_catalyst_status": "⚪ Unknown (no earnings data)",
             "economic_moat": "Narrow",
             "roic": None,
             "roic_label": "N/A",
@@ -1549,11 +1821,79 @@ class DeepResearchAgent:
             "bear_risks": "",
         }
 
+    @staticmethod
+    def _mark_fundamentals_failed(research: Dict[str, Any], reason: str) -> Dict[str, Any]:
+        """Applies the C2 fail-closed values after any deep-dive exception or fundamentals failure."""
+        research["data_ok"] = False
+        research["data_error"] = reason or "fundamentals unavailable"
+        research["fundamental_score"] = 50
+        research["quality_grade"] = "N/A"
+        research["street_consensus"] = "N/A"
+        research["expected_5y_cagr_pct"] = None
+        research["expected_5y_cagr_capped"] = None
+        research["fair_pe_multiple"] = None
+        research["valuation_regime_label"] = "⚪ Valuation N/A (fundamentals unavailable)"
+        return research
+
+    def _safe_etf_profile(
+        self,
+        ticker: str,
+        ticker_obj: Optional[yf.Ticker] = None,
+        info: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Builds the ETF profile (data_ok True); if building fails, returns a fail-closed profile (data_ok False)."""
+        try:
+            return self._build_etf_profile(ticker, ticker_obj=ticker_obj, info=info)
+        except Exception as e:
+            logger.warning("Could not build ETF profile for %s: %s", ticker, e)
+            research = self._base_research_profile(
+                ticker,
+                default_theme="Global Diversification Foundation",
+                default_cluster="Diversified Index Core",
+            )
+            research["is_etf"] = True
+            research["sector"] = "Index ETF"
+            return self._mark_fundamentals_failed(research, str(e))
+
+    def conduct_deep_dive(self, yf_ticker: str) -> Dict[str, Any]:
+        """Conducts a comprehensive institutional research audit on a specific company.
+
+        Contract (C2): the result always carries "data_ok" (True only when core fundamentals were fetched without
+        an exception; True for a successfully built ETF profile) and "expected_5y_cagr_capped" ("cap", "floor" or
+        None). On any exception or fundamentals failure: data_ok False, fundamental_score 50, quality_grade "N/A",
+        street_consensus "N/A", expected_5y_cagr_pct None.
+        """
+        # For broad index ETFs and physical commodity ETCs, return tailored ETF fundamental profile
+        if _is_known_etf_ticker(yf_ticker):
+            return self._safe_etf_profile(yf_ticker)
+
+        research = self._base_research_profile(yf_ticker)
+
         try:
             t = yf.Ticker(yf_ticker)
             info = t.info
+            if not isinstance(info, dict):
+                info = {}
 
-            curr_price = float(t.fast_info.get("lastPrice", 0.0))
+            # Guarded ETF detection from Yahoo's quoteType (cheap: info is already fetched for the stock path)
+            try:
+                quote_type = str(info.get("quoteType") or "").strip().upper()
+            except Exception:
+                quote_type = ""
+            if quote_type == "ETF":
+                return self._safe_etf_profile(yf_ticker, ticker_obj=t, info=info)
+
+            core_hits = sum(1 for k in _CORE_FUNDAMENTAL_KEYS if _clean_num(info.get(k)) is not None)
+            if core_hits < _MIN_CORE_FUNDAMENTALS:
+                raise ValueError(
+                    f"core fundamentals unavailable ({core_hits} of {len(_CORE_FUNDAMENTAL_KEYS)} core fields)"
+                )
+
+            try:
+                curr_price = _clean_num(t.fast_info.get("lastPrice"), 0.0)
+            except Exception as e:
+                logger.debug("Live price unavailable for %s: %s", yf_ticker, e)
+                curr_price = 0.0
             mkt_cap = _clean_num(info.get("marketCap"), 0.0) or 0.0
             fx_div = _get_fin_fx_divisor(info)
             research["market_cap_b"] = round(mkt_cap / 1e9, 1)
@@ -1592,7 +1932,8 @@ class DeepResearchAgent:
             research["debt_to_equity"] = round(debt_eq, 1) if debt_eq is not None else None
 
             fcf_raw = _clean_num(info.get("freeCashflow"))
-            fcf_norm = (fcf_raw / fx_div) if (fcf_raw is not None and fx_div > 0) else None
+            # FX-dependent: without a live statement->quote FX rate, normalized FCF (and FCF yield) is unknown
+            fcf_norm = (fcf_raw / fx_div) if (fcf_raw is not None and fx_div is not None and fx_div > 0) else None
             if fcf_norm is not None:
                 research["free_cashflow_b"] = round(fcf_norm / 1e9, 2)
 
@@ -1605,14 +1946,17 @@ class DeepResearchAgent:
             research["target_high_price"] = round(float(info.get("targetHighPrice", 0.0)), 2) if info.get("targetHighPrice") else 0.0
             research["target_low_price"] = round(float(info.get("targetLowPrice", 0.0)), 2) if info.get("targetLowPrice") else 0.0
 
-            rec_key = info.get("recommendationKey", "buy").replace("_", " ").title()
-            research["street_consensus"] = rec_key
+            rec_raw = info.get("recommendationKey")
+            rec_txt = str(rec_raw).strip() if rec_raw is not None else ""
+            research["street_consensus"] = (
+                rec_txt.replace("_", " ").title() if rec_txt and rec_txt.lower() != "none" else "N/A"
+            )
             research["analyst_count"] = info.get("numberOfAnalystOpinions", 0) or 0
 
             short_float = _clean_num(info.get("shortPercentOfFloat"))
             research["short_interest_pct"] = round(short_float * 100, 2) if short_float is not None else 0.0
 
-            # Forensic Piotroski Quality Audit
+            # Static 9-point Quality Checklist (0-9; not the year-on-year Piotroski F-score)
             p_score, p_label, p_factors = self._compute_piotroski_score(info)
             research["piotroski_score"] = p_score
             research["piotroski_label"] = p_label
@@ -1711,6 +2055,7 @@ class DeepResearchAgent:
             # 8. Forward 5-Year Intrinsic Compounding & Valuation Normalization Model
             comp_model = self._compute_intrinsic_5y_compounding(research)
             research["expected_5y_cagr_pct"] = comp_model["expected_5y_cagr_pct"]
+            research["expected_5y_cagr_capped"] = comp_model.get("expected_5y_cagr_capped")
             research["fair_pe_multiple"] = comp_model["fair_pe_multiple"]
             research["valuation_regime_label"] = comp_model["valuation_regime_label"]
 
@@ -1793,22 +2138,37 @@ class DeepResearchAgent:
             research["bear_risks"] = bear_r
             research["economic_moat"] = moat
 
+            # Core fundamentals fetched and scored without an exception
+            research["data_ok"] = True
+            research["data_error"] = None
+
         except Exception as e:
             logger.warning("Error during deep research for %s: %s", yf_ticker, e)
+            self._mark_fundamentals_failed(research, str(e))
 
         return research
 
-    def _build_etf_profile(self, ticker: str, ticker_obj: Optional[yf.Ticker] = None) -> Dict[str, Any]:
-        """Provides institutional analysis for core index and thematic ETFs with genuine fund data."""
-        if ticker_obj is None:
-            ticker_obj = yf.Ticker(ticker)
+    def _build_etf_profile(
+        self,
+        ticker: str,
+        ticker_obj: Optional[yf.Ticker] = None,
+        info: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Provides institutional analysis for core index and thematic ETFs with genuine fund data.
 
+        `info` may be passed when it was already fetched (quoteType == 'ETF' detection) to avoid a second request.
+        """
+        prefetched_info = info if isinstance(info, dict) else None
         info = {}
         fast_info = {}
         try:
+            if ticker_obj is None:
+                ticker_obj = yf.Ticker(ticker)
             fast_info = getattr(ticker_obj, "fast_info", {}) or {}
+            if prefetched_info is not None:
+                info = prefetched_info
             # LSE Physical Gold ETCs (SGLN.L/IGLN.L) and SONIA Overnight Cash ETF (CSH2.L) do not expose a corporate quoteSummary endpoint on Yahoo
-            if not any(g in ticker.upper() for g in ["SGLN", "IGLN", "CSH2"]):
+            elif not any(g in ticker.upper() for g in ["SGLN", "IGLN", "CSH2"]):
                 info = getattr(ticker_obj, "info", {}) or {}
         except Exception as e:
             logger.warning("Could not fetch online metadata for ETF %s (%s). Using static profile.", ticker, e)
@@ -1821,13 +2181,13 @@ class DeepResearchAgent:
         moat = "Systemic Diversification Moat"
         exp_5y_cagr = 11.5
 
-        if "VUAA" in ticker or "VUSA" in ticker:
-            name = "Vanguard S&P 500 UCITS ETF"
+        if "VUAA" in ticker or "VUSA" in ticker or "VUAG" in ticker or "CSPX" in ticker:
+            name = "iShares Core S&P 500 UCITS ETF" if "CSPX" in ticker else "Vanguard S&P 500 UCITS ETF"
             bull = "Captures the top 500 US companies. Heavy exposure to mega-cap cash-flow compounding technology monopolies with unmatched capital returns."
             bear = "Index concentration in top 10 mega-caps; sensitive to broader US equity multiple contraction if Treasury yields rise."
             moat = "Wide Moat (Top 500 US Monopolies)"
             exp_5y_cagr = 12.5
-        elif "VWRP" in ticker:
+        elif "VWRP" in ticker or "VWRA" in ticker:
             name = "Vanguard FTSE All-World UCITS ETF"
             bull = "Maximum worldwide economic diversification across 3,000+ companies in 49 developed and emerging economies (-6.3% resilient 2022 drawdown in GBP)."
             bear = "Lower return on equity than pure US tech; exposure to slower-growth European and emerging market economies."
@@ -1851,7 +2211,7 @@ class DeepResearchAgent:
             bear = "High cyclical volatility (beta >1.5); severe drawdowns during semiconductor supply chain inventory corrections."
             moat = "Wide Moat (Global Silicon Value Chain)"
             exp_5y_cagr = 16.5
-        elif "CNDX" in ticker:
+        elif "CNDX" in ticker or "CNX1" in ticker:
             name = "iShares Nasdaq 100 UCITS ETF"
             bull = "Pure-play concentration in the 100 largest non-financial innovators leading global AI, cloud, and consumer technology."
             bear = "High multiple vulnerability during interest rate spikes or antitrust regulatory scrutiny."
@@ -1871,7 +2231,15 @@ class DeepResearchAgent:
             exp_5y_cagr = 15.0
 
         # Real ETF Fund Metrics from market feed
-        aum = info.get("totalAssets") or fast_info.get("marketCap") or (14.8e9 if "SGLN" in ticker.upper() else (1.9e9 if "CSH2" in ticker.upper() else 0))
+        aum = _clean_num(info.get("totalAssets"))
+        if not aum:
+            try:
+                aum = _clean_num(fast_info.get("marketCap")) if hasattr(fast_info, "get") else None
+            except Exception as e:
+                logger.debug("ETF AUM lookup failed for %s: %s", ticker, e)
+                aum = None
+        if not aum:
+            aum = 14.8e9 if "SGLN" in ticker.upper() else (1.9e9 if "CSH2" in ticker.upper() else 0)
         aum_b = round(aum / 1e9, 2) if aum > 0 else None
         etf_yield = info.get("yield") or info.get("dividendYield") or info.get("trailingAnnualDividendYield")
         etf_yield_pct = round(etf_yield * 100, 2) if etf_yield else (4.23 if "CSH2" in ticker.upper() else 0.0)
@@ -1906,6 +2274,9 @@ class DeepResearchAgent:
             "theme": theme,
             "macro_cluster": cluster,
             "is_etf": True,
+            "data_ok": True,
+            "data_error": None,
+            "expected_5y_cagr_capped": None,
             "market_cap_b": aum_b or 0.0,
             "etf_aum_b": aum_b,
             "etf_yield_pct": etf_yield_pct,
