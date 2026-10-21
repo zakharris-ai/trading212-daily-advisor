@@ -17,6 +17,7 @@ from portfolio_storage import (
     detect_and_record_trades,
     get_position_entries,
     get_position_trims,
+    get_recent_trend_exits,
     load_portfolio_history,
     save_daily_snapshot,
     summarize_tracking_performance,
@@ -538,6 +539,8 @@ def run_pipeline(
     analyses = []
     tracked_entries = get_position_entries().get(account_name, {})
     tracked_trims = get_position_trims().get(account_name, {})
+    # Trend exits recommended for this account in the last 14 days stay in force while the trend is still broken
+    recent_exits = {} if use_mock else get_recent_trend_exits(account_name, run_date)
     for pos in acc_info["raw_positions"]:
       yf_ticker = pos["yf_ticker"]
       raw_t = pos.get("ticker", "")
@@ -555,6 +558,10 @@ def run_pipeline(
         pos["last_trim_date"] = tracked_trims[yf_ticker]
       elif raw_t in tracked_trims:
         pos["last_trim_date"] = tracked_trims[raw_t]
+
+      prior_exit = recent_exits.get(canon_t) or recent_exits.get(yf_ticker)
+      if prior_exit:
+        pos["recent_trend_exit"] = prior_exit
 
       logger.info("Auditing %s for %s...", yf_ticker, account_name)
       analysis = analyze_position(yf_ticker, pos, gbp_rate=gbp_rate)

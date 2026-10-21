@@ -1051,3 +1051,46 @@ def append_recommendation_records(records: List[Dict[str, Any]]) -> int:
     if added:
         _save_json_file(LEDGER_FILE, ledger)
     return added
+
+
+# Trend-based risk exits (identified by the reason text the engine writes into the ledger) that stay in force for a
+# while once recommended, so a stock hovering around the trigger line cannot flip between SELL and HOLD daily.
+TREND_EXIT_RULES = ("structural breakdown", "thesis break")
+
+
+def get_recent_trend_exits(account_name: str, as_of: str, days: int = 14) -> Dict[str, Dict[str, str]]:
+    """Trend-based SELL recommendations for one account dated within `days` of `as_of` (YYYY-MM-DD, inclusive).
+
+    Reads data/recommendation_ledger.json and returns {ticker: {"date": "YYYY-MM-DD", "rule": "structural
+    breakdown"}} with the most recent such record per ticker. Leverage-policy sells, buys and other accounts are
+    ignored. A missing or unreadable ledger returns {}; never raises.
+    """
+    try:
+        with open(LEDGER_FILE, "r", encoding="utf-8") as f:
+            ledger = json.load(f)
+        end = datetime.strptime(str(as_of), "%Y-%m-%d").date()
+    except Exception:
+        return {}
+    if not isinstance(ledger, list):
+        return {}
+    exits: Dict[str, Dict[str, str]] = {}
+    for rec in ledger:
+        if not isinstance(rec, dict) or rec.get("account") != account_name:
+            continue
+        action = str(rec.get("action", "")).upper()
+        if "SELL" not in action or "LEVERAGE" in action:
+            continue
+        reason = str(rec.get("reason", "")).lower()
+        rule = next((r for r in TREND_EXIT_RULES if r in reason), None)
+        ticker = str(rec.get("ticker") or "").strip()
+        if rule is None or not ticker:
+            continue
+        try:
+            rec_date = datetime.strptime(str(rec.get("date")), "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= (end - rec_date).days <= days:
+            continue
+        if ticker not in exits or exits[ticker]["date"] < rec_date.isoformat():
+            exits[ticker] = {"date": rec_date.isoformat(), "rule": rule}
+    return exits

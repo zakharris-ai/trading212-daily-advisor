@@ -513,6 +513,31 @@ class RecommendationLedgerTests(_TempDataDirMixin, unittest.TestCase):
             self.assertEqual(ps.append_recommendation_records([self.RECORD]), 0)
         self.assertEqual(ps.LEDGER_FILE.read_text(encoding="utf-8"), "{corrupt")
 
+    def test_recent_trend_exits_keep_only_recent_trend_sells_for_the_account(self):
+        def rec(date, account, action, ticker, reason):
+            return dict(self.RECORD, date=date, account=account, action=action, ticker=ticker, reason=reason)
+        ps.append_recommendation_records([
+            rec("2026-10-20", "Secondary", "SELL (GET CASH)", "AAA", "Acme: structural breakdown: price -4.8% vs the 200-day EMA"),
+            rec("2026-10-12", "Secondary", "SELL (GET CASH)", "AAA", "Acme: structural breakdown: older"),
+            rec("2026-10-19", "Secondary", "SELL (GET CASH)", "BBB", "Beta Corp: thesis break: fundamental score 40/100"),
+            rec("2026-10-19", "Secondary", "🔴 SELL (LEVERAGE POLICY — 0% CAP)", "QQQ3.L", "Leverage policy: structural breakdown text"),
+            rec("2026-10-20", "Secondary", "BUY (ADD TO POSITION)", "VWRP.L", "structural breakdown mentioned in a buy"),
+            rec("2026-10-20", "Main", "SELL (GET CASH)", "CCC", "Gamma Inc: structural breakdown"),
+            rec("2026-09-01", "Secondary", "SELL (GET CASH)", "DDD", "Delta plc: structural breakdown (too old)"),
+            rec("2026-10-22", "Secondary", "SELL (GET CASH)", "EEE", "Epsilon: structural breakdown (after as_of)"),
+        ])
+        exits = ps.get_recent_trend_exits("Secondary", "2026-10-21")
+        self.assertEqual(exits, {"AAA": {"date": "2026-10-20", "rule": "structural breakdown"},
+                                 "BBB": {"date": "2026-10-19", "rule": "thesis break"}})
+        self.assertEqual(set(ps.get_recent_trend_exits("Main", "2026-10-21")), {"CCC"})
+        self.assertEqual(ps.get_recent_trend_exits("Secondary", "not-a-date"), {})
+
+    def test_recent_trend_exits_tolerate_missing_or_corrupt_ledger(self):
+        self.assertEqual(ps.get_recent_trend_exits("Secondary", "2026-10-21"), {})
+        self.data.mkdir(parents=True)
+        ps.LEDGER_FILE.write_text("{corrupt", encoding="utf-8")
+        self.assertEqual(ps.get_recent_trend_exits("Secondary", "2026-10-21"), {})
+
 
 def _load_cleanup_module():
     spec = importlib.util.spec_from_file_location("cleanup_trade_log", REPO_ROOT / "scripts" / "cleanup_trade_log.py")

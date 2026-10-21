@@ -1033,6 +1033,31 @@ class TestAnalyzePosition(EngineTestCase):
         self.assertEqual(res["signal"], "🔴 SELL (EXIT)")
         self.assertIn("structural breakdown", res["reason"])
 
+    def test_recent_trend_exit_stays_in_force_until_price_recovers_above_200d_ema(self):
+        # A stock closes -3.9% vs its 200-day EMA, just above the -4% trigger, one day after a
+        # structural-breakdown SELL. The exit must not flip to HOLD on a small bounce.
+        ema200 = float(se.calculate_ema(pd.Series(self.DOWN), 200).iloc[-1])
+        research = {"data_ok": True, "company_name": "Acme Industrial", "fundamental_score": 70, "macro_cluster": "Infrastructure & Electrification"}
+        prior = {"date": "2026-10-20", "rule": "structural breakdown"}
+
+        def run(price, recent_exit):
+            position = {"quantity": 6.0, "currentPrice": price, "averagePrice": ema200 * 1.1, "currency": "USD"}
+            if recent_exit:
+                position["recent_trend_exit"] = recent_exit
+            with mock.patch.object(se, "evaluate_minervini_template", return_value=dict(MINERVINI_BEAR)):
+                return self.run_analysis("AAA", dict(research), self.DOWN, weekly=WEEKLY_DOWNTREND, position=position, currency="USD")
+
+        held = run(ema200 * 0.97, prior)       # inside the band: below the 200-day EMA, above the -4% line
+        self.assertEqual(held["signal"], "🔴 SELL (EXIT)")
+        self.assertIn("exit still in force: structural breakdown flagged on 2026-10-20", held["reason"])
+        self.assertNotEqual(run(ema200 * 0.97, None)["signal"], "🔴 SELL (EXIT)")      # no prior exit: no flip-flop SELL
+        self.assertNotEqual(run(ema200 * 1.01, prior)["signal"], "🔴 SELL (EXIT)")     # real recovery clears it
+        uptrend = dict(WEEKLY_DOWNTREND, is_weekly_stage_2=True)
+        position = {"quantity": 6.0, "currentPrice": ema200 * 0.97, "averagePrice": ema200, "currency": "USD", "recent_trend_exit": prior}
+        with mock.patch.object(se, "evaluate_minervini_template", return_value=dict(MINERVINI_BEAR)):
+            repaired = self.run_analysis("AAA", dict(research), self.DOWN, weekly=uptrend, position=position, currency="USD")
+        self.assertNotEqual(repaired["signal"], "🔴 SELL (EXIT)")                          # weekly trend repaired clears it
+
     def test_no_trend_exit_without_weekly_data(self):
         # A data glitch (weekly history unavailable) must never trigger an irreversible SELL on daily data alone.
         position = {"quantity": 10.0, "currentPrice": self.DOWN[-1], "averagePrice": 100.0, "currency": "USD"}

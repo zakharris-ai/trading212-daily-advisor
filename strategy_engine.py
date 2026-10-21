@@ -1891,6 +1891,15 @@ def analyze_position(
             # 3. Long-Term Thesis Break: Deteriorating fundamentals + broken weekly trend below 50d EMA
             if weekly_ok and (not is_core) and (not weekly_s2) and latest_price < curr_ema_50 * 0.97 and fund_score < 48:
                 exit_reasons.append(f"thesis break: fundamental score {fund_score:.0f}/100 (below 48) with price {pct_above_50 * 100:+.1f}% vs the 50-day EMA and the weekly trend broken")
+            # 4. Hysteresis: a trend exit recommended in the last 14 days (main.py attaches it from the recommendation
+            #    ledger) stays in force while the weekly trend is still broken and the price is below the 200-day EMA.
+            #    It clears only on a real recovery, so a stock hovering at the -4% line cannot flip SELL/HOLD daily.
+            prior_exit = (position_data or {}).get("recent_trend_exit") or {}
+            if (not exit_reasons) and prior_exit and weekly_ok and (not weekly_s2) and latest_price < curr_ema_200:
+                exit_reasons.append(
+                    f"exit still in force: {prior_exit.get('rule', 'trend exit')} flagged on {prior_exit.get('date', 'a recent run')}, "
+                    f"price still {pct_vs_200:+.1f}% vs the 200-day EMA with the weekly trend broken"
+                )
 
         # Signal Classification with Institutional Gatekeepers & 5-Year Horizon Anti-Churn Defense
         if is_earmarked_pos:
