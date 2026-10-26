@@ -61,7 +61,18 @@ jobs:
         id: time_gate
         env:
           FORCE_INPUT: ${{ github.event.inputs.force }}
+          T212_KEY_ID: ${{ secrets.T212_KEY_ID }}
+          T212_KEY_ID_2: ${{ secrets.T212_KEY_ID_2 }}
         run: |
+          # A repository with no Trading 212 key (this template itself, or a fork not set up yet) has nothing to
+          # analyse: skip cleanly so the run is green and GitHub sends no "Run failed" emails. A partly configured
+          # repository (a key but no secret) still fails loudly in main.py.
+          if [ -z "$T212_KEY_ID" ] && [ -z "$T212_KEY_ID_2" ]; then
+            echo "::notice title=Digest skipped::No Trading 212 API key in this repository's secrets (T212_KEY_ID / T212_KEY_ID_2). Add your secrets (see README) to turn the daily digest on."
+            echo "proceed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           # Read the sent-marker from the freshest origin/main (another run may have pushed since checkout).
           git fetch origin main
           MARKER_JSON=$(git show origin/main:data/last_email_sent.json 2>/dev/null) || MARKER_JSON='{}'

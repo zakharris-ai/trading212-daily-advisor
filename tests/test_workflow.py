@@ -72,6 +72,16 @@ class WorkflowInvariantTests(unittest.TestCase):
             self.assertRegex(self.text, rf"(?m)^\s+id: {step_id}$")
             self.assertIn(f"${{{{ steps.{step_id}.outcome }}}}", self.text)
 
+    def test_unconfigured_repository_skips_instead_of_failing(self):
+        # The template repo (and forks not set up yet) has no Trading 212 secrets: the gatekeeper must end the
+        # run green with proceed=false, so GitHub never emails "Run failed" every day.
+        gate = self.text.split("id: time_gate", 1)[1].split("- name:", 1)[0]
+        self.assertIn("T212_KEY_ID: ${{ secrets.T212_KEY_ID }}", gate)
+        self.assertIn("T212_KEY_ID_2: ${{ secrets.T212_KEY_ID_2 }}", gate)
+        guard = gate.index('if [ -z "$T212_KEY_ID" ] && [ -z "$T212_KEY_ID_2" ]; then')
+        self.assertLess(guard, gate.index("git fetch origin main"))
+        self.assertIn('echo "proceed=false" >> $GITHUB_OUTPUT', gate[guard:guard + 400])
+
 
 if __name__ == "__main__":
     unittest.main()

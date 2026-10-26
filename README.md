@@ -154,7 +154,7 @@ The workflow lives in `.github/workflows/daily_trading_digest.yml`:
 
 1. **Triggers:** cron ticks at :05, :20, :35 and :50 past 08:00 and 09:00 UTC (covering the BST and GMT morning windows) plus a 10:05 UTC catch-all, and manual/external `workflow_dispatch` with an optional boolean `force` input.
 2. **Concurrency:** all runs share the `daily-digest` group (`cancel-in-progress: false`), so two runs never send or push at the same time; the job times out after 20 minutes.
-3. **Gatekeeper:** runs `git fetch origin main` and reads `data/last_email_sent.json` from `origin/main`. Scheduled ticks proceed only when the Europe/London hour is 9 or later and nothing has been sent today; dispatches skip the hour check but still respect the dedupe unless `force` is true.
+3. **Gatekeeper:** if the repository has no Trading 212 key at all (`T212_KEY_ID` and `T212_KEY_ID_2` both unset, e.g. this template or a fork you haven't set up yet), the run is skipped cleanly with a notice, so it stays green and GitHub sends no "Run failed" emails. Otherwise it runs `git fetch origin main` and reads `data/last_email_sent.json` from `origin/main`. Scheduled ticks proceed only when the Europe/London hour is 9 or later and nothing has been sent today; dispatches skip the hour check but still respect the dedupe unless `force` is true.
 4. **Offline unit tests** run before the digest; a failing test fails the job before any email is sent.
 5. **`main.py`** runs (with `--force` only when the dispatch input `force` is true). Test and digest output is also written to `logs/` (gitignored, never committed) so a failure alert can quote it.
 6. **Commit step:** `git add data/ dashboard.html`, then up to 3 attempts of `git pull --rebase origin main` + `git push`.
