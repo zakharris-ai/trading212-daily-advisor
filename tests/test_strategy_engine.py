@@ -49,10 +49,10 @@ LEGACY_ALLOCATION_CFG = {
 
 # The owner-approved household defaults (config.ALLOCATION_CONFIG as shipped), used by the household tests
 HOUSEHOLD_ALLOCATION_CFG = {
-    "targets": {"core": 0.65, "satellite": 0.20, "defensive": 0.15},
+    "targets": {"core": 0.75, "satellite": 0.20, "defensive": 0.05},
     "band_pp": 5.0,
     "satellite_max_single_pct": 0.05,
-    "defensive_split": {"gold": 0.5, "short_gilts": 0.5},
+    "defensive_split": {"gold": 1.0, "short_gilts": 0.0},
     "core_buy_ticker": "VWRP.L",
     "gold_buy_ticker": "SGLN.L",
     "short_gilt_buy_ticker": "IGLS.L",
@@ -1023,19 +1023,30 @@ class TestAnalyzePosition(EngineTestCase):
         self.assertIsNone(self.run_analysis("MSFT", below, self.UP, currency="USD")["risk_reward_ratio"])
         self.assertLess(res["target_price"], price * 1.15)  # no artificial +15% target floor
 
-    def test_exit_fires_before_trim_lockout_and_names_condition(self):
+    def test_exit_fires_before_trim_lockout_for_fundamental_distress_while_trend_breakdown_is_review_only(self):
         today = datetime.now().strftime("%Y-%m-%d")
         position = {"quantity": 10.0, "currentPrice": self.DOWN[-1], "averagePrice": 100.0, "last_trim_date": today,
                     "last_entry_date": today, "currency": "USD"}
-        research = {"data_ok": True, "company_name": "NVIDIA", "fundamental_score": 70, "macro_cluster": "AI Hardware & Semiconductors"}
+        # Solvent balance sheet: oversold technical breakdown is a HOLD / review alert, never an automatic SELL
+        solvent = {"data_ok": True, "company_name": "NVIDIA", "fundamental_score": 70, "altman_z": 6.5,
+                   "piotroski_score": 8, "macro_cluster": "AI Hardware & Semiconductors"}
         with mock.patch.object(se, "evaluate_minervini_template", return_value=dict(MINERVINI_BEAR)):
-            res = self.run_analysis("NVDA", research, self.DOWN, weekly=WEEKLY_DOWNTREND, position=position, currency="USD")
-        self.assertEqual(res["signal"], "🔴 SELL (EXIT)")
-        self.assertIn("structural breakdown", res["reason"])
+            res_tech = self.run_analysis("NVDA", solvent, self.DOWN, weekly=WEEKLY_DOWNTREND, position=position, currency="USD")
+        self.assertEqual(res_tech["signal"], se.TREND_REVIEW_SIGNAL)
+        self.assertEqual(res_tech["action_short"], "HOLD")
+        self.assertIn("structural breakdown", res_tech["reason"])
 
-    def test_recent_trend_exit_stays_in_force_until_price_recovers_above_200d_ema(self):
-        # A stock closes -3.9% vs its 200-day EMA, just above the -4% trigger, one day after a
-        # structural-breakdown SELL. The exit must not flip to HOLD on a small bounce.
+        # Hard balance-sheet insolvency risk still triggers an immediate SELL before trim lockouts and anti-churn
+        distressed = dict(solvent, altman_z=1.20, piotroski_score=2)
+        with mock.patch.object(se, "evaluate_minervini_template", return_value=dict(MINERVINI_BEAR)):
+            res_distress = self.run_analysis("NVDA", distressed, self.DOWN, weekly=WEEKLY_DOWNTREND, position=position, currency="USD")
+        self.assertEqual(res_distress["signal"], "🔴 SELL (EXIT)")
+        self.assertEqual(res_distress["action_short"], "SELL")
+        self.assertIn("fundamental distress", res_distress["reason"])
+
+    def test_recent_trend_exit_keeps_review_alert_in_force_until_price_recovers_above_200d_ema(self):
+        # Hysteresis keeps a recent trend-breakdown review alert active inside the -4% band (without auto-selling)
+        # until price recovers above the 200-day EMA or the weekly trend repairs.
         ema200 = float(se.calculate_ema(pd.Series(self.DOWN), 200).iloc[-1])
         research = {"data_ok": True, "company_name": "Acme Industrial", "fundamental_score": 70, "macro_cluster": "Infrastructure & Electrification"}
         prior = {"date": "2026-10-20", "rule": "structural breakdown"}
@@ -1048,15 +1059,16 @@ class TestAnalyzePosition(EngineTestCase):
                 return self.run_analysis("AAA", dict(research), self.DOWN, weekly=WEEKLY_DOWNTREND, position=position, currency="USD")
 
         held = run(ema200 * 0.97, prior)       # inside the band: below the 200-day EMA, above the -4% line
-        self.assertEqual(held["signal"], "🔴 SELL (EXIT)")
-        self.assertIn("exit still in force: structural breakdown flagged on 2026-10-20", held["reason"])
-        self.assertNotEqual(run(ema200 * 0.97, None)["signal"], "🔴 SELL (EXIT)")      # no prior exit: no flip-flop SELL
-        self.assertNotEqual(run(ema200 * 1.01, prior)["signal"], "🔴 SELL (EXIT)")     # real recovery clears it
+        self.assertEqual(held["signal"], se.TREND_REVIEW_SIGNAL)
+        self.assertEqual(held["action_short"], "HOLD")
+        self.assertIn("review still in force: structural breakdown flagged on 2026-10-20", held["reason"])
+        self.assertNotEqual(run(ema200 * 0.97, None)["signal"], se.TREND_REVIEW_SIGNAL)   # no prior flag: no trend-review alert
+        self.assertNotEqual(run(ema200 * 1.01, prior)["signal"], se.TREND_REVIEW_SIGNAL)  # recovery above 200d EMA clears it
         uptrend = dict(WEEKLY_DOWNTREND, is_weekly_stage_2=True)
         position = {"quantity": 6.0, "currentPrice": ema200 * 0.97, "averagePrice": ema200, "currency": "USD", "recent_trend_exit": prior}
         with mock.patch.object(se, "evaluate_minervini_template", return_value=dict(MINERVINI_BEAR)):
             repaired = self.run_analysis("AAA", dict(research), self.DOWN, weekly=uptrend, position=position, currency="USD")
-        self.assertNotEqual(repaired["signal"], "🔴 SELL (EXIT)")                          # weekly trend repaired clears it
+        self.assertNotEqual(repaired["signal"], se.TREND_REVIEW_SIGNAL)                    # weekly trend repaired clears it
 
     def test_no_trend_exit_without_weekly_data(self):
         # A data glitch (weekly history unavailable) must never trigger an irreversible SELL on daily data alone.
@@ -1157,6 +1169,79 @@ class TestAnalyzePosition(EngineTestCase):
                     p.stop()
             self.assertNotIn("Analysis error", res["reason"], label)
             self.assertIn(expected, res["signal"], f"{label}: {res['signal']} / {res['reason']}")
+            if label == "parabolic":
+                self.assertEqual(res["action_short"], "HOLD")
+
+    def test_csh2_250_to_1_unadjusted_split_normalizes_daily_and_weekly_metrics(self):
+        # 27 Oct 2026 live bug: CSH2.L executed a 250:1 split (125,770 GBp -> 503.40 GBp) before Yahoo adjusted bars.
+        pre_daily = [108000.0 + 70.0 * i for i in range(251)]
+        daily_closes = pre_daily + [503.40]
+        pre_weekly = [103000.0 + 88.0 * i for i in range(259)]
+        weekly_closes = pre_weekly + [503.40]
+        spy_w = weekly_frame(np.linspace(380.0, 580.0, 260))
+        fx_w = weekly_frame([1.27] * 260)
+        self.use_tickers({
+            "CSH2.L": FakeTicker(daily=daily_frame(daily_closes), weekly=weekly_frame(weekly_closes),
+                                 fast_info={"currency": "GBp", "lastPrice": 503.40}),
+            "SPY": FakeTicker(daily=daily_frame(np.linspace(450.0, 580.0, 252)), weekly=spy_w,
+                              fast_info={"currency": "USD"}),
+            "GBPUSD=X": FakeTicker(weekly=fx_w),
+        })
+        pos = {"quantity": 4032.25, "currentPrice": 503.40, "averagePrice": 495.0, "currency": "GBX"}
+        with mock.patch.object(se.research_agent, "conduct_deep_dive", return_value=dict(self.ETF_RESEARCH, company_name="Amundi SONIA")), \
+                mock.patch.object(se.research_agent, "get_macro_regime", return_value={"macro_score": 55}):
+            res = se.analyze_position("CSH2.L", pos, gbp_rate=1.27)
+        self.assertTrue(res["data_ok"])
+        self.assertTrue(res["valuation_ok"])
+        self.assertGreater(res["cagr_5y_pct"], 3.0)
+        self.assertGreater(res["sortino_5y"], 0.5)
+        self.assertLess(res["trailing_stop"], 503.40)
+        self.assertLess(res["target_price"], 560.0)
+        self.assertAlmostEqual(res["price_gbp"], 5.034, places=3)
+
+    def test_lse_100x_pence_pound_transient_bar_glitch_normalized(self):
+        closes = list(self.UP)
+        closes[-10] = closes[-10] * 100.0  # isolated 100x GBp/GBP feed glitch
+        df_clean, suspect, rescaled = se.normalize_ohlc_dataframe(daily_frame(closes), yf_ticker="VWRP.L")
+        self.assertFalse(suspect)
+        self.assertTrue(rescaled)
+        self.assertAlmostEqual(float(df_clean["Close"].iloc[-10]), self.UP[-10], places=4)
+
+    def test_single_stock_10_to_1_split_broker_confirmed_vs_unowned_fail_closed(self):
+        pre_split = [800.0 + 0.8 * i for i in range(251)]  # rises 800 -> 1000
+        split_closes = pre_split + [100.5]                 # 10:1 split day
+        wk_closes = [500.0 + 2.0 * i for i in range(259)] + [100.5]
+        spy_w = weekly_frame(np.linspace(380.0, 580.0, 260))
+        fx_w = weekly_frame([1.27] * 260)
+        tickers = {
+            "NVDA": FakeTicker(daily=daily_frame(split_closes), weekly=weekly_frame(wk_closes),
+                               fast_info={"currency": "USD", "lastPrice": 100.5}),
+            "SPY": FakeTicker(daily=daily_frame(np.linspace(450.0, 580.0, 252)), weekly=spy_w,
+                              fast_info={"currency": "USD"}),
+            "GBPUSD=X": FakeTicker(weekly=fx_w),
+        }
+        research = {"data_ok": True, "company_name": "NVIDIA", "fundamental_score": 82,
+                    "macro_cluster": "AI Hardware & Semiconductors", "target_mean_price": 1200.0}
+        # 1. Held position with post-split averagePrice ($85) confirms the 10:1 split and rescales cleanly
+        self.use_tickers(tickers)
+        held_pos = {"quantity": 100.0, "currentPrice": 100.5, "averagePrice": 85.0, "currency": "USD"}
+        with mock.patch.object(se.research_agent, "conduct_deep_dive", return_value=dict(research)), \
+                mock.patch.object(se.research_agent, "get_macro_regime", return_value={"macro_score": 60}):
+            held_res = se.analyze_position("NVDA", held_pos, gbp_rate=1.27)
+        self.assertTrue(held_res["price_data_ok"])
+        self.assertTrue(held_res["is_weekly_stage_2"])
+        self.assertLess(held_res["trailing_stop"], 105.0)
+        self.assertIsNone(held_res["risk_reward_ratio"])  # stale pre-split $1,200 analyst target ignored
+
+        # 2. Unowned watchlist candidate has no broker confirmation -> fails closed (price_data_ok=False, no BUY)
+        se.reset_runtime_caches()
+        self.use_tickers(tickers)
+        with mock.patch.object(se.research_agent, "conduct_deep_dive", return_value=dict(research)), \
+                mock.patch.object(se.research_agent, "get_macro_regime", return_value={"macro_score": 60}):
+            unowned_res = se.analyze_position("NVDA", None, gbp_rate=1.27)
+        self.assertFalse(unowned_res["price_data_ok"])
+        self.assertFalse(unowned_res["data_ok"])
+        self.assertNotEqual(unowned_res["action_short"], "BUY")
 
 
 class TestEndToEndOffline(EngineTestCase):
@@ -1319,36 +1404,44 @@ class TestHouseholdHelpers(EngineTestCase):
         alloc = se.allocate_new_money(5000.0, {"core": 22000.0, "satellite": 75000.0, "defensive": 3000.0}, 105000.0)
         self.assertEqual(alloc["satellite"], 0.0)
         self.assertAlmostEqual(sum(alloc.values()), 5000.0, places=6)
-        core_gap, def_gap = 0.65 * 105000 - 22000, 0.15 * 105000 - 3000
-        self.assertAlmostEqual(alloc["core"], 5000.0 * core_gap / (core_gap + def_gap), places=6)
+        # Core is 21.0% vs 75% target (>5pp out of band), while Defensive is 2.9% vs 5% target (within 5pp band),
+        # so out-of-band Core gets filled first!
+        self.assertAlmostEqual(alloc["core"], 5000.0, places=6)
+        # When both Core and Defensive are out of band (>5pp below target), new money splits proportionally by gap:
+        alloc2 = se.allocate_new_money(
+            5000.0, {"core": 22000.0, "satellite": 78000.0, "defensive": 0.0}, 105000.0,
+            targets={"core": 0.65, "satellite": 0.20, "defensive": 0.15},
+        )
+        core_gap, def_gap = 0.65 * 105000 - 22000, 0.15 * 105000 - 0.0
+        self.assertAlmostEqual(alloc2["core"], 5000.0 * core_gap / (core_gap + def_gap), places=6)
 
     def test_allocate_new_money_out_of_band_bucket_first(self):
-        # Core 50% (more than 5pp below 65%) is filled before in-band shortfalls
-        alloc = se.allocate_new_money(5000.0, {"core": 50000.0, "satellite": 19000.0, "defensive": 26000.0}, 100000.0)
+        # Core 50% (more than 5pp below 75%) is filled before in-band shortfalls
+        alloc = se.allocate_new_money(5000.0, {"core": 50000.0, "satellite": 21000.0, "defensive": 24000.0}, 100000.0)
         self.assertAlmostEqual(alloc["core"], 5000.0, places=6)
-        # All in band: split across the under-target buckets in proportion to their shortfall
-        alloc = se.allocate_new_money(5000.0, {"core": 64000.0, "satellite": 21000.0, "defensive": 10000.0}, 100000.0)
+        # All in band (73% vs 75%, 21% vs 20%, 1% vs 5%): split across under-target buckets in proportion to shortfall
+        alloc = se.allocate_new_money(5000.0, {"core": 73000.0, "satellite": 21000.0, "defensive": 1000.0}, 100000.0)
         self.assertEqual(alloc["satellite"], 0.0)
-        self.assertAlmostEqual(alloc["core"], 5000.0 * 1000.0 / 6000.0, places=6)
-        self.assertAlmostEqual(alloc["defensive"], 5000.0 * 5000.0 / 6000.0, places=6)
+        self.assertAlmostEqual(alloc["core"], 5000.0 * 2000.0 / 6000.0, places=6)
+        self.assertAlmostEqual(alloc["defensive"], 5000.0 * 4000.0 / 6000.0, places=6)
         self.assertEqual(se.allocate_new_money(0.0, {"core": 1.0}, 10.0), {"core": 0.0, "satellite": 0.0, "defensive": 0.0})
 
     def test_household_mix_values_status_and_post_trade(self):
         holdings = [{"ticker": "VWRP.L", "value_gbp": 20000.0}, {"ticker": "NVDA", "value_gbp": 70000.0},
                     {"ticker": "SGLN.L", "value_gbp": 2000.0}]
         outside = [{"account": "Main", "ticker": "GOOGL", "vested_gbp": 5000.0, "unvested_gbp": 9000.0}]
-        mix = se.compute_household_mix(holdings, 3000.0, outside, excluded_cash_gbp=6500.0,
+        mix = se.compute_household_mix(holdings, 2000.0, outside, excluded_cash_gbp=6500.0,
                                        sell_orders=[{"ticker": "NVDA", "estimated_gbp": 10000.0}],
                                        buy_orders=[{"ticker": "VWRP.L", "estimated_gbp": 2000.0, "bucket": "core"}])
-        self.assertEqual(mix["basis_gbp"], 100000.0)  # unvested and excluded top-up cash never count
-        self.assertEqual(mix["values_gbp"], {"core": 20000.0, "satellite": 75000.0, "defensive": 5000.0})
+        self.assertEqual(mix["basis_gbp"], 99000.0)  # unvested and excluded top-up cash never count
+        self.assertEqual(mix["values_gbp"], {"core": 20000.0, "satellite": 75000.0, "defensive": 4000.0})
         rows = {r["bucket"]: r for r in mix["buckets"]}
         self.assertEqual(rows["core"]["status"], "under")
         self.assertEqual(rows["satellite"]["status"], "over")
-        self.assertEqual(rows["defensive"]["status"], "under")
+        self.assertEqual(rows["defensive"]["status"], "in_band")  # 4.0% is within ±5pp band of the 5% target
         self.assertEqual(rows["core"]["post_trade_gbp"], 22000.0)
         self.assertEqual(rows["satellite"]["post_trade_gbp"], 65000.0)
-        self.assertEqual(rows["defensive"]["post_trade_gbp"], 13000.0)
+        self.assertEqual(rows["defensive"]["post_trade_gbp"], 12000.0)
         self.assertEqual(mix["excluded_cash_gbp"], 6500.0)
         self.assertTrue(mix["post_trade_available"])
         self.assertFalse(se.compute_household_mix(holdings, 0.0)["post_trade_available"])
@@ -1392,14 +1485,13 @@ class TestHouseholdPlan(EngineTestCase):
 
     def test_off_cycle_buy_goes_to_core_and_defensive_only(self):
         meta = make_analysis("META", 0.0, conviction_score=95, is_new_addition=True)
+        # Under 75/20/5 Gold-only defaults: Core is 9.4% vs 75% (>5pp out of band), Defensive is 0.5% vs 5% (within 5pp),
+        # so out-of-band Core receives 100% of the £5,500 deployable cash first!
         plan = self.hh_plan(self.tech_heavy_book(), cash=6000.0, opps=[meta])
         buys = {b["ticker"]: b for b in plan["buy_orders"]}
-        self.assertEqual(set(buys), {"VWRP.L", "SGLN.L", "IGLS.L"})
+        self.assertEqual(set(buys), {"VWRP.L"})
         self.assertEqual(buys["VWRP.L"]["bucket"], "core")
-        self.assertEqual(buys["SGLN.L"]["bucket"], "defensive")
-        self.assertEqual(buys["IGLS.L"]["bucket"], "defensive")
         self.assertAlmostEqual(sum(b["estimated_gbp"] for b in plan["buy_orders"]), 5500.0, delta=1.0)
-        self.assertGreater(buys["VWRP.L"]["estimated_gbp"], buys["SGLN.L"]["estimated_gbp"] + buys["IGLS.L"]["estimated_gbp"])
         alloc = plan["household_allocation"]
         self.assertTrue(alloc["buys_allowed"])
         self.assertIn("Off-cycle", alloc["cadence_note"])
@@ -1408,6 +1500,15 @@ class TestHouseholdPlan(EngineTestCase):
         self.assertIn("Satellites", notes)
         self.assertIn("big tech", notes)
         self.assertTrue(all(b["is_new"] for b in plan["buy_orders"]))  # none of the bucket funds is held here
+
+        # When Core is near target (74%) and Defensive is 0.5% vs 5%, Gold-only defensive buys SGLN.L (0% IGLS.L)
+        core_full = [fund("VWRP.L", 100.0, "Diversified Index Core", value_gbp=78000.0),
+                     make_analysis("NVDA", 22000.0, macro_cluster="AI Hardware & Semiconductors")]
+        plan_def = self.hh_plan(core_full, cash=6000.0, opps=[meta])
+        buys_def = {b["ticker"]: b for b in plan_def["buy_orders"]}
+        self.assertIn("SGLN.L", buys_def)
+        self.assertNotIn("IGLS.L", buys_def)
+        self.assertEqual(buys_def["SGLN.L"]["bucket"], "defensive")
 
     def test_buy_amounts_are_whole_pounds_rounded_down_and_never_breach_the_reserve(self):
         # Round-to-nearest display let value orders add up to more than the cash above the reserve (e.g. three
@@ -1509,7 +1610,9 @@ class TestHouseholdPlan(EngineTestCase):
 
     def test_unpriced_core_fund_stays_in_cash_with_note(self):
         universe = [fund("SGLN.L", 60.0, "Uncorrelated Crash Hedge & Gold"), fund("IGLS.L", 130.0, "Defensive Gilts & Cash")]
-        plan = self.hh_plan(self.tech_heavy_book(), cash=6000.0, universe=universe)
+        core_near_target = [fund("VUAG.L", 100.0, "Diversified Index Core", value_gbp=76000.0),
+                            make_analysis("NVDA", 24000.0, macro_cluster="AI Hardware & Semiconductors")]
+        plan = self.hh_plan(core_near_target, cash=6000.0, universe=universe)
         self.assertNotIn("VWRP.L", [b["ticker"] for b in plan["buy_orders"]])
         self.assertIn("VWRP.L not bought because no valid GBP price", " ".join(plan["household_allocation"]["notes"]))
         self.assertTrue(any(b["bucket"] == "defensive" for b in plan["buy_orders"]))
@@ -1533,11 +1636,11 @@ class TestHouseholdPlan(EngineTestCase):
         self.assertAlmostEqual(buys["AAA"]["estimated_gbp"], buys["BBB"]["estimated_gbp"], delta=0.01)
         self.assertEqual(buys["AAA"]["rebalance_score"], buys["BBB"]["rebalance_score"])
 
-    def _two_accounts(self, topup=0.0):
+    def _two_accounts(self, topup=0.0, core_gbp=40000.0):
         return {
             "Main": {"cfg": {"reserve_topup_gbp": topup},
                     "cash": {"free_gbp": 6000.0, "blocked_gbp": 0.0},
-                    "analyses": [fund("VWRP.L", 100.0, "Diversified Index Core", value_gbp=40000.0),
+                    "analyses": [fund("VWRP.L", 100.0, "Diversified Index Core", value_gbp=core_gbp),
                                  make_analysis("NVDA", 40000.0, macro_cluster="AI Hardware & Semiconductors")]},
             "Second": {"cfg": {}, "cash": {"free_gbp": 6000.0, "blocked_gbp": 0.0},
                      "analyses": [make_analysis("MSFT", 10000.0)]},
@@ -1549,17 +1652,18 @@ class TestHouseholdPlan(EngineTestCase):
                          as_of=self.off_cycle_day)
 
     def test_shared_ledger_prevents_double_filling_across_accounts(self):
-        accounts = self._two_accounts()
+        accounts = self._two_accounts(core_gbp=130000.0)
         view = se.build_consolidated_portfolio_view(accounts, gbp_rate=1.25)
-        self.assertEqual(view["household_mix"]["basis_gbp"], 102000.0)
+        self.assertEqual(view["household_mix"]["basis_gbp"], 192000.0)
         main = self._account_plan(accounts, "Main", view)
         ledger = view["household_mix"]["ledger"]
         main_core = sum(b["estimated_gbp"] for b in main["buy_orders"] if b["bucket"] == "core")
         self.assertAlmostEqual(ledger["core"], main_core, places=6)
         second = self._account_plan(accounts, "Second", view)
-        fresh_view = se.build_consolidated_portfolio_view(self._two_accounts(), gbp_rate=1.25)
-        second_fresh = self._account_plan(self._two_accounts(), "Second", fresh_view)
-        # Main already filled part of the household core gap, so Second's plan puts less into core
+        fresh_accounts = self._two_accounts(core_gbp=130000.0)
+        fresh_view = se.build_consolidated_portfolio_view(fresh_accounts, gbp_rate=1.25)
+        second_fresh = self._account_plan(fresh_accounts, "Second", fresh_view)
+        # Main already filled part of the household core gap (bringing Core back inside the 5pp band), so Second's plan puts less into core
         self.assertLess(second["household_allocation"]["by_bucket_gbp"]["core"],
                         second_fresh["household_allocation"]["by_bucket_gbp"]["core"])
         rebuilt = se.build_consolidated_portfolio_view(accounts, gbp_rate=1.25, account_plans={"Main": main, "Second": second})
@@ -1589,6 +1693,54 @@ class TestHouseholdPlan(EngineTestCase):
         rp = se.compute_portfolio_5y_risk_profile(book, 0.0, 0.0, 100000.0)
         self.assertEqual(rp["current_shield_pct"], 10.0)     # IGLS only; BRK-B is a stock
         self.assertEqual(rp["current_defensive_pct"], 10.0)
+
+    def test_household_position_cap_protects_smaller_account_and_dedupes_across_accounts(self):
+        # 1. Second holds £10k PLTR in a £50k ISA (20% of Second's ISA), while Main holds £150k VWRP.L -> £200k household,
+        #    so PLTR is only 5.0% of household wealth (< 15% cap): NO premature cap trim in Second's smaller ISA!
+        accounts = {
+            "Main": {"cfg": {}, "cash": {"free_gbp": 1000.0, "blocked_gbp": 0.0},
+                     "analyses": [fund("VWRP.L", 100.0, "Diversified Index Core", value_gbp=149000.0)]},
+            "Second": {"cfg": {}, "cash": {"free_gbp": 500.0, "blocked_gbp": 0.0},
+                       "analyses": [make_analysis("PLTR", 10000.0, price_gbp=100.0, macro_cluster="Enterprise Cloud & Software"),
+                                    fund("VWRP.L", 100.0, "Diversified Index Core", value_gbp=39500.0)]},
+        }
+        view = se.build_consolidated_portfolio_view(accounts, gbp_rate=1.25)
+        second_plan = self._account_plan(accounts, "Second", view)
+        self.assertEqual(second_plan["sell_orders"], [])
+
+        # 2. Shared oversized stock across both accounts: Main £25k NVDA + Second £15k NVDA = £40k on £200k household
+        #    (20% vs 15% cap -> £10k household excess). Main trims £10k; Second sees £0 remaining excess (no double-trim).
+        accounts2 = {
+            "Main": {"cfg": {}, "cash": {"free_gbp": 1000.0, "blocked_gbp": 0.0},
+                     "analyses": [make_analysis("NVDA", 25000.0, price_gbp=100.0, macro_cluster="AI Hardware & Semiconductors"),
+                                  fund("VWRP.L", 100.0, "Diversified Index Core", value_gbp=124000.0)]},
+            "Second": {"cfg": {}, "cash": {"free_gbp": 500.0, "blocked_gbp": 0.0},
+                       "analyses": [make_analysis("NVDA", 15000.0, price_gbp=100.0, macro_cluster="AI Hardware & Semiconductors"),
+                                    fund("VWRP.L", 100.0, "Diversified Index Core", value_gbp=34500.0)]},
+        }
+        view2 = se.build_consolidated_portfolio_view(accounts2, gbp_rate=1.25)
+        main_p2 = self._account_plan(accounts2, "Main", view2)
+        second_p2 = self._account_plan(accounts2, "Second", view2)
+        self.assertEqual(len(main_p2["sell_orders"]), 1)
+        self.assertAlmostEqual(main_p2["sell_orders"][0]["estimated_gbp"], 10000.0, places=2)
+        self.assertIn("household wealth", main_p2["sell_orders"][0]["plain_english_why"])
+        self.assertEqual(second_p2["sell_orders"], [])
+
+        # 3. Split excess: Main holds £4k NVDA and Second holds £36k NVDA (£40k on £200k -> £10k excess):
+        #    Main sells all £4k and Second trims the remaining £6k.
+        accounts3 = {
+            "Main": {"cfg": {}, "cash": {"free_gbp": 1000.0, "blocked_gbp": 0.0},
+                     "analyses": [make_analysis("NVDA", 4000.0, price_gbp=100.0, macro_cluster="AI Hardware & Semiconductors"),
+                                  fund("VWRP.L", 100.0, "Diversified Index Core", value_gbp=145000.0)]},
+            "Second": {"cfg": {}, "cash": {"free_gbp": 500.0, "blocked_gbp": 0.0},
+                       "analyses": [make_analysis("NVDA", 36000.0, price_gbp=100.0, macro_cluster="AI Hardware & Semiconductors"),
+                                    fund("VWRP.L", 100.0, "Diversified Index Core", value_gbp=13500.0)]},
+        }
+        view3 = se.build_consolidated_portfolio_view(accounts3, gbp_rate=1.25)
+        main_p3 = self._account_plan(accounts3, "Main", view3)
+        second_p3 = self._account_plan(accounts3, "Second", view3)
+        self.assertAlmostEqual(main_p3["sell_orders"][0]["estimated_gbp"], 4000.0, places=2)
+        self.assertAlmostEqual(second_p3["sell_orders"][0]["estimated_gbp"], 6000.0, places=2)
 
 
 class TestCompiles(unittest.TestCase):

@@ -75,8 +75,13 @@ BUCKET_LABELS: Dict[str, str] = {
 EARMARKED_SIGNAL = "🔒 HOLD (EARMARKED — EXCLUDED FROM PORTFOLIO MATHS)"
 LEVERAGE_POLICY_SELL_SIGNAL = "🔴 SELL (LEVERAGE POLICY — 0% CAP)"
 STOP_REVIEW_SIGNAL = "⚠️ HOLD — BELOW REFERENCE STOP (REVIEW)"
+TREND_REVIEW_SIGNAL = "⚠️ HOLD — TREND BREAKDOWN (REVIEW)"
 TRIM_LOCKOUT_SIGNAL = "🟢 HOLD (RECENTLY TRIMMED — LOCKOUT)"
 DATA_UNAVAILABLE_LABEL = "⚪ Data unavailable"
+
+_CORPORATE_SPLIT_FACTORS: Tuple[int, ...] = (
+    2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 40, 50, 100, 125, 200, 250, 500, 1000,
+)
 
 
 def _num(v: Any, default: Any = 0.0) -> Any:
@@ -161,6 +166,202 @@ def is_defensive_asset(yf_ticker: str) -> bool:
     return is_gold_etc(sym) or is_money_market_fund(sym) or is_short_gilt_fund(sym)
 
 
+def is_unleveraged_fund(yf_ticker: str, company_name: str = "", is_etf_hint: bool = False) -> bool:
+    """Returns True for unleveraged ETFs, ETCs and money-market funds."""
+    sym = _sym(yf_ticker)
+    if not sym or is_leveraged_etf(sym, company_name):
+        return False
+    if is_etf_hint:
+        return True
+    return (
+        is_broad_index_etf(sym)
+        or is_money_market_fund(sym)
+        or is_gold_etc(sym)
+        or is_short_gilt_fund(sym)
+        or any(k in sym for k in SECTOR_ETF_KEYS)
+    )
+
+
+def _same_currency_unit(ccy_a: Optional[str], ccy_b: Optional[str]) -> bool:
+    """True when two currency labels share the same unit scale (never mixing GBp/GBX pence with GBP pounds)."""
+    a = str(ccy_a or "").strip()
+    b = str(ccy_b or "").strip()
+    if not a or not b:
+        return True
+    pence = {"GBX", "PENCE", "GBPX"}
+    a_pence = (a == "GBp") or (a.upper() in pence)
+    b_pence = (b == "GBp") or (b.upper() in pence)
+    if a_pence != b_pence:
+        return False
+    if a_pence and b_pence:
+        return True
+    return a.upper() == b.upper()
+
+
+def _snap_split_factor(ratio: float, min_factor: float = 1.85, tol: float = 0.025) -> Optional[float]:
+    """Given ratio = older_price / newer_anchor, returns the multiplier to bring older bars onto the newer scale
+    when ratio is within ±tol of a standard integer split/consolidation factor, otherwise None."""
+    if not math.isfinite(ratio) or ratio <= 0:
+        return None
+    if ratio >= min_factor:
+        for f in _CORPORATE_SPLIT_FACTORS:
+            if f >= min_factor and abs(ratio / float(f) - 1.0) <= tol:
+                return 1.0 / float(f)
+    elif ratio <= 1.0 / min_factor:
+        inv = 1.0 / ratio
+        for f in _CORPORATE_SPLIT_FACTORS:
+            if f >= min_factor and abs(inv / float(f) - 1.0) <= tol:
+                return float(f)
+    return None
+
+
+def normalize_price_series(
+    closes: pd.Series,
+    yf_ticker: str = "",
+    reference_price: Optional[float] = None,
+    avg_price: Optional[float] = None,
+    company_name: str = "",
+    is_etf_hint: bool = False,
+) -> Tuple[pd.Series, np.ndarray, np.ndarray, bool]:
+    """Normalizes unadjusted share splits/consolidations (e.g. CSH2.L 250:1 split before Yahoo back-adjusts bars)
+    and isolated LSE ~100x pence/pound bar glitches by walking backwards from `reference_price` (or latest close).
+
+    Returns (clean_closes, price_scales, volume_scales, split_suspect).
+    - Unleveraged funds never genuinely jump >=1.85x in 1 bar: persistent split plateaus and ~100x unit glitches
+      are rescaled automatically onto the latest scale.
+    - Single stocks are rescaled only when a persistent >=3.8x integer split factor is confirmed by the broker's
+      post-split `avg_price` (or isolated ~100x LSE pence/pound glitch); unconfirmed >=4x single-bar cliffs set
+      `split_suspect=True` so callers fail closed (`data_ok=False`) rather than firing false BUY/SELL signals.
+    """
+    vals = closes.to_numpy(dtype=float, copy=True)
+    n = len(vals)
+    price_scales = np.ones(n, dtype=float)
+    vol_scales = np.ones(n, dtype=float)
+    if n == 0:
+        return closes.copy(), price_scales, vol_scales, False
+
+    unlev_fund = is_unleveraged_fund(yf_ticker, company_name=company_name, is_etf_hint=is_etf_hint)
+    lev_etf = is_leveraged_etf(yf_ticker, company_name)
+    ref = _num(reference_price, 0.0)
+    anchor = float(ref) if (ref is not None and ref > 0) else float(vals[-1])
+    avg_p = _num(avg_price, 0.0)
+
+    running_scale = 1.0
+    vol_running_scale = 1.0
+    split_suspect = False
+    normal_hi = 1.85 if unlev_fund else 3.80
+    normal_lo = 1.0 / normal_hi
+
+    for i in range(n - 1, -1, -1):
+        v_raw = float(vals[i])
+        if not math.isfinite(v_raw) or v_raw <= 0 or not math.isfinite(anchor) or anchor <= 0:
+            price_scales[i] = running_scale
+            vol_scales[i] = vol_running_scale
+            continue
+
+        v_scaled = v_raw * running_scale
+        ratio = v_scaled / anchor
+        if normal_lo < ratio < normal_hi:
+            price_scales[i] = running_scale
+            vol_scales[i] = vol_running_scale
+            anchor = v_scaled
+            continue
+
+        # Distinguish an isolated 1-bar unit glitch (earlier bars still match `anchor`) from a persistent split plateau
+        prior_slice = vals[max(0, i - 5):i]
+        prior_valid = prior_slice[np.isfinite(prior_slice) & (prior_slice > 0)] * running_scale
+        prior_med = float(np.median(prior_valid)) if len(prior_valid) > 0 else None
+        is_transient_glitch = (
+            prior_med is not None
+            and anchor > 0
+            and 0.70 <= (prior_med / anchor) <= 1.43
+        )
+
+        if is_transient_glitch:
+            bar_mult: Optional[float] = None
+            if 80.0 <= ratio <= 125.0:
+                bar_mult = 0.01
+            elif 0.008 <= ratio <= 0.0125:
+                bar_mult = 100.0
+            elif unlev_fund:
+                bar_mult = anchor / v_scaled
+            if bar_mult is not None:
+                price_scales[i] = running_scale * bar_mult
+                vol_scales[i] = vol_running_scale
+                anchor = v_raw * price_scales[i]
+                continue
+
+        if unlev_fund:
+            snapped = _snap_split_factor(ratio, min_factor=1.85, tol=0.03)
+            step_mult = snapped if snapped is not None else (anchor / v_scaled)
+            running_scale *= step_mult
+            vol_running_scale /= step_mult
+            price_scales[i] = running_scale
+            vol_scales[i] = vol_running_scale
+            anchor = v_raw * running_scale
+            continue
+
+        if not lev_etf:
+            snapped = _snap_split_factor(ratio, min_factor=3.8, tol=0.025)
+            confirmed_by_broker = False
+            if snapped is not None and avg_p is not None and avg_p > 0 and anchor > 0:
+                if snapped < 1.0:
+                    confirmed_by_broker = (avg_p <= anchor * 2.5) and ((avg_p / v_scaled) <= snapped * 2.5)
+                else:
+                    confirmed_by_broker = avg_p >= v_scaled * (snapped * 0.4)
+            if confirmed_by_broker and snapped is not None:
+                running_scale *= snapped
+                vol_running_scale /= snapped
+                price_scales[i] = running_scale
+                vol_scales[i] = vol_running_scale
+                anchor = v_raw * running_scale
+                continue
+
+        if ratio >= 4.0 or ratio <= 0.25:
+            split_suspect = True
+        price_scales[i] = running_scale
+        vol_scales[i] = vol_running_scale
+        anchor = v_scaled
+
+    if np.allclose(price_scales, 1.0):
+        return closes.copy(), price_scales, vol_scales, split_suspect
+    clean = pd.Series(vals * price_scales, index=closes.index, name=closes.name)
+    return clean, price_scales, vol_scales, split_suspect
+
+
+def normalize_ohlc_dataframe(
+    df: pd.DataFrame,
+    yf_ticker: str = "",
+    reference_price: Optional[float] = None,
+    avg_price: Optional[float] = None,
+    company_name: str = "",
+    is_etf_hint: bool = False,
+) -> Tuple[pd.DataFrame, bool, bool]:
+    """Applies `normalize_price_series` consistently across OHLC and Volume columns of a daily DataFrame.
+    Returns (df_normalized, split_suspect, was_rescaled)."""
+    if df is None or df.empty or "Close" not in df.columns:
+        return df, False, False
+    _, p_scales, v_scales, split_suspect = normalize_price_series(
+        df["Close"],
+        yf_ticker=yf_ticker,
+        reference_price=reference_price,
+        avg_price=avg_price,
+        company_name=company_name,
+        is_etf_hint=is_etf_hint,
+    )
+    was_rescaled = not np.allclose(p_scales, 1.0)
+    if not was_rescaled:
+        return df, split_suspect, False
+    out = df.copy()
+    for col in ("Open", "High", "Low", "Close"):
+        if col in out.columns:
+            out[col] = out[col].to_numpy(dtype=float, copy=True) * p_scales
+    if "Volume" in out.columns and not np.allclose(v_scales, 1.0):
+        out["Volume"] = out["Volume"].to_numpy(dtype=float, copy=True) * v_scales
+    logger.info("Normalized unadjusted split/unit scale in daily bars for %s.", yf_ticker)
+    return out, split_suspect, True
+
+
 def classify_bucket(yf_ticker: str) -> str:
     """Household-mix bucket for an instrument: 'defensive' (gold / money-market / short gilts), 'core' (All-World and
     S&P 500 index funds) or 'satellite' (single stocks, Nasdaq-100, sector, thematic and leveraged funds)."""
@@ -176,12 +377,12 @@ def _allocation_cfg() -> Dict[str, Any]:
     raw = getattr(config, "ALLOCATION_CONFIG", None)
     raw = raw if isinstance(raw, dict) else {}
     raw_targets = raw.get("targets") if isinstance(raw.get("targets"), dict) else {}
-    defaults = {BUCKET_CORE: 0.65, BUCKET_SATELLITE: 0.20, BUCKET_DEFENSIVE: 0.15}
+    defaults = {BUCKET_CORE: 0.75, BUCKET_SATELLITE: 0.20, BUCKET_DEFENSIVE: 0.05}
     targets = {b: max(0.0, _num(raw_targets.get(b), d)) for b, d in defaults.items()}
     t_sum = sum(targets.values())
     targets = {b: v / t_sum for b, v in targets.items()} if t_sum > 0 else dict(defaults)
     raw_split = raw.get("defensive_split") if isinstance(raw.get("defensive_split"), dict) else {}
-    gold_share = min(1.0, max(0.0, _num(raw_split.get("gold"), 0.5)))
+    gold_share = min(1.0, max(0.0, _num(raw_split.get("gold"), 1.0)))
     cadence = str(raw.get("buy_cadence") or "monthly").strip().lower()
     return {
         "targets": targets,
@@ -990,7 +1191,15 @@ def evaluate_minervini_template(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-def evaluate_weekly_trend(ticker_obj: yf.Ticker, yf_ticker: str = "", currency: Optional[str] = None) -> Dict[str, Any]:
+def evaluate_weekly_trend(
+    ticker_obj: yf.Ticker,
+    yf_ticker: str = "",
+    currency: Optional[str] = None,
+    reference_price: Optional[float] = None,
+    avg_price: Optional[float] = None,
+    company_name: str = "",
+    is_etf_hint: bool = False,
+) -> Dict[str, Any]:
     """Evaluates Stan Weinstein's 30-week Moving Average rule AND computes empirical 5-Year
     Risk-Adjusted Return (CAGR, Volatility, Sortino, Sharpe, Calmar, Max Drawdown) & 2022 Crash Resilience.
 
@@ -1033,6 +1242,18 @@ def evaluate_weekly_trend(ticker_obj: yf.Ticker, yf_ticker: str = "", currency: 
         c_native = _tz_naive_index(c_native)
         c_native = c_native[c_native > 0]
         if len(c_native) < 20:
+            return default_5y
+
+        c_native, _, _, split_suspect_w = normalize_price_series(
+            c_native,
+            yf_ticker=yf_ticker,
+            reference_price=reference_price,
+            avg_price=avg_price,
+            company_name=company_name,
+            is_etf_hint=is_etf_hint,
+        )
+        if split_suspect_w:
+            logger.warning("Unconfirmed split/cliff detected in weekly bars for %s; failing closed.", yf_ticker)
             return default_5y
 
         # Convert into GBP BEFORE computing anything (USD ÷ GBPUSD, GBp ÷ 100, EUR/CHF/other × {CCY}GBP);
@@ -1611,6 +1832,30 @@ def analyze_position(
         yf_currency = _quote_currency(ticker_obj, fast_info)
         currency = yf_currency or _currency_hint()
 
+        # Resolve live quote & average cost BEFORE computing indicators so unadjusted splits/unit glitches in `df`
+        # are normalized onto the live scale first (e.g. CSH2.L 250:1 split before Yahoo back-adjusts historical bars)
+        pos_ccy = str((position_data or {}).get("currency") or "").strip()
+        same_unit_pos = _same_currency_unit(yf_currency, pos_ccy)
+        live_quote = None
+        if position_data and same_unit_pos and _num(position_data.get("currentPrice"), 0.0) > 0:
+            live_quote = _num(position_data.get("currentPrice"), 0.0)
+        elif _num(_fi_get(fast_info, "lastPrice"), 0.0) > 0:
+            live_quote = _num(_fi_get(fast_info, "lastPrice"), 0.0)
+        avg_for_norm = (
+            _num(position_data.get("averagePrice"), 0.0)
+            if (position_data and same_unit_pos)
+            else 0.0
+        )
+
+        df, split_suspect_d, was_split_normalized = normalize_ohlc_dataframe(
+            df,
+            yf_ticker=yf_ticker,
+            reference_price=live_quote,
+            avg_price=avg_for_norm,
+            company_name=company_name,
+            is_etf_hint=bool(research.get("is_etf", False)),
+        )
+
         close_series = df["Close"]
         ema_20 = calculate_ema(close_series, STRATEGY_CONFIG["ema_short"])
         ema_50 = calculate_ema(close_series, STRATEGY_CONFIG["ema_medium"])
@@ -1619,12 +1864,6 @@ def analyze_position(
         atr = calculate_atr(df, STRATEGY_CONFIG["atr_period"])
         macd_line, macd_sig, macd_hist = calculate_macd(close_series)
         latest_price = float(close_series.iloc[-1])
-        # Ensure latest price reflects the most up-to-date real-time quote available
-        live_quote = None
-        if position_data and _num(position_data.get("currentPrice"), 0.0) > 0:
-            live_quote = _num(position_data.get("currentPrice"), 0.0)
-        elif _num(_fi_get(fast_info, "lastPrice"), 0.0) > 0:
-            live_quote = _num(_fi_get(fast_info, "lastPrice"), 0.0)
         if live_quote is not None and live_quote > 0:
             latest_price = live_quote
 
@@ -1639,7 +1878,15 @@ def analyze_position(
         minervini = evaluate_minervini_template(df)
 
         # 1b. Stan Weinstein Multi-Timeframe Weekly Trend & 5-Year Empirical Risk/Crash Audit (GBP basis)
-        weekly_trend = evaluate_weekly_trend(ticker_obj, yf_ticker=yf_ticker, currency=(yf_currency or _currency_hint() or ""))
+        weekly_trend = evaluate_weekly_trend(
+            ticker_obj,
+            yf_ticker=yf_ticker,
+            currency=(yf_currency or _currency_hint() or ""),
+            reference_price=latest_price,
+            avg_price=avg_for_norm,
+            company_name=company_name,
+            is_etf_hint=bool(research.get("is_etf", False)),
+        )
         weekly_ok = bool(weekly_trend.get("data_ok", True))
         weekly_s2 = bool(weekly_trend.get("is_weekly_stage_2", False))
 
@@ -1710,6 +1957,8 @@ def analyze_position(
             or is_money_market_fund(yf_ticker) or is_leveraged
         )
         analyst_target = _num(research.get("target_mean_price"), None)
+        if was_split_normalized and analyst_target is not None and latest_price > 0 and analyst_target > latest_price * 3.0:
+            analyst_target = None  # ignore stale pre-split consensus target until data provider adjusts it
         target_eval = analyst_target if (analyst_target is not None and analyst_target > latest_price and not is_fund_like) else None
 
         if trailing_stop < latest_price:
@@ -1873,31 +2122,36 @@ def analyze_position(
         is_trimmed, days_trimmed = is_recently_trimmed(position_data, days_threshold=trim_lockout_days)
 
         # Risk-exit (SELL) conditions are evaluated BEFORE the trim lockout, anti-churn and core branches.
-        # Broad diversified index ETFs, money-market funds and physical gold ETCs are never exited.
+        # Broad diversified index ETFs, money-market funds, physical gold ETCs and short-gilt funds are never exited.
+        # Only hard balance-sheet insolvency risk triggers an automatic SELL; oversold technical breakdowns and soft
+        # score dips are surfaced as HOLD / review alerts (empirical backtests across survivorship-free ETFs and single
+        # stocks showed auto-selling oversold breakdowns below the 200d EMA systematically sold troughs and cut CAGR).
         is_exit_exempt = is_broad_index_etf(yf_ticker) or is_money_market_fund(yf_ticker) or is_gold or is_short_gilt_fund(yf_ticker)
         pct_vs_200 = ((latest_price / curr_ema_200) - 1.0) * 100.0 if curr_ema_200 > 0 else 0.0
         altman_z = _num(research.get("altman_z"), None)
         piotroski = _num(research.get("piotroski_score"), None)
         exit_reasons: List[str] = []
+        trend_review_reasons: List[str] = []
         if not is_exit_exempt:
-            # Trend-based exits need a CONFIRMED weekly downtrend. When weekly data is unavailable we never exit on
-            # daily data alone (a data glitch must not trigger an irreversible sale); tomorrow's run re-checks it.
-            # 1. Sustained macro structural breakdown below 200 EMA + Weekly Stage 4 downtrend
-            if weekly_ok and (not weekly_s2) and latest_price < curr_ema_200 * 0.96 and curr_rsi < 38.0:
-                exit_reasons.append(f"structural breakdown: price {pct_vs_200:+.1f}% vs the 200-day EMA, weekly close below the 30-week EMA, RSI {curr_rsi:.1f}")
-            # 2. Severe fundamental distress (insolvency risk)
+            # 1. Severe fundamental distress (balance-sheet insolvency risk) — non-discretionary automatic SELL
             if altman_z is not None and altman_z < 1.81 and piotroski is not None and piotroski <= 2:
                 exit_reasons.append(f"fundamental distress: Altman Z {altman_z:.2f} (below 1.81) with Piotroski {piotroski:.0f}/9")
-            # 3. Long-Term Thesis Break: Deteriorating fundamentals + broken weekly trend below 50d EMA
+            # 2. Sustained macro structural breakdown below 200 EMA + Weekly Stage 4 downtrend -> HOLD / review alert
+            if weekly_ok and (not weekly_s2) and latest_price < curr_ema_200 * 0.96 and curr_rsi < 38.0:
+                trend_review_reasons.append(
+                    f"structural breakdown: price {pct_vs_200:+.1f}% vs the 200-day EMA, weekly close below the 30-week EMA, RSI {curr_rsi:.1f}"
+                )
+            # 3. Long-Term Thesis Review: Deteriorating fundamentals + broken weekly trend below 50d EMA -> HOLD / review alert
             if weekly_ok and (not is_core) and (not weekly_s2) and latest_price < curr_ema_50 * 0.97 and fund_score < 48:
-                exit_reasons.append(f"thesis break: fundamental score {fund_score:.0f}/100 (below 48) with price {pct_above_50 * 100:+.1f}% vs the 50-day EMA and the weekly trend broken")
-            # 4. Hysteresis: a trend exit recommended in the last 14 days (main.py attaches it from the recommendation
-            #    ledger) stays in force while the weekly trend is still broken and the price is below the 200-day EMA.
-            #    It clears only on a real recovery, so a stock hovering at the -4% line cannot flip SELL/HOLD daily.
+                trend_review_reasons.append(
+                    f"thesis break: fundamental score {fund_score:.0f}/100 (below 48) with price {pct_above_50 * 100:+.1f}% vs the 50-day EMA and the weekly trend broken"
+                )
+            # 4. Hysteresis for review alerts: a recent trend breakdown stays flagged for review while the weekly trend
+            #    remains broken and price is still below the 200-day EMA, clearing only on a real recovery.
             prior_exit = (position_data or {}).get("recent_trend_exit") or {}
-            if (not exit_reasons) and prior_exit and weekly_ok and (not weekly_s2) and latest_price < curr_ema_200:
-                exit_reasons.append(
-                    f"exit still in force: {prior_exit.get('rule', 'trend exit')} flagged on {prior_exit.get('date', 'a recent run')}, "
+            if (not trend_review_reasons) and prior_exit and weekly_ok and (not weekly_s2) and latest_price < curr_ema_200:
+                trend_review_reasons.append(
+                    f"review still in force: {prior_exit.get('rule', 'trend breakdown')} flagged on {prior_exit.get('date', 'a recent run')}, "
                     f"price still {pct_vs_200:+.1f}% vs the 200-day EMA with the weekly trend broken"
                 )
 
@@ -2015,12 +2269,18 @@ def analyze_position(
             app_instruction = "No new buys ➔ Cap enforced by rebalancing plan"
 
         elif (not is_core) and curr_rsi > 82.0 and pct_above_50 > 0.25 and gain_pct >= 0.35:
-            signal = "🟠 TRIM (PARABOLIC BLOW-OFF)"
-            badge_color = "#f59e0b"
-            action_short = "TRIM"
-            reason = f"Extreme parabolic blow-off (RSI {curr_rsi:.1f}, +{pct_above_50*100:.1f}% vs 50 EMA, +{gain_pct*100:.1f}% gain)."
-            plain_english_why = f"{company_name} has surged +{gain_pct*100:.1f}% into an extreme parabolic spike (>25% above 50 EMA). Banking partial profits if position is oversized."
-            app_instruction = f"Search '{search_sym}' in Trading 212 ➔ Tap Sell ➔ Sell 1/4 of shares to lock in gains"
+            signal = "🟢 HOLD (PARABOLIC LEADER — LET WINNER RUN)"
+            badge_color = "#10b981"
+            action_short = "HOLD"
+            reason = (
+                f"Strong momentum leader (RSI {curr_rsi:.1f}, +{pct_above_50*100:.1f}% vs 50 EMA, +{gain_pct*100:.1f}% gain). "
+                f"Discretionary RSI trims are disabled so winners compound freely up to the 15% household cap."
+            )
+            plain_english_why = (
+                f"{company_name} has surged +{gain_pct*100:.1f}% in a strong momentum run. Let your winner compound — "
+                f"positions are trimmed only when they breach the 15% household concentration cap."
+            )
+            app_instruction = "No action needed ➔ Let winner compound (trimmed only above 15% household cap)"
 
         elif (
             (
@@ -2103,7 +2363,7 @@ def analyze_position(
         if val_gbp is None or np.isnan(val_gbp):
             val_gbp = 0.0
 
-        price_data_ok = weekly_ok  # daily bars were already validated above; weekly 5Y data must also be present
+        price_data_ok = bool(weekly_ok and not split_suspect_d)  # daily & weekly 5Y bars must be clean and split-consistent
         data_ok = bool(price_data_ok and research_data_ok)
 
         # Data-quality & policy BUY gate: never BUY (new or add) on defaulted data, invalid valuation or 3x leverage
@@ -2114,7 +2374,7 @@ def analyze_position(
             elif not data_ok:
                 missing = []
                 if not price_data_ok:
-                    missing.append("weekly 5Y price history")
+                    missing.append("clean/split-consistent 5Y price history" if split_suspect_d else "weekly 5Y price history")
                 if not research_data_ok:
                     missing.append("fundamental research")
                 no_buy_reason = "data incomplete (" + ", ".join(missing) + ")"
@@ -2129,8 +2389,26 @@ def analyze_position(
                 plain_english_why = f"{company_name} showed a buy setup, but it was blocked because {no_buy_reason}. No order today."
                 app_instruction = "No action needed ➔ Re-evaluate when data is complete"
 
-        # Reference-stop breach: surfaced for review, never an automatic SELL
-        if stop_breached and action_short not in ("SELL", "TRIM") and not is_earmarked_pos:
+        # Trend breakdown & reference-stop breach: surfaced for human review, never an automatic SELL
+        if trend_review_reasons and p_qty > 0 and action_short not in ("SELL", "TRIM") and not is_earmarked_pos:
+            prior_signal = signal
+            signal = TREND_REVIEW_SIGNAL
+            badge_color = "#f59e0b"
+            action_short = "HOLD"
+            stop_extra = (
+                f" Also below reference stop {trailing_stop:,.2f} ({stop_dist_pct:+.1f}%)."
+                if stop_breached else ""
+            )
+            reason = (
+                "Trend breakdown review: " + "; ".join(trend_review_reasons) + f".{stop_extra} "
+                f"Review the long-term thesis; the engine never auto-sells oversold technical breakdowns. Prior signal: {prior_signal}."
+            )
+            plain_english_why = (
+                f"{company_name}: " + "; ".join(trend_review_reasons) + ". "
+                "Surfaced for human thesis review — auto-selling oversold breakdowns historically hurt long-term compounding, so no automatic sell order is generated."
+            )
+            app_instruction = "Review long-term thesis ➔ No automatic order"
+        elif stop_breached and action_short not in ("SELL", "TRIM") and not is_earmarked_pos:
             prior_signal = signal
             signal = STOP_REVIEW_SIGNAL
             badge_color = "#f59e0b"
@@ -2666,7 +2944,7 @@ def compute_portfolio_5y_risk_profile(
     crash_delta_gbp = round(post_metrics["stress_2022_gbp"] - curr_metrics["stress_2022_gbp"], 0)
     crash_saved_gbp = max(0.0, crash_delta_gbp)
 
-    shield_target_pct = _rebalance_cfg_frac("target_crash_shield_pct", 0.15) * 100.0
+    shield_target_pct = _rebalance_cfg_frac("target_crash_shield_pct", 0.05) * 100.0
     lev_cap_pct = _rebalance_cfg_frac("max_leveraged_etf_pct", 0.08) * 100.0
     if post_metrics["shield_pct"] >= shield_target_pct and post_metrics["lev_3x_pct"] <= lev_cap_pct:
         shield_status = "🟢 ALL-WEATHER CRASH SHIELD ACTIVE"
@@ -3313,7 +3591,7 @@ def build_rebalancing_plan(
     pos_cap = _rebalance_cfg_frac("max_position_pct", 0.15)
     lev_cap = _rebalance_cfg_frac("max_leveraged_etf_pct", 0.08)
     cluster_cap_pct = _rebalance_cfg_frac("max_cluster_pct", 0.24) * 100.0
-    shield_target_pct = _rebalance_cfg_frac("target_crash_shield_pct", 0.15) * 100.0
+    shield_target_pct = _rebalance_cfg_frac("target_crash_shield_pct", 0.05) * 100.0
     max_new_ideas = max(0, int(_rebalance_cfg_frac("max_new_ideas_to_buy", 2)))
     earmarked_set = _earmarked_tickers()
 
@@ -3410,6 +3688,52 @@ def build_rebalancing_plan(
             "badge_bg": badge_bg
         })
 
+    # Resolve household scope & shared ledger upfront so both non-discretionary cap checks (step 2) and new-money
+    # allocation (step 3c) treat both ISAs + vested outside holdings as one portfolio when `global_context` is supplied.
+    hh_ctx = global_context.get("household_mix") if isinstance(global_context, dict) else None
+    if isinstance(hh_ctx, dict) and isinstance(hh_ctx.get("values_gbp"), dict) and _num(hh_ctx.get("basis_gbp"), 0.0) > 0:
+        household = hh_ctx
+        household_scope = "household"
+        big_tech_ctx = global_context.get("big_tech") if isinstance(global_context.get("big_tech"), dict) else None
+    else:
+        local_rows = [
+            {"account": acc_name, "ticker": p.get("ticker", ""), "value_gbp": p.get("value_gbp")}
+            for p in analyses if not p.get("is_earmarked")
+        ]
+        household = compute_household_mix(local_rows, available_cash_gbp + blocked_cash_gbp, outside_rows)
+        household_scope = "account"
+        big_tech_ctx = compute_big_tech_exposure(local_rows, outside_rows, household["basis_gbp"])
+    hh_basis = max(0.0, _num(household.get("basis_gbp"), 0.0))
+    if not isinstance(big_tech_ctx, dict):
+        big_tech_ctx = {"basis_gbp": hh_basis, "exposure_gbp": 0.0, "exposure_pct": 0.0}
+    ledger = household.get("ledger")
+    if not isinstance(ledger, dict):
+        ledger = {"core": 0.0, "satellite": 0.0, "gold": 0.0, "short_gilts": 0.0, "big_tech_gbp": 0.0}
+        household["ledger"] = ledger
+    cap_trimmed_ledger = ledger.setdefault("cap_trimmed_by_ticker", {})
+    hh_outside_rows = (
+        global_context.get("outside_holdings")
+        if household_scope == "household" and isinstance(global_context.get("outside_holdings"), list)
+        else outside_rows
+    )
+
+    def _household_value_of(t: str) -> float:
+        v = 0.0
+        if household_scope == "household" and isinstance(global_context.get("holdings"), dict):
+            for k, item in global_context["holdings"].items():
+                if isinstance(item, dict) and not item.get("is_earmarked") and tickers_match(k, t):
+                    v += max(0.0, _num(item.get("total_value_gbp"), 0.0))
+        else:
+            v += sum(
+                max(0.0, _num(p.get("value_gbp"), 0.0)) for p in analyses
+                if not p.get("is_earmarked") and tickers_match(p.get("ticker", ""), t)
+            )
+        v += sum(
+            max(0.0, _num(h.get("vested_gbp"), 0.0)) for h in (hh_outside_rows or [])
+            if isinstance(h, dict) and tickers_match(h.get("ticker", ""), t)
+        )
+        return v
+
     # 2. Identify Sells and Trims (Separating Already-Pending Orders from New Actions)
     sell_orders = []
     pending_sell_orders = []
@@ -3426,11 +3750,32 @@ def build_rebalancing_plan(
         name = pos.get("name", ticker)
         is_lev_item = is_leveraged_etf(ticker)
 
-        # Non-discretionary cap checks on the investable basis (leverage cap for 3x ETFs; single-name cap for
-        # single stocks and sector ETFs; broad index ETFs / gold / money-market exempt unless configured)
+        # Non-discretionary cap checks: evaluated across household wealth when `global_context` is supplied (falling
+        # back to single-account investable basis in standalone calls). Earlier accounts' cap trims/pending sells are
+        # subtracted via `cap_trimmed_ledger` so two accounts holding the same ticker never double-trim the excess.
         o_t = 0.0 if pos["is_earmarked"] else _outside_vested_for(ticker)
-        name_basis = investable_total_gbp + o_t
-        w_frac = ((val_gbp + o_t) / name_basis) if name_basis > 0 else 0.0
+        if household_scope == "household" and hh_basis > 0 and not pos["is_earmarked"]:
+            prior_cap_trimmed = max(
+                0.0,
+                sum(
+                    _num(v_trim, 0.0)
+                    for k_trim, v_trim in cap_trimmed_ledger.items()
+                    if tickers_match(k_trim, ticker)
+                ),
+            )
+            hh_val_t = max(0.0, _household_value_of(ticker) - prior_cap_trimmed)
+            name_basis = hh_basis
+            w_frac = (hh_val_t / name_basis) if name_basis > 0 else 0.0
+            hh_o_t = sum(
+                max(0.0, _num(h.get("vested_gbp"), 0.0))
+                for h in (hh_outside_rows or [])
+                if isinstance(h, dict) and tickers_match(h.get("ticker", ""), ticker)
+            )
+        else:
+            hh_val_t = val_gbp + o_t
+            name_basis = investable_total_gbp + o_t
+            w_frac = (hh_val_t / name_basis) if name_basis > 0 else 0.0
+            hh_o_t = o_t
         cap_frac: Optional[float] = None
         cap_kind: Optional[str] = None
         if not pos["is_earmarked"] and qty > 0:
@@ -3439,7 +3784,7 @@ def build_rebalancing_plan(
             elif _position_cap_applies(ticker):
                 cap_frac, cap_kind = pos_cap, "position"
         over_cap = cap_frac is not None and w_frac > cap_frac + 1e-9
-        cap_excess_gbp = min(val_gbp, max(0.0, (val_gbp + o_t) - cap_frac * name_basis)) if (over_cap and cap_frac is not None) else 0.0
+        cap_excess_gbp = min(val_gbp, max(0.0, hh_val_t - cap_frac * name_basis)) if (over_cap and cap_frac is not None) else 0.0
         breach = None
         if over_cap and cap_frac is not None:
             breach = {
@@ -3502,6 +3847,8 @@ def build_rebalancing_plan(
             })
             if is_immediate_fill:
                 cash_from_sells += pending_val_gbp
+                if _sym(ticker):
+                    cap_trimmed_ledger[_sym(ticker)] = _num(cap_trimmed_ledger.get(_sym(ticker)), 0.0) + pending_val_gbp
             if breach is not None:
                 breach["actioned"] = True
                 breach["pending_order"] = True
@@ -3518,7 +3865,8 @@ def build_rebalancing_plan(
             f"Measured 5Y risk: {max_dd_txt:+.1f}% max drawdown, {crash_txt:+.1f}% in 2022, Sortino {sort_txt:.2f}."
             if (max_dd_txt is not None and crash_txt is not None and sort_txt is not None) else ""
         )
-        outside_txt = f" (incl. £{o_t:,.0f} held outside Trading 212)" if o_t > 0 else ""
+        outside_txt = f" (incl. £{hh_o_t:,.0f} held outside Trading 212)" if hh_o_t > 0 else ""
+        basis_label = "household wealth" if household_scope == "household" else "the investable portfolio"
 
         full_exit_kind: Optional[str] = None
         if is_lev_item and lev_cap <= 0.0:
@@ -3542,8 +3890,10 @@ def build_rebalancing_plan(
             else:
                 cap_label = "LEVERAGE" if cap_kind == "leverage" else "POSITION"
                 sell_action = f"SELL ({cap_label} CAP — {cap_frac * 100:.0f}%)"
-                sell_why = f"{name} is {w_frac * 100:.1f}% of the investable portfolio{outside_txt}, above the {cap_frac * 100:.0f}% cap. Selling the position to comply with the cap."
+                sell_why = f"{name} is {w_frac * 100:.1f}% of {basis_label}{outside_txt}, above the {cap_frac * 100:.0f}% cap. Selling the position to comply with the cap."
             cash_from_sells += proceeds
+            if _sym(ticker):
+                cap_trimmed_ledger[_sym(ticker)] = _num(cap_trimmed_ledger.get(_sym(ticker)), 0.0) + proceeds
             order = {
                 "ticker": ticker,
                 "search_symbol": sym,
@@ -3602,7 +3952,7 @@ def build_rebalancing_plan(
             else:
                 trim_action = f"TRIM (POSITION CAP — {cap_frac * 100:.0f}%)"
                 trim_why = (
-                    f"{name} is {w_frac * 100:.1f}% of the investable portfolio{outside_txt}, above the {cap_frac * 100:.0f}% single-name cap. "
+                    f"{name} is {w_frac * 100:.1f}% of {basis_label}{outside_txt}, above the {cap_frac * 100:.0f}% single-name cap. "
                     f"Trimming {_fmt_shares(trim_qty)} shares brings it back to the cap (cap enforcement ignores trim lockouts)."
                 )
         else:
@@ -3612,6 +3962,8 @@ def build_rebalancing_plan(
 
         proceeds = trim_qty * price_gbp
         cash_from_sells += proceeds
+        if _sym(ticker):
+            cap_trimmed_ledger[_sym(ticker)] = _num(cap_trimmed_ledger.get(_sym(ticker)), 0.0) + proceeds
         order = {
             "ticker": ticker,
             "search_symbol": sym,
@@ -3711,27 +4063,7 @@ def build_rebalancing_plan(
         net_budget_to_deploy = 0.0
 
     # 3c. Household strategic allocation of today's new money (core / satellite / defensive)
-    hh_ctx = global_context.get("household_mix") if isinstance(global_context, dict) else None
-    if isinstance(hh_ctx, dict) and isinstance(hh_ctx.get("values_gbp"), dict) and _num(hh_ctx.get("basis_gbp"), 0.0) > 0:
-        household = hh_ctx
-        household_scope = "household"
-        big_tech_ctx = global_context.get("big_tech") if isinstance(global_context.get("big_tech"), dict) else None
-    else:
-        # No household view (e.g. a single-account call): this account plus its outside holdings is the household
-        local_rows = [
-            {"account": acc_name, "ticker": p.get("ticker", ""), "value_gbp": p.get("value_gbp")}
-            for p in analyses if not p.get("is_earmarked")
-        ]
-        household = compute_household_mix(local_rows, available_cash_gbp + blocked_cash_gbp, outside_rows)
-        household_scope = "account"
-        big_tech_ctx = compute_big_tech_exposure(local_rows, outside_rows, household["basis_gbp"])
-    hh_basis = max(0.0, _num(household.get("basis_gbp"), 0.0))
-    if not isinstance(big_tech_ctx, dict):
-        big_tech_ctx = {"basis_gbp": hh_basis, "exposure_gbp": 0.0, "exposure_pct": 0.0}
-    ledger = household.get("ledger")
-    if not isinstance(ledger, dict):
-        ledger = {"core": 0.0, "satellite": 0.0, "gold": 0.0, "short_gilts": 0.0, "big_tech_gbp": 0.0}
-        household["ledger"] = ledger
+    # (`household`, `household_scope`, `hh_basis`, `big_tech_ctx`, `ledger` and `_household_value_of` were resolved above)
     led = {k: max(0.0, _num(ledger.get(k), 0.0)) for k in ("core", "satellite", "gold", "short_gilts")}
     hh_vals = household.get("values_gbp") or {}
     hh_def = household.get("defensive_detail_gbp") or {}
@@ -3773,28 +4105,6 @@ def build_rebalancing_plan(
 
     # Household single-stock cap for satellite buys (existing positions are never trimmed by it)
     sat_single_cap = alloc_cfg["satellite_max_single_pct"]
-    hh_outside_rows = (
-        global_context.get("outside_holdings")
-        if household_scope == "household" and isinstance(global_context.get("outside_holdings"), list)
-        else outside_rows
-    )
-
-    def _household_value_of(t: str) -> float:
-        v = 0.0
-        if household_scope == "household" and isinstance(global_context.get("holdings"), dict):
-            for k, item in global_context["holdings"].items():
-                if isinstance(item, dict) and not item.get("is_earmarked") and tickers_match(k, t):
-                    v += max(0.0, _num(item.get("total_value_gbp"), 0.0))
-        else:
-            v += sum(
-                max(0.0, _num(p.get("value_gbp"), 0.0)) for p in analyses
-                if not p.get("is_earmarked") and tickers_match(p.get("ticker", ""), t)
-            )
-        v += sum(
-            max(0.0, _num(h.get("vested_gbp"), 0.0)) for h in (hh_outside_rows or [])
-            if isinstance(h, dict) and tickers_match(h.get("ticker", ""), t)
-        )
-        return v
 
     def _satellite_single_room(t: str) -> float:
         if classify_bucket(t) != BUCKET_SATELLITE or not _position_cap_applies(t) or any(k in _sym(t) for k in SECTOR_ETF_KEYS):
@@ -3876,7 +4186,8 @@ def build_rebalancing_plan(
             logger.info("Skipping %s as buy candidate: at/above the %.0f%% household single-stock cap.", t, sat_single_cap * 100.0)
             continue
         # 3b. Configured single-name cap (max_position_pct) for capped instruments
-        if _position_cap_applies(t) and w_local >= pos_cap * 100.0:
+        eff_cap_w = w_global if household_scope == "household" else w_local
+        if _position_cap_applies(t) and eff_cap_w >= pos_cap * 100.0:
             logger.info("Skipping %s as buy candidate: at/above the %.0f%% single-name cap.", t, pos_cap * 100.0)
             continue
         # 3c. US big-tech cap (household, fund look-through)
@@ -4218,9 +4529,17 @@ def build_rebalancing_plan(
         for candidate in selected_candidates:
             c_ticker = candidate["ticker"]
             if _position_cap_applies(c_ticker):
-                existing_val = sum(max(0.0, _num(p.get("value_gbp"), 0.0)) for p in analyses if p.get("ticker") == c_ticker)
-                o_c = _outside_vested_for(c_ticker)
-                room_by_ticker[c_ticker] = max(0.0, pos_cap * (investable_total_gbp + o_c) - existing_val - o_c)
+                if household_scope == "household" and hh_basis > 0:
+                    already_bought_t = sum(
+                        _num(v_b, 0.0)
+                        for k_b, v_b in (ledger.get("by_ticker_bought") or {}).items()
+                        if tickers_match(k_b, c_ticker)
+                    )
+                    room_by_ticker[c_ticker] = max(0.0, pos_cap * hh_basis - _household_value_of(c_ticker) - already_bought_t)
+                else:
+                    existing_val = sum(max(0.0, _num(p.get("value_gbp"), 0.0)) for p in analyses if p.get("ticker") == c_ticker)
+                    o_c = _outside_vested_for(c_ticker)
+                    room_by_ticker[c_ticker] = max(0.0, pos_cap * (investable_total_gbp + o_c) - existing_val - o_c)
             else:
                 room_by_ticker[c_ticker] = float("inf")
             room_by_ticker[c_ticker] = min(room_by_ticker[c_ticker], _satellite_single_room(c_ticker))
@@ -4470,11 +4789,11 @@ def build_rebalancing_plan(
         gilt_gap = max(0.0, (1.0 - gold_share) * def_target_gbp - hh_cashlike_v)
         gold_amt = def_budget * (gold_gap / (gold_gap + gilt_gap) if gold_gap + gilt_gap > 0.01 else gold_share)
         gilt_amt = def_budget - gold_amt
-        # Route everything to the fund that can actually be bought today
+        # Route everything to the fund that can actually be bought today (only when that sleeve half has a >0% target share)
         gold_ok, gilt_ok = _bucket_block_reason(gold_t) is None, _bucket_block_reason(gilt_t) is None
-        if not gold_ok and gilt_ok:
+        if not gold_ok and gilt_ok and (1.0 - gold_share) > 1e-6:
             gold_amt, gilt_amt = 0.0, def_budget
-        elif not gilt_ok and gold_ok:
+        elif not gilt_ok and gold_ok and gold_share > 1e-6:
             gold_amt, gilt_amt = def_budget, 0.0
         # No token orders: a slice below the minimum joins the other one
         if 0.0 < gold_amt < min_ord_gbp and gilt_amt >= gold_amt:
@@ -4507,6 +4826,10 @@ def build_rebalancing_plan(
             key = "gold" if is_gold_etc(o.get("ticker", "")) else "short_gilts"
             ledger[key] = _num(ledger.get(key), 0.0) + amt
         ledger["big_tech_gbp"] = _num(ledger.get("big_tech_gbp"), 0.0) + big_tech_weight(o.get("ticker", "")) * amt
+        bought_by_t = ledger.setdefault("by_ticker_bought", {})
+        t_key = _sym(o.get("ticker", ""))
+        if t_key:
+            bought_by_t[t_key] = _num(bought_by_t.get(t_key), 0.0) + amt
 
     alloc_notes: List[str] = []
     if deployable_before_cadence > 0 and not data_degraded_reason:

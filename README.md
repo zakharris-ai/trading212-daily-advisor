@@ -186,10 +186,10 @@ All optional settings are off by default. Set them in `.env` for local runs, or 
 | `EXCLUDED_TICKERS` | none | Tickers the engine must never recommend buying (e.g. `TSLA,COIN`). |
 
 Fixed limits in `config.py` (`REBALANCE_CONFIG`):
-- `max_position_pct`: 15% per holding. Not applied to broad index ETFs unless `cap_applies_to_broad_etfs` is `True`.
+- `max_position_pct`: 15% per holding (evaluated across combined household wealth when household context is supplied). Not applied to broad index ETFs unless `cap_applies_to_broad_etfs` is `True`.
 - `max_cluster_pct`: 24% per correlated macro cluster.
 - `max_new_ideas_to_buy`: 2.
-- `target_crash_shield_pct`: 15%. Crash protection counts **only real defensive assets**: cash, money-market funds, physical gold and short-dated gilts. Low-beta stocks and equity index funds do not count.
+- `target_crash_shield_pct`: 5% (env `TARGET_CRASH_SHIELD_PCT`). Crash protection counts **only real defensive assets**: cash, money-market funds, physical gold and short-dated gilts. Low-beta stocks and equity index funds do not count.
 
 `MODEL_VERSION` is stamped on every snapshot and ledger record; bump it whenever you change the scoring rules.
 
@@ -198,11 +198,11 @@ Fixed limits in `config.py` (`REBALANCE_CONFIG`):
 - **Satellites**: single stocks, Nasdaq-100, sector and thematic funds.
 - **Defensive**: cash, money-market funds, gold and short gilts.
 
-The default target is **65 / 20 / 15**. New money goes to whichever bucket is furthest below target; buckets more than ±5pp below target go first. Nothing profitable is ever sold to rebalance.
+The default target is **75 / 20 / 5** (Gold-only new defensive buys by default via `DEFENSIVE_GOLD_SHARE=1.0`). New money goes to whichever bucket is furthest below target; buckets more than ±5pp below target go first. Nothing profitable is ever sold to rebalance.
 
 How new money is invested:
 - **Core money** buys `VWRP.L`.
-- **Defensive money** buys `SGLN.L` (gold) and/or `IGLS.L` (UK 0–5yr gilts).
+- **Defensive money** buys `SGLN.L` (accumulating physical gold; or a split with `IGLS.L` short gilts if `DEFENSIVE_GOLD_SHARE` is set below `1.0`).
 - **Satellite money** goes through the stock-selection engine, subject to:
   - a 5% household cap per stock for new buys;
   - a 30% cap on US big tech (AAPL, MSFT, GOOGL/GOOG, AMZN, META, NVDA, AVGO, TSLA) as a share of household wealth. This counts fund look-through, using approximate weights reviewed yearly, plus outside holdings.
@@ -214,9 +214,10 @@ Optional env overrides (all parsed safely):
 
 | Variable | Default |
 |---|---|
-| `TARGET_CORE_PCT` | `0.65` |
+| `TARGET_CORE_PCT` | `0.75` |
 | `TARGET_SATELLITE_PCT` | `0.20` |
-| `TARGET_DEFENSIVE_PCT` | `0.15` |
+| `TARGET_DEFENSIVE_PCT` | `0.05` |
+| `DEFENSIVE_GOLD_SHARE` | `1.0` |
 | `ALLOCATION_BAND_PP` | `5` |
 | `SATELLITE_MAX_SINGLE_PCT` | `0.05` |
 | `BIG_TECH_CAP_PCT` | `0.30` |
@@ -285,7 +286,7 @@ Past results on one historical path are not a forecast.
 
 1. **30-Second Daily TL;DR**:
    Every run starts with a clear checklist:
-   - 🔴 **Sells / Profit Trims to Execute**: Identifies holdings with a confirmed structural breakdown (weekly downtrend plus failed trend template), fundamental deterioration, or that have become dangerously overextended (`>18%` above 50-day EMA with RSI `>75`), and trims positions back to the single-position and leverage caps (cluster-cap breaches are flagged and block new buys in that cluster).
+   - 🔴 **Sells / Cap Trims to Execute**: Identifies holdings with severe balance-sheet distress (`Altman Z < 1.81` with `Piotroski <= 2`) or leverage-policy breaches, and trims positions back to the 15% household single-position and leverage caps (oversold technical breakdowns are surfaced as HOLD / review alerts rather than auto-sold; cluster-cap breaches block new buys in that cluster).
    - 🟢 **High-Conviction Buys**: Ranks your existing winners and a curated 5-year high-Sortino watchlist by institutional quality, recommending exact £ GBP allocation sizes only when you have surplus cash above your reserve floor.
    - 🟡 **Hold & Compound**: Tells you which positions are in healthy Stage 2 uptrends so you can sit back and let them compound.
 2. **Forensic Balance-Sheet Audit (Quality Checklist 0–9 & Altman Z-Score)**:

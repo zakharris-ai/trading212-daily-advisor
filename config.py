@@ -392,9 +392,9 @@ REBALANCE_CONFIG = {
     "max_position_pct": 0.15,       # Maximum 15% of total portfolio in one asset
     "min_order_gbp": 300.0,         # Minimum tranche size in GBP
     "max_new_ideas_to_buy": 2,      # Limit concurrent new entries to keep portfolio focused
-    # Target >=15% in real defensive assets only: cash, money-market funds, physical gold and short-dated gilts
-    # (low-beta stocks and equity index funds do not count: they are shares and fall with the market in a crash)
-    "target_crash_shield_pct": 0.15,
+    # Target >=5% in real defensive assets only: cash, money-market funds, physical gold and short-dated gilts
+    # (aligned with the 5% household defensive target; low-beta stocks and equity index funds do not count)
+    "target_crash_shield_pct": max(0.0, min(1.0, _safe_float(os.getenv("TARGET_CRASH_SHIELD_PCT"), 0.05))),
     # Maximum cap on 3x daily leveraged instruments (0.0 = exit them entirely; see LEVERAGED-ETF POLICY above)
     "max_leveraged_etf_pct": _parse_fraction(
         os.getenv("MAX_LEVERAGED_ETF_PCT"), _DEFAULT_MAX_LEVERAGED_ETF_PCT, "MAX_LEVERAGED_ETF_PCT"
@@ -409,9 +409,9 @@ def _build_allocation_config() -> Dict[str, Any]:
 
     The household = all configured Trading 212 accounts + vested outside holdings, treated as one portfolio.
     New money is steered to the bucket furthest below target; profitable holdings are never sold to rebalance.
-    Targets that do not sum to 1.0 are normalised (with a warning); an all-zero/invalid set falls back to 65/20/15.
+    Targets that do not sum to 1.0 are normalised (with a warning); an all-zero/invalid set falls back to 75/20/5.
     """
-    defaults = {"core": 0.65, "satellite": 0.20, "defensive": 0.15}
+    defaults = {"core": 0.75, "satellite": 0.20, "defensive": 0.05}
     targets = {
         "core": _safe_float(os.getenv("TARGET_CORE_PCT"), defaults["core"]),
         "satellite": _safe_float(os.getenv("TARGET_SATELLITE_PCT"), defaults["satellite"]),
@@ -420,7 +420,7 @@ def _build_allocation_config() -> Dict[str, Any]:
     targets = {k: max(0.0, v) for k, v in targets.items()}
     total = sum(targets.values())
     if total <= 0:
-        logger.warning("Household allocation targets are invalid (sum %.3f); using the 65/20/15 default.", total)
+        logger.warning("Household allocation targets are invalid (sum %.3f); using the 75/20/5 default.", total)
         targets = dict(defaults)
     elif abs(total - 1.0) > 1e-6:
         logger.warning("Household allocation targets sum to %.3f, not 1.0; normalising them.", total)
@@ -431,6 +431,8 @@ def _build_allocation_config() -> Dict[str, Any]:
         logger.warning("BUY_CADENCE=%r is not 'monthly' or 'daily'; using 'monthly'.", cadence)
         cadence = "monthly"
 
+    gold_share = min(1.0, max(0.0, _safe_float(os.getenv("DEFENSIVE_GOLD_SHARE"), 1.0)))
+
     return {
         "targets": targets,
         # Rebalancing band in percentage points: a bucket further than this from target is "out of band" and
@@ -438,8 +440,9 @@ def _build_allocation_config() -> Dict[str, Any]:
         "band_pp": max(0.0, _safe_float(os.getenv("ALLOCATION_BAND_PP"), 5.0)),
         # Max household weight for any single satellite stock (new buys only; existing positions are not trimmed by it)
         "satellite_max_single_pct": max(0.0, _safe_float(os.getenv("SATELLITE_MAX_SINGLE_PCT"), 0.05)),
-        # Defensive sleeve split: cash and money-market funds count towards the short-gilt/cash half
-        "defensive_split": {"gold": 0.5, "short_gilts": 0.5},
+        # Defensive sleeve split: default 100% physical gold (SGLN.L, accumulating) / 0% new short gilts (env DEFENSIVE_GOLD_SHARE);
+        # existing cash, money-market and short-gilt holdings still count towards the defensive bucket
+        "defensive_split": {"gold": round(gold_share, 6), "short_gilts": round(1.0 - gold_share, 6)},
         # GBP-quoted lines for new money (no 0.15% FX fee)
         "core_buy_ticker": (os.getenv("CORE_BUY_TICKER") or "VWRP.L").strip().upper(),
         "gold_buy_ticker": (os.getenv("GOLD_BUY_TICKER") or "SGLN.L").strip().upper(),
@@ -469,7 +472,7 @@ BIG_TECH_LOOKTHROUGH: Dict[str, float] = {
 }
 
 # --- MODEL VERSION (stamped on every recommendation-ledger record and snapshot) ---
-MODEL_VERSION = "2026.10.19-household-allocation"
+MODEL_VERSION = "2026.10.27-max-compounding"
 
 # --- OPTIONAL EXCLUDED TICKERS ---
 # Set EXCLUDED_TICKERS="TSLA,COIN" in .env if you want the engine to never buy specific tickers.

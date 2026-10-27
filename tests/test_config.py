@@ -244,9 +244,9 @@ class OutsideHoldingsTests(unittest.TestCase):
 
 class AllocationConfigTests(unittest.TestCase):
     # Shape / parsing checks only (these tests gate the daily email in CI, so never assert personal values).
-    ENV_KEYS = ("TARGET_CORE_PCT", "TARGET_SATELLITE_PCT", "TARGET_DEFENSIVE_PCT", "BUY_CADENCE", "BIG_TECH_CAP_PCT",
-                "ALLOCATION_BAND_PP", "SATELLITE_MAX_SINGLE_PCT", "OFF_CYCLE_MIN_DEPLOY_GBP", "CORE_BUY_TICKER",
-                "GOLD_BUY_TICKER", "SHORT_GILT_BUY_TICKER")
+    ENV_KEYS = ("TARGET_CORE_PCT", "TARGET_SATELLITE_PCT", "TARGET_DEFENSIVE_PCT", "DEFENSIVE_GOLD_SHARE",
+                "BUY_CADENCE", "BIG_TECH_CAP_PCT", "ALLOCATION_BAND_PP", "SATELLITE_MAX_SINGLE_PCT",
+                "OFF_CYCLE_MIN_DEPLOY_GBP", "CORE_BUY_TICKER", "GOLD_BUY_TICKER", "SHORT_GILT_BUY_TICKER")
 
     def _build(self, **env):
         clean = {k: v for k, v in os.environ.items() if k not in self.ENV_KEYS}
@@ -258,6 +258,8 @@ class AllocationConfigTests(unittest.TestCase):
         cfg = config.ALLOCATION_CONFIG
         self.assertEqual(set(cfg["targets"]), {"core", "satellite", "defensive"})
         self.assertAlmostEqual(sum(cfg["targets"].values()), 1.0, places=6)
+        self.assertEqual(set(cfg["defensive_split"]), {"gold", "short_gilts"})
+        self.assertAlmostEqual(sum(cfg["defensive_split"].values()), 1.0, places=6)
         self.assertIn(cfg["buy_cadence"], ("monthly", "daily"))
         for key in ("band_pp", "satellite_max_single_pct", "big_tech_cap_pct", "off_cycle_min_deploy_gbp"):
             self.assertGreaterEqual(cfg[key], 0.0, key)
@@ -272,16 +274,18 @@ class AllocationConfigTests(unittest.TestCase):
 
     def test_env_overrides_are_parsed_safely(self):
         # GitHub Actions renders `||` expressions as 'true' and missing secrets as '' — both must fall back to defaults
-        cfg = self._build(TARGET_CORE_PCT="true", TARGET_SATELLITE_PCT="", TARGET_DEFENSIVE_PCT="0.15",
-                          BUY_CADENCE="weekly", BIG_TECH_CAP_PCT="true", ALLOCATION_BAND_PP="abc",
-                          OFF_CYCLE_MIN_DEPLOY_GBP="null")
-        self.assertEqual(cfg["targets"], {"core": 0.65, "satellite": 0.20, "defensive": 0.15})
+        cfg = self._build(TARGET_CORE_PCT="true", TARGET_SATELLITE_PCT="", TARGET_DEFENSIVE_PCT="0.05",
+                          DEFENSIVE_GOLD_SHARE="true", BUY_CADENCE="weekly", BIG_TECH_CAP_PCT="true",
+                          ALLOCATION_BAND_PP="abc", OFF_CYCLE_MIN_DEPLOY_GBP="null")
+        self.assertEqual(cfg["targets"], {"core": 0.75, "satellite": 0.20, "defensive": 0.05})
+        self.assertEqual(cfg["defensive_split"], {"gold": 1.0, "short_gilts": 0.0})
         self.assertEqual(cfg["buy_cadence"], "monthly")
         self.assertEqual(cfg["big_tech_cap_pct"], 0.30)
         self.assertEqual(cfg["band_pp"], 5.0)
         self.assertEqual(cfg["off_cycle_min_deploy_gbp"], 2000.0)
         self.assertEqual(self._build(BUY_CADENCE="Daily")["buy_cadence"], "daily")
         self.assertEqual(self._build(CORE_BUY_TICKER=" vwra.l ")["core_buy_ticker"], "VWRA.L")
+        self.assertEqual(self._build(DEFENSIVE_GOLD_SHARE="0.5")["defensive_split"], {"gold": 0.5, "short_gilts": 0.5})
 
     def test_targets_are_normalised_or_fall_back(self):
         cfg = self._build(TARGET_CORE_PCT="0.6", TARGET_SATELLITE_PCT="0.3", TARGET_DEFENSIVE_PCT="0.3")
@@ -289,7 +293,7 @@ class AllocationConfigTests(unittest.TestCase):
         self.assertAlmostEqual(cfg["targets"]["satellite"], 0.25)
         self.assertAlmostEqual(cfg["targets"]["defensive"], 0.25)
         cfg = self._build(TARGET_CORE_PCT="0", TARGET_SATELLITE_PCT="0", TARGET_DEFENSIVE_PCT="0")
-        self.assertEqual(cfg["targets"], {"core": 0.65, "satellite": 0.20, "defensive": 0.15})
+        self.assertEqual(cfg["targets"], {"core": 0.75, "satellite": 0.20, "defensive": 0.05})
         cfg = self._build(TARGET_CORE_PCT="-1")
         self.assertGreaterEqual(min(cfg["targets"].values()), 0.0)
 
