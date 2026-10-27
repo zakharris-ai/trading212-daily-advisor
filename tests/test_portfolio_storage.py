@@ -75,6 +75,7 @@ class _TempDataDirMixin:
                     "ticker": p["yf_ticker"],
                     "quantity": p["quantity"],
                     "price": p.get("currentPrice", 0.0),
+                    "avg_price": p.get("averagePrice", 0.0),
                     "currency": "USD",
                     "value_gbp": p["quantity"] * p.get("currentPrice", 0.0),
                 }
@@ -139,6 +140,38 @@ class TradeDetectionTests(_TempDataDirMixin, unittest.TestCase):
         self.assertEqual(ps.get_position_trims()["Main"]["NVDA"], "2026-10-02")
         self.assertEqual(ps.get_position_entries()["Main"]["NVDA"], "2026-09-10")  # still held
         self.assertEqual(ps.get_closed_positions(), {})
+
+    def _split_case(self, before, after):
+        """Runs day 1 (`before`) and day 2 (`after`) position dicts for CSH2.L; returns day-2 trade events."""
+        day1 = {"Main": [dict(self._pos("CSH2l_EQ", "CSH2.L", before[0], price=before[1], fill="2026-10-13T10:25:02.000+03:00"),
+                             averagePrice=before[2])]}
+        self._detect("2026-10-26", day1)
+        self._snapshot("2026-10-26", day1)
+        return self._detect("2026-10-27", {"Main": [dict(self._pos("CSH2l_EQ", "CSH2.L", after[0], price=after[1]),
+                                                        averagePrice=after[2])]})
+
+    def test_share_split_is_a_corporate_action_not_a_buy(self):
+        # A 250:1 fund split: 20 units at ~100,000p become 5,000 units at ~400p.
+        new = self._split_case((20.0, 100120.0, 100000.0), (5000.0, 400.6, 400.0))
+        self.assertEqual([t["action"] for t in new], ["CORPORATE ACTION (SPLIT 250:1)"])
+        self.assertAlmostEqual(new[0]["old_shares"], 20.0)
+        self.assertAlmostEqual(new[0]["new_total_shares"], 5000.0)
+        self.assertEqual(ps.get_position_entries()["Main"]["CSH2.L"], "2026-10-13")  # entry date untouched
+        self.assertEqual(ps.get_position_trims().get("Main", {}), {})
+
+    def test_consolidation_is_a_corporate_action_not_a_trim(self):
+        new = self._split_case((100.0, 2.0, 1.9), (10.0, 20.1, 19.0))
+        self.assertEqual([t["action"] for t in new], ["CORPORATE ACTION (CONSOLIDATION 1:10)"])
+        self.assertEqual(ps.get_position_trims().get("Main", {}), {})  # no 180-day re-buy lockout
+
+    def test_real_trades_that_change_the_share_count_a_lot_are_still_trades(self):
+        doubled = self._split_case((10.0, 100.0, 95.0), (20.0, 101.0, 98.0))  # bought 10 more near 101
+        self.assertEqual([t["action"] for t in doubled], ["BUY (ACCUMULATION)"])
+
+    def test_large_partial_sale_is_still_a_trim(self):
+        sold = self._split_case((10.0, 100.0, 95.0), (4.0, 101.0, 95.0))  # average cost is unchanged by a sale
+        self.assertEqual([t["action"] for t in sold], ["SELL (TRIMMED)"])
+        self.assertEqual(ps.get_position_trims()["Main"]["CSH2.L"], "2026-10-27")
 
     def test_full_close_records_sell_closed_and_archives_entry(self):
         day1 = {"Main": [

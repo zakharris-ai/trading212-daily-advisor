@@ -263,6 +263,27 @@ def _position_qty(pos: Optional[Dict[str, Any]]) -> float:
     return _to_float((pos or {}).get("quantity"), 0.0)
 
 
+def _position_avg_price(pos: Optional[Dict[str, Any]]) -> float:
+    """Average cost per share of a live position (`averagePrice`) or a snapshot position (`avg_price`); 0.0 if unknown."""
+    pos = pos or {}
+    return _to_float(pos.get("averagePrice") if pos.get("averagePrice") is not None else pos.get("avg_price"), 0.0)
+
+
+def _looks_like_split(prior_qty: float, curr_qty: float, prior_avg: float, curr_avg: float) -> bool:
+    """True when a share-count change is a split or consolidation rather than a trade.
+
+    The count changes by at least 1.5x either way while the total cost basis (quantity x average cost) is unchanged
+    within 3%: no money moved. A real buy raises the cost basis and a real sale shrinks it in line with the shares
+    sold (average-cost method), so neither matches. Unknown average costs never count as a split.
+    """
+    if min(prior_qty, curr_qty, prior_avg, curr_avg) <= 0:
+        return False
+    qty_ratio = curr_qty / prior_qty
+    if 1.0 / 1.5 < qty_ratio < 1.5:
+        return False
+    return abs((curr_qty * curr_avg) / (prior_qty * prior_avg) - 1.0) <= 0.03
+
+
 def _initial_fill_date(pos: Optional[Dict[str, Any]]) -> Optional[str]:
     """Date part (YYYY-MM-DD) of a Trading 212 position's initialFillDate, if present and well-formed."""
     raw = str((pos or {}).get("initialFillDate") or "").strip()[:10]
@@ -381,6 +402,28 @@ def detect_and_record_trades(
             pos_name = ref_pos.get("name") or ticker
             pos_currency = ref_pos.get("currency", "USD")
             timestamp = datetime.now().isoformat()
+
+            if prior_qty > _QTY_EPS and curr_qty > _QTY_EPS and _looks_like_split(
+                prior_qty, curr_qty, _position_avg_price(prior_pos), _position_avg_price(pos)
+            ):
+                # Share split / consolidation (e.g. a fund splitting 250:1): not a trade, so entry and trim
+                # dates (anti-churn and lockouts) are left untouched and only an informational event is logged.
+                ratio = curr_qty / prior_qty
+                label = f"SPLIT {ratio:.4g}:1" if ratio > 1 else f"CONSOLIDATION 1:{1 / ratio:.4g}"
+                if _record({
+                    "date": current_date_str,
+                    "timestamp": timestamp,
+                    "account": acc_name,
+                    "ticker": ticker,
+                    "name": pos_name,
+                    "action": f"CORPORATE ACTION ({label})",
+                    "old_shares": prior_qty,
+                    "new_total_shares": curr_qty,
+                    "price": pos_price,
+                    "currency": pos_currency,
+                }):
+                    logger.info("Recorded %s for %s (%s): %.4f -> %.4f shares", label, ticker, acc_name, prior_qty, curr_qty)
+                continue
 
             if curr_qty > _QTY_EPS and prior_qty <= _QTY_EPS:
                 # Newly acquired (or first-ever seen) position: date it from the broker's initial fill.
