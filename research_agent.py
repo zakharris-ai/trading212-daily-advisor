@@ -1020,6 +1020,120 @@ class DeepResearchAgent:
             return None, None, "⚪ Unknown (earnings calendar unavailable)"
         return None, None, "✅ Clear (No imminent date)"
 
+    def _backfill_info_from_statements(self, ticker_obj: Any, info: Dict[str, Any]) -> Dict[str, Any]:
+        """Backfills missing Yahoo `info` financialData fields from verified `financials`, `cashflow` and `balance_sheet`."""
+        merged = dict(info or {})
+
+        def _row_val(df: Any, candidates: Tuple[str, ...], col: int = 0) -> Optional[float]:
+            if df is None or not hasattr(df, "empty") or df.empty or df.shape[1] <= col:
+                return None
+            for name in candidates:
+                if name in df.index:
+                    v = _clean_num(df.loc[name].iloc[col])
+                    if v is not None:
+                        return v
+            return None
+
+        fin = cf = bs = None
+        try:
+            fin = getattr(ticker_obj, "financials", None)
+        except Exception:
+            fin = None
+        try:
+            cf = getattr(ticker_obj, "cashflow", None)
+        except Exception:
+            cf = None
+        try:
+            bs = getattr(ticker_obj, "balance_sheet", None)
+        except Exception:
+            bs = None
+
+        rev_0 = _row_val(fin, ("Total Revenue", "Operating Revenue"))
+        rev_1 = _row_val(fin, ("Total Revenue", "Operating Revenue"), col=1)
+        ni_0 = _row_val(fin, ("Net Income Common Stockholders", "Net Income", "Net Income Including Noncontrolling Interests"))
+        op_inc_0 = _row_val(fin, ("Operating Income", "EBIT"))
+        gp_0 = _row_val(fin, ("Gross Profit",))
+
+        if _clean_num(merged.get("totalRevenue")) is None and rev_0 is not None:
+            merged["totalRevenue"] = rev_0
+        if _clean_num(merged.get("netIncomeToCommon")) is None and _clean_num(merged.get("netIncome")) is None and ni_0 is not None:
+            merged["netIncomeToCommon"] = ni_0
+        if _clean_num(merged.get("operatingMargins")) is None and op_inc_0 is not None and rev_0 is not None and rev_0 > 0:
+            merged["operatingMargins"] = op_inc_0 / rev_0
+        if _clean_num(merged.get("grossMargins")) is None and gp_0 is not None and rev_0 is not None and rev_0 > 0:
+            merged["grossMargins"] = gp_0 / rev_0
+        if _clean_num(merged.get("revenueGrowth")) is None and rev_0 is not None and rev_1 is not None and rev_1 > 0:
+            merged["revenueGrowth"] = (rev_0 - rev_1) / rev_1
+
+        ocf_0 = _row_val(cf, ("Operating Cash Flow", "Total Cash From Operating Activities", "Cash Flow From Continuing Operating Activities"))
+        fcf_0 = _row_val(cf, ("Free Cash Flow",))
+        capex_0 = _row_val(cf, ("Capital Expenditure", "Capital Expenditures"))
+        if fcf_0 is None and ocf_0 is not None and capex_0 is not None:
+            fcf_0 = ocf_0 - abs(capex_0)
+        if _clean_num(merged.get("operatingCashflow")) is None and ocf_0 is not None:
+            merged["operatingCashflow"] = ocf_0
+        if _clean_num(merged.get("freeCashflow")) is None and fcf_0 is not None:
+            merged["freeCashflow"] = fcf_0
+
+        cash_0 = _row_val(bs, ("Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"))
+        debt_0 = _row_val(bs, ("Total Debt", "Long Term Debt"))
+        ca_0 = _row_val(bs, ("Current Assets", "Total Current Assets"))
+        cl_0 = _row_val(bs, ("Current Liabilities", "Total Current Liabilities"))
+        eq_0 = _row_val(bs, ("Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"))
+
+        if _clean_num(merged.get("totalCash")) is None and cash_0 is not None:
+            merged["totalCash"] = cash_0
+        if _clean_num(merged.get("totalDebt")) is None and debt_0 is not None:
+            merged["totalDebt"] = debt_0
+        if _clean_num(merged.get("currentRatio")) is None and ca_0 is not None and cl_0 is not None and cl_0 > 0:
+            merged["currentRatio"] = ca_0 / cl_0
+        if _clean_num(merged.get("debtToEquity")) is None and debt_0 is not None and eq_0 is not None and eq_0 > 0:
+            merged["debtToEquity"] = (debt_0 / eq_0) * 100.0
+        ni_eff = _clean_num(merged.get("netIncomeToCommon"))
+        if ni_eff is None:
+            ni_eff = _clean_num(merged.get("netIncome"))
+        if _clean_num(merged.get("returnOnEquity")) is None and ni_eff is not None and eq_0 is not None and eq_0 > 0:
+            merged["returnOnEquity"] = ni_eff / eq_0
+
+        return merged
+
+    def _count_verifiable_piotroski_inputs(self, info: Dict[str, Any]) -> int:
+        """Counts how many of the 9 Quality Checklist inputs are actually reported in `info`."""
+        ni = _clean_num(info.get("netIncomeToCommon"))
+        if ni is None:
+            ni = _clean_num(info.get("netIncome"))
+        ocf = _clean_num(info.get("operatingCashflow"))
+        fcf = _clean_num(info.get("freeCashflow"))
+        op_m = _clean_num(info.get("operatingMargins"))
+        gross_m = _clean_num(info.get("grossMargins"))
+        roe = _clean_num(info.get("returnOnEquity"))
+        cur_ratio = _clean_num(info.get("currentRatio"))
+        debt_eq = _clean_num(info.get("debtToEquity"))
+        total_cash = _clean_num(info.get("totalCash"))
+        total_debt = _clean_num(info.get("totalDebt"))
+        rev_g = _clean_num(info.get("revenueGrowth"))
+
+        verifiable = 0
+        if ni is not None:
+            verifiable += 1
+        if ocf is not None:
+            verifiable += 1
+        if ni is not None and ocf is not None:
+            verifiable += 1
+        if fcf is not None:
+            verifiable += 1
+        if op_m is not None or gross_m is not None:
+            verifiable += 1
+        if roe is not None:
+            verifiable += 1
+        if cur_ratio is not None:
+            verifiable += 1
+        if debt_eq is not None or (total_cash is not None and total_debt is not None):
+            verifiable += 1
+        if rev_g is not None:
+            verifiable += 1
+        return verifiable
+
     def _compute_piotroski_score(self, info: Dict[str, Any]) -> Tuple[int, str, List[str]]:
         """Computes the static 9-point Quality Checklist (0-9) from point-in-time fundamentals.
 
@@ -1032,47 +1146,55 @@ class DeepResearchAgent:
         checks = []
 
         # 1. Net Income > 0
-        net_income = info.get("netIncomeToCommon") or info.get("netIncome") or 0
-        if net_income > 0:
+        net_income = _clean_num(info.get("netIncomeToCommon"))
+        if net_income is None:
+            net_income = _clean_num(info.get("netIncome"))
+        if net_income is None:
+            checks.append("⚪ Net income not reported (no point)")
+        elif net_income > 0:
             score += 1
             checks.append("Positive Net Income")
         else:
             checks.append("⚠️ Negative Net Income")
 
         # 2. Operating Cash Flow > 0
-        ocf = info.get("operatingCashflow") or 0
-        if ocf > 0:
+        ocf = _clean_num(info.get("operatingCashflow"))
+        if ocf is None:
+            checks.append("⚪ Operating cash flow not reported (no point)")
+        elif ocf > 0:
             score += 1
             checks.append("Positive Operating Cash Flow")
         else:
             checks.append("⚠️ Negative Operating Cash Flow")
 
         # 3. Quality of Earnings: OCF >= Net Income (low accrual risk)
-        if ocf > 0 and ocf >= (net_income * 0.9):
-            score += 1
-            checks.append("High Earnings Quality (OCF >= Net Income)")
-        elif net_income > 0 and ocf < (net_income * 0.7):
-            checks.append("⚠️ Accrual Warning: Cash flow trails reported earnings")
+        if ocf is not None and net_income is not None:
+            if ocf > 0 and ocf >= (net_income * 0.9):
+                score += 1
+                checks.append("High Earnings Quality (OCF >= Net Income)")
+            elif net_income > 0 and ocf < (net_income * 0.7):
+                checks.append("⚠️ Accrual Warning: Cash flow trails reported earnings")
 
         # 4. Positive Free Cash Flow (reported in the financial-statement currency)
-        fcf = info.get("freeCashflow") or 0
-        if fcf > 0:
+        fcf = _clean_num(info.get("freeCashflow"))
+        if fcf is not None and fcf > 0:
             score += 1
             fin_ccy = str(info.get("financialCurrency") or "").upper().strip() or "statement ccy"
             checks.append(f"Positive FCF ({fcf/1e9:.1f}B {fin_ccy})")
 
         # 5. Elite Pricing Power (Operating Margin > 20% or Gross Margin > 45%)
-        op_m = info.get("operatingMargins") or 0
-        gross_m = info.get("grossMargins") or 0
-        if op_m >= 0.20 or gross_m >= 0.45:
+        op_m = _clean_num(info.get("operatingMargins"))
+        gross_m = _clean_num(info.get("grossMargins"))
+        if (op_m is not None and op_m >= 0.20) or (gross_m is not None and gross_m >= 0.45):
             score += 1
-            checks.append(f"Superior Pricing Power (Op Margin: {op_m*100:.1f}%)")
-        elif op_m > 0.10:
+            op_disp = (op_m * 100.0) if op_m is not None else ((gross_m or 0.0) * 100.0)
+            checks.append(f"Superior Pricing Power (Op Margin: {op_disp:.1f}%)")
+        elif op_m is not None and op_m > 0.10:
             score += 1
 
         # 6. Elite ROE (> 15%)
-        roe = info.get("returnOnEquity") or 0
-        if roe >= 0.15:
+        roe = _clean_num(info.get("returnOnEquity"))
+        if roe is not None and roe >= 0.15:
             score += 1
             checks.append(f"High Return on Equity ({roe*100:.1f}%)")
 
@@ -1101,8 +1223,8 @@ class DeepResearchAgent:
             checks.append(f"Elevated Leverage (D/E: {debt_eq:.1f}%)")
 
         # 9. Top-Line Expansion (Revenue Growth > 10%)
-        rev_g = info.get("revenueGrowth") or 0
-        if rev_g >= 0.10:
+        rev_g = _clean_num(info.get("revenueGrowth"))
+        if rev_g is not None and rev_g >= 0.10:
             score += 1
             checks.append(f"Strong Revenue Growth (+{rev_g*100:.1f}% YoY)")
 
@@ -1216,6 +1338,14 @@ class DeepResearchAgent:
         Returns (z_score, label, zone_color). Zero synthetic guessing, NaN-safe, and currency-normalized.
         """
         try:
+            sector_l = str(info.get("sector") or "").lower()
+            industry_l = str(info.get("industry") or "").lower()
+            if "financial" in sector_l and any(
+                k in industry_l for k in ("bank", "insurance", "conglomerate", "asset management", "capital markets", "broker")
+            ):
+                # Manufacturing Altman Z (Working Capital / Asset Turnover) is structurally invalid for banks, insurers & BRK-B
+                return None, "N/A (Financial/Insurance Balance Sheet)", "#64748b"
+
             bs = getattr(ticker_obj, "balance_sheet", None)
             if bs is None or bs.empty or "Total Assets" not in bs.index:
                 return None, "N/A (Balance sheet not reported)", "#64748b"
@@ -1503,12 +1633,13 @@ class DeepResearchAgent:
         Quality-Justified Fair P/E Multiple, and Valuation Regime using the Institutional TSR Decomposition:
             E[5Y CAGR] = Sustainable Organic Growth + FCF/Shareholder Yield +/- 5Y Valuation Multiple Normalization.
         """
-        ticker = str(research.get("ticker") or "")
-        clean_key = ticker.replace(".L", "").replace(".DE", "").replace(".AS", "").replace("-", "_")
-        has_wide_moat = bool(INSTITUTIONAL_DOSSIERS.get(ticker) or INSTITUTIONAL_DOSSIERS.get(clean_key))
         roic = _clean_num(research.get("roic"))
         op_m = _clean_num(research.get("operating_margin_pct"))
         gm = _clean_num(research.get("gross_margin_pct"))
+        has_wide_moat = bool(
+            (roic is not None and roic >= 20.0)
+            and ((op_m is not None and op_m >= 22.0) or (gm is not None and gm >= 50.0))
+        )
         rev_g = _clean_num(research.get("revenue_growth_yoy"))
         eps_g = _clean_num(research.get("earnings_growth_yoy"))
         f_pe = _clean_num(research.get("forward_pe")) or _clean_num(research.get("trailing_pe"))
@@ -1888,6 +2019,7 @@ class DeepResearchAgent:
             if quote_type == "ETF":
                 return self._safe_etf_profile(yf_ticker, ticker_obj=t, info=info)
 
+            info = self._backfill_info_from_statements(t, info)
             core_hits = sum(1 for k in _CORE_FUNDAMENTAL_KEYS if _clean_num(info.get(k)) is not None)
             if core_hits < _MIN_CORE_FUNDAMENTALS:
                 raise ValueError(
@@ -1963,8 +2095,15 @@ class DeepResearchAgent:
 
             # Static 9-point Quality Checklist (0-9; not the year-on-year Piotroski F-score)
             p_score, p_label, p_factors = self._compute_piotroski_score(info)
-            research["piotroski_score"] = p_score
-            research["piotroski_label"] = p_label
+            verifiable_p_inputs = self._count_verifiable_piotroski_inputs(info)
+            if verifiable_p_inputs < 5:
+                research["piotroski_score"] = None
+                research["piotroski_label"] = "N/A (Insufficient Fundamental Data)"
+                p_score_for_pillar = 5.5
+            else:
+                research["piotroski_score"] = p_score
+                research["piotroski_label"] = p_label
+                p_score_for_pillar = float(p_score)
             research["piotroski_factors"] = p_factors
 
             # Catalyst Calendar (Earnings Announcement Risk)
@@ -2069,7 +2208,7 @@ class DeepResearchAgent:
             score = 38.0
 
             # Pillar A: Forensic Balance Sheet & Cash Quality (up to ~20 pts)
-            score += (p_score * 1.6)  # Up to 14.4 pts
+            score += (p_score_for_pillar * 1.6)  # Up to 14.4 pts (neutral 8.8 when checklist inputs unavailable)
             if z_score is not None:
                 if z_score >= 3.5:
                     score += 4.5

@@ -1743,6 +1743,177 @@ class TestHouseholdPlan(EngineTestCase):
         self.assertAlmostEqual(second_p3["sell_orders"][0]["estimated_gbp"], 6000.0, places=2)
 
 
+class TestGoalAuditFixes(EngineTestCase):
+    def test_pending_earmarked_sell_never_inflates_deployable_cash_or_triggers_await_fills(self):
+        csh2 = make_analysis("CSH2.L", 20000.0, price_gbp=5.0, macro_cluster="Uncorrelated Crash Hedge & Gold")
+        vwrp = make_analysis("VWRP.L", 80000.0, price_gbp=120.0, macro_cluster="Diversified Index Core")
+        pending = {
+            "pending_sells": {
+                "CSH2.L": {"order_type": "MARKET", "quantity": 4000.0, "limit_price": 0.0, "stop_price": 0.0}
+            },
+            "pending_buys": {},
+        }
+        with mock.patch.object(config, "EARMARKED_TICKERS", {"CSH2.L"}):
+            plan = self.plan([csh2, vwrp], cash=0.25, pending_orders_data=pending, account_name="Main")
+        self.assertEqual(len(plan["pending_sell_orders"]), 1)
+        self.assertTrue(plan["pending_sell_orders"][0]["is_earmarked"])
+        self.assertEqual(plan["cash_from_sells_gbp"], 0.0)
+        self.assertEqual(plan["buy_orders"], [])
+        tldr = se.generate_tldr_summary({"Main": {"rebalancing_plan": plan}})["Main"]
+        self.assertEqual(tldr["phase"], "ALL_SET")
+
+    def test_filled_earmarked_proceeds_raised_via_reserve_topup_blocks_buys_and_excludes_from_risk_basis(self):
+        config.ALLOCATION_CONFIG.update(HOUSEHOLD_ALLOCATION_CFG)
+        vwrp = make_analysis("VWRP.L", 80000.0, price_gbp=120.0, macro_cluster="Diversified Index Core")
+        sgln = make_analysis("SGLN.L", 5000.0, price_gbp=60.0, macro_cluster="Uncorrelated Crash Hedge & Gold")
+        accounts = {
+            "Main": {
+                "cfg": {"reserve_topup_gbp": 20000.0},
+                "cash": {"free_gbp": 20000.25, "blocked_gbp": 0.0},
+                "analyses": [vwrp, sgln],
+            }
+        }
+        view = se.build_consolidated_portfolio_view(accounts, gbp_rate=1.28)
+        plan = se.build_rebalancing_plan(
+            analyses=[vwrp, sgln],
+            available_cash_gbp=20000.25,
+            new_opportunities=[],
+            gbp_rate=1.28,
+            min_cash_reserve_gbp=1500.0 + 20000.0,
+            reserve_topup_gbp=20000.0,
+            account_name="Main",
+            global_context=view,
+            as_of=datetime(2026, 11, 2).date(),
+        )
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(plan["net_budget_to_deploy_gbp"], 0.0)
+        self.assertAlmostEqual(plan["risk_profile_5y"]["excluded_cash_gbp"], 20000.0, places=2)
+        self.assertAlmostEqual(plan["risk_profile_5y"]["investable_total_gbp"], 85000.25, places=2)
+        tldr = se.generate_tldr_summary({"Main": {"rebalancing_plan": plan}})["Main"]
+        self.assertEqual(tldr["phase"], "ALL_SET")
+
+    def test_bearish_analyst_target_sets_flag_blocks_watchlist_and_penalizes_rebalance_score(self):
+        up = alternating_path(252, 0.011, 0.008)
+        last = up[-1]
+        self.use_tickers({"MSFT": FakeTicker(daily=daily_frame(up), fast_info={"currency": "USD"})})
+        bearish_res_dict = {
+            "data_ok": True, "company_name": "Microsoft", "fundamental_score": 82,
+            "macro_cluster": "Enterprise Cloud & Software",
+            "target_mean_price": last * 0.88,
+            "expected_5y_cagr_pct": 12.0,
+        }
+        with mock.patch.object(se.research_agent, "get_macro_regime", return_value={"macro_score": 55, "sector_momentum": {}, "macro_data_ok": True}), \
+             mock.patch.object(se, "get_spy_history", return_value=None), \
+             mock.patch.object(se, "evaluate_minervini_template", return_value=dict(MINERVINI_BULL)), \
+             mock.patch.object(se, "evaluate_institutional_volume", return_value=dict(VOLUME_ACCUM)), \
+             mock.patch.object(se.research_agent, "conduct_deep_dive", return_value=bearish_res_dict), \
+             mock.patch.object(se, "evaluate_weekly_trend", return_value=dict(WEEKLY_UPTREND)):
+            res = se.analyze_position("MSFT", None, gbp_rate=1.25)
+        self.assertIsNone(res["risk_reward_ratio"])
+        self.assertTrue(res["analyst_target_bearish"])
+        self.assertEqual(res["signal"], "🟡 HOLD (WAIT FOR ASYMMETRY)")
+        self.assertNotEqual(res["action_short"], "BUY")
+
+        forced_buy = dict(res, action_short="BUY", conviction_score=85)
+        with mock.patch.object(se, "WATCHLIST", [{"ticker": "MSFT", "name": "Microsoft", "theme": "Cloud"}]), \
+             mock.patch.object(se, "analyze_position", return_value=forced_buy):
+            opps = se.scan_watchlist_opportunities(set(), gbp_rate=1.25)
+        self.assertEqual(opps, [])
+
+        bearish_cand = make_analysis("BEAR", 0.0, action_short="BUY", conviction_score=80, is_new_addition=True,
+                                     risk_reward_ratio=None, analyst_target_bearish=True,
+                                     macro_cluster="Financials & Payment Rails")
+        neutral_cand = make_analysis("NEUT", 0.0, action_short="BUY", conviction_score=80, is_new_addition=True,
+                                     risk_reward_ratio=None, analyst_target_bearish=False,
+                                     macro_cluster="Healthcare & Biopharma")
+        plan = self.plan([make_analysis("VWRP.L", 50000.0, macro_cluster="Diversified Index Core")],
+                         cash=8000.0, opps=[bearish_cand, neutral_cand])
+        by_t = {b["ticker"]: b for b in plan["buy_orders"]}
+        self.assertEqual(by_t["NEUT"]["rebalance_score"] - by_t["BEAR"]["rebalance_score"], 20.0)
+
+    def test_10y_weekly_history_preserves_2022_crash_past_2027_and_computes_orthogonal_qmj_factors(self):
+        idx = pd.date_range(start="2021-06-07", periods=360, freq="W-MON")
+        vals = [100.0]
+        for dt in idx[1:]:
+            if dt.year == 2022:
+                vals.append(vals[-1] * 0.994)
+            else:
+                vals.append(vals[-1] * 1.0045)
+        stock_wk = pd.DataFrame({"Close": vals}, index=idx)
+        spy_vals = [100.0]
+        for k, dt in enumerate(idx[1:], start=1):
+            if dt.year == 2022:
+                spy_vals.append(spy_vals[-1] * 0.995)
+            elif k % 12 == 0:
+                spy_vals.append(spy_vals[-1] * 0.975)
+            else:
+                spy_vals.append(spy_vals[-1] * 1.0055)
+        spy_wk = pd.DataFrame({"Close": spy_vals}, index=idx)
+        fx_wk = pd.DataFrame({"Close": [1.0] * len(idx)}, index=idx)
+
+        fake_tok = FakeTicker(weekly=stock_wk, fast_info={"currency": "GBP"})
+        with mock.patch.object(se, "get_spy_5y_weekly_history_gbp", return_value=spy_wk["Close"]), \
+             mock.patch.object(se, "get_spy_5y_weekly_history", return_value=spy_wk["Close"]), \
+             mock.patch.object(se, "get_fx_weekly_history", return_value=fx_wk["Close"]):
+            wk = se.evaluate_weekly_trend(fake_tok, yf_ticker="TEST.L", currency="GBP")
+        self.assertTrue(wk["data_ok"])
+        self.assertTrue(wk["is_weekly_stage_2"])
+        self.assertLess(wk["crash_2022_ret_pct"], -20.0)
+        self.assertIsNotNone(wk["mom_12_1_gbp_pct"])
+        self.assertGreater(wk["mom_12_1_gbp_pct"], 10.0)
+        self.assertIsNotNone(wk["fip_pos_weeks_pct"])
+        self.assertGreater(wk["fip_pos_weeks_pct"], 60.0)
+        self.assertIsNotNone(wk["downside_vol_1y_pct"])
+        self.assertIsNotNone(wk["crisis_alpha_5y_pct"])
+
+    def test_core_etf_in_weekly_stage_2_suppresses_noisy_stop_review_while_stage_4_surfaces_it(self):
+        closes = [100.0 + i * 0.25 for i in range(249)] + [150.0, 145.0, 140.0]
+        self.use_tickers({"VWRP.L": FakeTicker(daily=daily_frame(closes), fast_info={"currency": "GBP"})})
+        etf_res = {
+            "data_ok": True, "is_etf": True, "company_name": "Vanguard FTSE All-World",
+            "fundamental_score": 91, "macro_cluster": "Diversified Index Core",
+            "target_mean_price": 0.0, "expected_5y_cagr_pct": 11.2,
+        }
+        pos = {"quantity": 100.0, "currentPrice": 140.0, "averagePrice": 110.0, "currency": "GBP"}
+        with mock.patch.object(se.research_agent, "get_macro_regime", return_value={"macro_score": 50, "sector_momentum": {}, "macro_data_ok": True}), \
+             mock.patch.object(se, "get_spy_history", return_value=None), \
+             mock.patch.object(se, "evaluate_minervini_template", return_value=dict(MINERVINI_BULL)), \
+             mock.patch.object(se, "evaluate_institutional_volume", return_value=dict(VOLUME_ACCUM)), \
+             mock.patch.object(se.research_agent, "conduct_deep_dive", return_value=etf_res):
+            with mock.patch.object(se, "evaluate_weekly_trend", return_value=dict(WEEKLY_UPTREND)):
+                res_s2 = se.analyze_position("VWRP.L", pos, gbp_rate=1.25)
+            with mock.patch.object(se, "evaluate_weekly_trend", return_value=dict(WEEKLY_DOWNTREND)):
+                res_s4 = se.analyze_position("VWRP.L", pos, gbp_rate=1.25)
+        self.assertTrue(res_s2["stop_breached"])
+        self.assertNotEqual(res_s2["signal"], se.STOP_REVIEW_SIGNAL)
+        self.assertEqual(res_s4["signal"], se.STOP_REVIEW_SIGNAL)
+
+    def test_unowned_stage2_watchlist_candidate_is_not_blocked_by_normal_uptrend_drift(self):
+        closes = alternating_path(252, 0.012, 0.0055)
+        last = closes[-1]
+        self.use_tickers({"LIN": FakeTicker(daily=daily_frame(closes), fast_info={"currency": "USD"})})
+        res_dict = {
+            "data_ok": True, "company_name": "Linde plc", "fundamental_score": 84,
+            "macro_cluster": "Infrastructure & Electrification",
+            "target_mean_price": last * 1.25, "expected_5y_cagr_pct": 13.5,
+        }
+        with mock.patch.object(se.research_agent, "get_macro_regime", return_value={"macro_score": 55, "sector_momentum": {}, "macro_data_ok": True}), \
+             mock.patch.object(se, "get_spy_history", return_value=None), \
+             mock.patch.object(se, "evaluate_minervini_template", return_value=dict(MINERVINI_BULL)), \
+             mock.patch.object(se, "evaluate_institutional_volume", return_value=dict(VOLUME_ACCUM)), \
+             mock.patch.object(se.research_agent, "conduct_deep_dive", return_value=res_dict), \
+             mock.patch.object(se, "evaluate_weekly_trend", return_value=dict(WEEKLY_UPTREND)), \
+             mock.patch.object(se, "WATCHLIST", [{"ticker": "LIN", "name": "Linde plc", "theme": "Industrial Gases"}]):
+            res = se.analyze_position("LIN", None, gbp_rate=1.25)
+            opps = se.scan_watchlist_opportunities(set(), gbp_rate=1.25)
+        self.assertFalse(res["is_extended"])
+        self.assertFalse(res["stop_breached"])
+        self.assertGreaterEqual(res["conviction_score"], 74)
+        self.assertEqual(len(opps), 1)
+        self.assertEqual(opps[0]["ticker"], "LIN")
+        self.assertEqual(opps[0]["action_short"], "BUY")
+
+
 class TestCompiles(unittest.TestCase):
     def test_py_compile(self):
         py_compile.compile(os.path.join(REPO_ROOT, "strategy_engine.py"), doraise=True)

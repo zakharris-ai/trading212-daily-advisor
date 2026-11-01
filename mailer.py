@@ -884,8 +884,8 @@ def generate_html_digest(
                     name = ps.get("name", pt)
                     val = float(ps.get("estimated_value", ps.get("value", 0.0)) or 0.0)
                     qty = float(ps.get("quantity", 0.0) or 0.0)
+                    matching_pso = next((p for p in pending_sell_orders if p.get("ticker") == pt or p.get("search_symbol") == pt), None)
                     if math.isnan(val) or val <= 0:
-                        matching_pso = next((p for p in pending_sell_orders if p.get("ticker") == pt or p.get("search_symbol") == pt), None)
                         if matching_pso:
                             val = float(matching_pso.get("estimated_gbp", 0.0) or 0.0)
                             if math.isnan(val):
@@ -897,7 +897,15 @@ def generate_html_digest(
                     lim_p = ps.get("limit_price", 0.0)
                     curr_sym = "$" if ps.get("currency") == "USD" or "US" in ps.get("raw_ticker", "") else "£"
                     limit_str = f" @ limit {curr_sym}{lim_p:,.2f}" if lim_p > 0 else ""
-                    val_str = f" (+£{val:,.0f} cash when filled)" if val > 0 else ""
+                    is_earm_ps = bool((matching_pso or {}).get("is_earmarked") or ps.get("is_earmarked"))
+                    if val > 0:
+                        val_str = (
+                            f" (+£{val:,.0f} ring-fenced cash for withdrawal when filled)"
+                            if is_earm_ps
+                            else f" (+£{val:,.0f} cash when filled)"
+                        )
+                    else:
+                        val_str = ""
                     pending_items_html += f"<li>🔴 <b>SELL {name} ({pt}):</b> ~{qty:,.2f} shares{limit_str} queued{val_str}.</li>"
                 pending_items_html += "</ul>"
             elif pending_sell_orders:
@@ -906,7 +914,12 @@ def generate_html_digest(
                 for pso in pending_sell_orders:
                     pso_val = float(pso.get('estimated_gbp', 0.0) or 0.0)
                     if math.isnan(pso_val): pso_val = 0.0
-                    pending_items_html += f"<li>🔴 <b>SELL {pso['name']} ({pso['search_symbol']}):</b> ~{pso['shares']:,.0f} shares already submitted & queued (+£{pso_val:,.0f} cash when filled).</li>"
+                    pso_note = (
+                        f"+£{pso_val:,.0f} ring-fenced cash for withdrawal when filled"
+                        if pso.get("is_earmarked")
+                        else f"+£{pso_val:,.0f} cash when filled"
+                    )
+                    pending_items_html += f"<li>🔴 <b>SELL {pso['name']} ({pso['search_symbol']}):</b> ~{pso['shares']:,.0f} shares already submitted & queued ({pso_note}).</li>"
                 pending_items_html += "</ul></div>"
             else:
                 pending_items_html = (

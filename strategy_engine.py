@@ -963,13 +963,13 @@ def get_spy_history() -> Optional[pd.DataFrame]:
 
 
 def get_spy_5y_weekly_history() -> Optional[pd.Series]:
-    """Fetches and caches 5-year weekly S&P 500 closes for empirical 5Y Beta and Correlation."""
+    """Fetches and caches weekly S&P 500 closes (10y window so 2022 stress & 5y rolling metrics both stay intact)."""
     global _CACHED_SPY_5Y_WK
     if _CACHED_SPY_5Y_WK is not None:
         return _CACHED_SPY_5Y_WK
     try:
         spy = yf.Ticker("SPY")
-        df_w = spy.history(period="5y", interval="1wk")
+        df_w = spy.history(period="10y", interval="1wk")
         if not df_w.empty and "Close" in df_w:
             s = df_w["Close"].dropna()
             if hasattr(s.index, "tz") and s.index.tz is not None:
@@ -977,7 +977,7 @@ def get_spy_5y_weekly_history() -> Optional[pd.Series]:
             _CACHED_SPY_5Y_WK = s
             return s
     except Exception as e:
-        logger.debug("Failed to fetch SPY 5y weekly benchmark: %s", e)
+        logger.debug("Failed to fetch SPY weekly benchmark: %s", e)
     return None
 
 
@@ -990,12 +990,12 @@ def _tz_naive_index(series: pd.Series) -> pd.Series:
 
 
 def get_fx_weekly_history(pair: str) -> Optional[pd.Series]:
-    """Fetches and caches (per process) 5-year weekly closes for a Yahoo FX pair such as 'GBPUSD=X'."""
+    """Fetches and caches (per process) weekly closes (10y window) for a Yahoo FX pair such as 'GBPUSD=X'."""
     if pair in _CACHED_FX_WEEKLY:
         return _CACHED_FX_WEEKLY[pair]
     series = None
     try:
-        df_fx = yf.Ticker(pair).history(period="5y", interval="1wk")
+        df_fx = yf.Ticker(pair).history(period="10y", interval="1wk")
         if df_fx is not None and not df_fx.empty and "Close" in df_fx:
             s = df_fx["Close"].dropna()
             s = s[s > 0]
@@ -1225,6 +1225,10 @@ def evaluate_weekly_trend(
         "crash_2022_ret_pct": MISSING_METRIC_DEFAULTS["crash_2022_ret_pct"],
         "beta_5y": MISSING_METRIC_DEFAULTS["beta_5y"],
         "corr_5y": MISSING_METRIC_DEFAULTS["corr_5y"],
+        "mom_12_1_gbp_pct": None,
+        "fip_pos_weeks_pct": None,
+        "downside_vol_1y_pct": None,
+        "crisis_alpha_5y_pct": None,
         "crash_role_label": DATA_UNAVAILABLE_LABEL,
         "crash_role_color": "#64748b",
         "fx_basis": "native",
@@ -1232,7 +1236,7 @@ def evaluate_weekly_trend(
         "data_ok": False,
     }
     try:
-        df_w = ticker_obj.history(period="5y", interval="1wk")
+        df_w = ticker_obj.history(period="10y", interval="1wk")
         if df_w is None or df_w.empty or len(df_w) < 25:
             return default_5y
 
@@ -1289,19 +1293,29 @@ def evaluate_weekly_trend(
         if np.isnan(ema_50w) or ema_50w <= 0:
             ema_50w = ema_30w
 
-        # Compute 5-Year Empirical Risk-Adjusted & Crash Metrics from Weekly Bars (GBP basis)
+        # Compute 5-Year Empirical Risk-Adjusted & Crash Metrics from Weekly Bars (GBP basis).
+        # Full 10-year `c_tz_free` retains 2022 stress history indefinitely past 2027, while `c_5y` slices the
+        # trailing 5-year window whenever more than ~5.34 years of weekly bars are returned.
         c_tz_free = c
+        total_span_days = float((c_tz_free.index[-1] - c_tz_free.index[0]).days)
+        if total_span_days > 1950.0:
+            cutoff_5y = c_tz_free.index[-1] - pd.DateOffset(years=5)
+            c_5y = c_tz_free[c_tz_free.index >= cutoff_5y]
+            if len(c_5y) < 25:
+                c_5y = c_tz_free
+        else:
+            c_5y = c_tz_free
 
-        days_span = max(365.0, float((c_tz_free.index[-1] - c_tz_free.index[0]).days))
+        days_span = max(365.0, float((c_5y.index[-1] - c_5y.index[0]).days))
         years_span = days_span / 365.25
-        first_w = float(c_tz_free.iloc[0]) if float(c_tz_free.iloc[0]) > 0 else latest_w
+        first_w = float(c_5y.iloc[0]) if float(c_5y.iloc[0]) > 0 else latest_w
         raw_5y_cagr_dec = ((latest_w / first_w) ** (1.0 / years_span)) - 1.0 if first_w > 0 else 0.12
 
         # Compute 3-Year Rolling CAGR to eliminate single-start-date Oct 2021 bubble-peak distortion
-        if len(c_tz_free) >= 150:
-            idx_3y = max(0, len(c_tz_free) - 156)
-            w_3y = float(c_tz_free.iloc[idx_3y])
-            days_3y = max(365.0, float((c_tz_free.index[-1] - c_tz_free.index[idx_3y]).days))
+        if len(c_5y) >= 150:
+            idx_3y = max(0, len(c_5y) - 156)
+            w_3y = float(c_5y.iloc[idx_3y])
+            days_3y = max(365.0, float((c_5y.index[-1] - c_5y.index[idx_3y]).days))
             cagr_3y_dec = ((latest_w / w_3y) ** (365.25 / days_3y)) - 1.0 if w_3y > 0 else raw_5y_cagr_dec
             cagr_dec = (0.55 * raw_5y_cagr_dec) + (0.45 * cagr_3y_dec)
         else:
@@ -1309,7 +1323,7 @@ def evaluate_weekly_trend(
 
         cagr_5y_pct = round(cagr_dec * 100.0, 1)
 
-        wk_ret = c_tz_free.pct_change().dropna()
+        wk_ret = c_5y.pct_change().dropna()
         vol_dec = float(wk_ret.std() * np.sqrt(52.0)) if len(wk_ret) > 5 else 0.20
         vol_5y_pct = round(vol_dec * 100.0, 1)
 
@@ -1320,15 +1334,33 @@ def evaluate_weekly_trend(
         sharpe_5y = round((cagr_dec - rf) / vol_dec, 2) if vol_dec > 0.01 else 1.0
         sortino_5y = round((cagr_dec - rf) / downside_dev, 2) if downside_dev > 0.01 else 1.3
 
-        roll_max = c_tz_free.cummax()
-        dd_series = (c_tz_free / roll_max) - 1.0
+        roll_max = c_5y.cummax()
+        dd_series = (c_5y / roll_max) - 1.0
         max_dd_dec = float(dd_series.min()) if not dd_series.empty else -0.20
         max_dd_5y_pct = round(max_dd_dec * 100.0, 1)
         calmar_5y = round(cagr_dec / abs(max_dd_dec), 2) if abs(max_dd_dec) > 0.01 else 1.0
 
-        # Beta & Correlation vs S&P 500 (SPY, converted into GBP on the GBP basis) over 5 years
+        # Orthogonal GBP Cross-Sectional Momentum (12-1m), Frog-in-the-Pan Trend Smoothness & 1Y Downside Vol
+        mom_12_1_gbp_pct: Optional[float] = None
+        if len(c_5y) >= 53 and float(c_5y.iloc[-53]) > 0 and float(c_5y.iloc[-5]) > 0:
+            mom_12_1_gbp_pct = round(((float(c_5y.iloc[-5]) / float(c_5y.iloc[-53])) - 1.0) * 100.0, 1)
+
+        fip_pos_weeks_pct: Optional[float] = None
+        if len(wk_ret) >= 52:
+            fip_window = wk_ret.iloc[-52:-4]
+            if len(fip_window) >= 40:
+                fip_pos_weeks_pct = round(float((fip_window > 0).mean() * 100.0), 1)
+
+        downside_vol_1y_pct: Optional[float] = None
+        if len(wk_ret) >= 26:
+            r_1y = wk_ret.tail(52).values
+            d_1y = np.minimum(0.0, r_1y - mar_wk)
+            downside_vol_1y_pct = round(float(np.sqrt(np.mean(d_1y ** 2) * 52.0) * 100.0), 1)
+
+        # Beta, Correlation & Rolling 5Y Downside Crisis Alpha vs S&P 500 (SPY, converted into GBP on the GBP basis)
         beta_5y = 1.0
         corr_5y = 0.70
+        crisis_alpha_5y_pct: Optional[float] = None
         spy_w = bench_w
         if spy_w is not None and len(spy_w) > 30:
             spy_ret = spy_w.pct_change().dropna()
@@ -1341,6 +1373,10 @@ def evaluate_weekly_trend(
                 c_mat = aligned["asset"].corr(aligned["spy"])
                 if pd.notna(c_mat):
                     corr_5y = round(float(c_mat), 2)
+                stress_wks = aligned[aligned["spy"] < -0.01]
+                if len(stress_wks) >= 8:
+                    excess_wk = float((stress_wks["asset"] - stress_wks["spy"]).mean())
+                    crisis_alpha_5y_pct = round(max(-35.0, min(35.0, excess_wk * 52.0 * 100.0)), 1)
 
         # 2022 Inflation & Tech Bear Market Stress Return (Jan 2022 - Dec 2022)
         c_2022 = c_tz_free[(c_tz_free.index >= "2022-01-01") & (c_tz_free.index <= "2022-12-31")]
@@ -1421,6 +1457,10 @@ def evaluate_weekly_trend(
             "crash_2022_ret_pct": crash_2022_ret_pct,
             "beta_5y": beta_5y,
             "corr_5y": corr_5y,
+            "mom_12_1_gbp_pct": mom_12_1_gbp_pct,
+            "fip_pos_weeks_pct": fip_pos_weeks_pct,
+            "downside_vol_1y_pct": downside_vol_1y_pct,
+            "crisis_alpha_5y_pct": crisis_alpha_5y_pct,
             "crash_role_label": crash_role_label,
             "crash_role_color": crash_role_color,
             "fx_basis": fx_basis,
@@ -1920,7 +1960,13 @@ def analyze_position(
         highest_22 = float(df["High"].tail(22).max())
         chandelier_stop = round(highest_22 - (chandelier_mult * curr_atr), 2)
         atr_stop = latest_price - (STRATEGY_CONFIG["atr_multiplier_stop"] * curr_atr)
-        base_trailing_stop = max(chandelier_stop, curr_ema_50 * 0.96, atr_stop)
+        held_qty_init = _num(position_data.get("quantity"), 0.0) if position_data else 0.0
+        if held_qty_init <= 0 and weekly_s2 and curr_ema_200 > 0 and latest_price >= curr_ema_200:
+            # Unowned Weekly Stage 2 watchlist candidates anchor reference stop to structural Stage 2 support so
+            # healthy pullbacks below the 50d EMA are not falsely blocked as 'below reference stop' before entry.
+            base_trailing_stop = max(curr_ema_200 * 0.97, min(chandelier_stop, curr_ema_50 * 0.94), atr_stop)
+        else:
+            base_trailing_stop = max(chandelier_stop, curr_ema_50 * 0.96, atr_stop)
 
         # Institutional Profit-Protection Ratchet: Never let a winning trade turn into a loss
         avg_price = _num(position_data.get("averagePrice"), 0.0) if position_data else 0.0
@@ -1948,17 +1994,24 @@ def analyze_position(
         target_price = round(recent_high * 1.05, 2)
         pct_above_50 = (latest_price - curr_ema_50) / curr_ema_50 if curr_ema_50 > 0 else 0.0
         pct_above_20 = (latest_price - curr_ema_20) / curr_ema_20 if curr_ema_20 > 0 else 0.0
-        is_extended = (pct_above_20 > 0.065) or (curr_rsi > 68.0)
+        is_extended = (pct_above_20 > 0.12) or (curr_rsi > 73.0)
 
         # Institutional Asymmetric Risk/Reward Ratio: only against a valid analyst consensus target above the price.
         # ETFs, gold, money-market and leveraged products have no single-name target -> R:R None (neutral).
+        # When a valid single-stock analyst target is AT OR BELOW the live price, R:R stays None for schema compatibility
+        # while `analyst_target_bearish` applies the same asymmetry penalty/gate as a sub-2.0x target (no discontinuity).
         is_fund_like = (
             bool(research.get("is_etf")) or is_broad_index_etf(yf_ticker) or is_gold_etc(yf_ticker)
             or is_money_market_fund(yf_ticker) or is_leveraged
         )
         analyst_target = _num(research.get("target_mean_price"), None)
-        if was_split_normalized and analyst_target is not None and latest_price > 0 and analyst_target > latest_price * 3.0:
-            analyst_target = None  # ignore stale pre-split consensus target until data provider adjusts it
+        if analyst_target is not None and latest_price > 0 and (
+            analyst_target > latest_price * 3.0 or analyst_target < latest_price * 0.25
+        ):
+            analyst_target = None  # ignore 100x pence/currency or stale pre-split provider target glitches
+        analyst_target_bearish = bool(
+            analyst_target is not None and latest_price > 0 and analyst_target <= latest_price and not is_fund_like
+        )
         target_eval = analyst_target if (analyst_target is not None and analyst_target > latest_price and not is_fund_like) else None
 
         if trailing_stop < latest_price:
@@ -2004,7 +2057,7 @@ def analyze_position(
 
         if 32 <= curr_rsi <= 50 and weekly_s2:
             tech_score += 18  # Institutional Pullback-to-Value sweet spot
-        elif 50 < curr_rsi <= 58:
+        elif 50 < curr_rsi <= 65:
             tech_score += 12
         elif curr_rsi > 75:
             tech_score -= 25
@@ -2014,6 +2067,20 @@ def analyze_position(
         if macd_bullish: tech_score += 10
         if rs_alpha > 5.0: tech_score += 10
         elif rs_alpha < -5.0: tech_score -= 8
+
+        # Orthogonal 12-1m GBP Momentum & Frog-in-the-Pan Continuous Information Diffusion
+        mom_12_1 = _num(weekly_trend.get("mom_12_1_gbp_pct"), None)
+        fip_pos_wks = _num(weekly_trend.get("fip_pos_weeks_pct"), None)
+        if mom_12_1 is not None:
+            if mom_12_1 >= 18.0:
+                tech_score += 5
+            elif mom_12_1 <= -10.0:
+                tech_score -= 6
+        if fip_pos_wks is not None:
+            if fip_pos_wks >= 58.0:
+                tech_score += 5
+            elif fip_pos_wks < 44.0:
+                tech_score -= 5
 
         # Factor in Bearish Divergence drag (-12)
         if has_bearish_div:
@@ -2060,12 +2127,14 @@ def analyze_position(
         if vol_footprint["up_down_vol_ratio"] >= 1.25: vol_score += 15
         vol_score = max(5, min(99, vol_score))
 
-        # Asymmetry Score (10% weight): R:R None (no valid target) is neutral — no bonus, no penalty
+        # Asymmetry Score (10% weight): R:R None with no target is neutral; analyst target <= live price is bearish (-30)
         asym_score = 50
         if risk_reward_ratio is not None:
             if risk_reward_ratio >= 3.5: asym_score += 40
             elif risk_reward_ratio >= 2.5: asym_score += 25
             elif risk_reward_ratio < 1.8: asym_score -= 30
+        elif analyst_target_bearish:
+            asym_score -= 30
         asym_score = max(5, min(99, asym_score))
 
         composite_conviction = int(round(
@@ -2320,11 +2389,14 @@ def analyze_position(
                 reason = f"Stage 2 uptrend at support, but earnings call is in {days_to_earnings} days. Risk gatekeeper prevents pre-earnings entry."
                 plain_english_why = f"{company_name} is technically poised to buy, but earnings announcement is in {days_to_earnings} days. Wait for earnings clarity to avoid binary gap risk."
                 app_instruction = "Hold off on new orders ➔ Re-evaluate post-earnings"
-            elif risk_reward_ratio is not None and risk_reward_ratio < 2.0:
+            elif (risk_reward_ratio is not None and risk_reward_ratio < 2.0) or analyst_target_bearish:
                 signal = "🟡 HOLD (WAIT FOR ASYMMETRY)"
                 badge_color = "#6366f1"
                 action_short = "HOLD"
-                reason = f"Testing support, but Risk/Reward ratio ({risk_reward_ratio}:1) is below 2.0x institutional threshold."
+                if analyst_target_bearish and analyst_target is not None:
+                    reason = f"Testing support, but Wall Street consensus target ({analyst_target:,.2f}) is at or below current price ({latest_price:,.2f})."
+                else:
+                    reason = f"Testing support, but Risk/Reward ratio ({risk_reward_ratio}:1) is below 2.0x institutional threshold."
                 plain_english_why = f"{company_name} is in an uptrend, but upside to target does not yet offer favorable asymmetry over stop loss. Wait for a deeper dip."
                 app_instruction = "No action needed ➔ Wait for better entry"
             else:
@@ -2408,7 +2480,7 @@ def analyze_position(
                 "Surfaced for human thesis review — auto-selling oversold breakdowns historically hurt long-term compounding, so no automatic sell order is generated."
             )
             app_instruction = "Review long-term thesis ➔ No automatic order"
-        elif stop_breached and action_short not in ("SELL", "TRIM") and not is_earmarked_pos:
+        elif stop_breached and action_short not in ("SELL", "TRIM") and not is_earmarked_pos and not (is_exit_exempt and weekly_s2):
             prior_signal = signal
             signal = STOP_REVIEW_SIGNAL
             badge_color = "#f59e0b"
@@ -2441,6 +2513,7 @@ def analyze_position(
             "target_price": target_price,
             "rr_target_price": target_eval,
             "risk_reward_ratio": risk_reward_ratio,
+            "analyst_target_bearish": analyst_target_bearish,
             "days_to_earnings": days_to_earnings,
             "earnings_catalyst_status": research.get("earnings_catalyst_status", "✅ Clear"),
             "piotroski_score": research.get("piotroski_score"),
@@ -2471,6 +2544,10 @@ def analyze_position(
             "crash_2022_ret_pct": crash_2022_ret,
             "beta_5y": beta_5y,
             "corr_5y": corr_5y,
+            "mom_12_1_gbp_pct": weekly_trend.get("mom_12_1_gbp_pct"),
+            "fip_pos_weeks_pct": weekly_trend.get("fip_pos_weeks_pct"),
+            "downside_vol_1y_pct": weekly_trend.get("downside_vol_1y_pct"),
+            "crisis_alpha_5y_pct": weekly_trend.get("crisis_alpha_5y_pct"),
             "crash_role_label": weekly_trend.get("crash_role_label", "📈 5Y Secular Growth"),
             "crash_role_color": weekly_trend.get("crash_role_color", "#64748b"),
             "fx_basis": weekly_trend.get("fx_basis", "native"),
@@ -2628,8 +2705,8 @@ def scan_watchlist_opportunities(
 
         # Risk Gatekeeper 3: Prevent buying overextended stocks
         if analysis.get("is_extended", False):
-            logger.info("Watchlist ticker %s filtered out: price extended >6.5%% above 20 EMA or RSI >68", ticker)
-            _collect(analysis, "filtered: price extended (>6.5% above 20 EMA or RSI >68)")
+            logger.info("Watchlist ticker %s filtered out: price extended >12%% above 20 EMA or RSI >73", ticker)
+            _collect(analysis, "filtered: price extended (>12% above 20 EMA or RSI >73)")
             continue
 
         # Risk Gatekeeper 4: Pre-earnings blackout (never initiate binary bets <= 5 days before earnings)
@@ -2646,7 +2723,11 @@ def scan_watchlist_opportunities(
         # A conviction-based forced BUY is only allowed when the per-asset analysis passed its own gates:
         # data OK, earnings not imminent, no R:R / 'WAIT FOR ASYMMETRY' failure, not extended, not below its reference stop.
         rr = _num(analysis.get("risk_reward_ratio"), None)
-        rr_gate_failed = (rr is not None and rr < 2.0) or ("WAIT FOR ASYMMETRY" in str(analysis.get("signal", "")))
+        rr_gate_failed = (
+            (rr is not None and rr < 2.0)
+            or bool(analysis.get("analyst_target_bearish"))
+            or ("WAIT FOR ASYMMETRY" in str(analysis.get("signal", "")))
+        )
         passed_asset_gates = (
             analysis.get("data_ok", True) is not False
             and not earnings_imminent
@@ -2656,10 +2737,10 @@ def scan_watchlist_opportunities(
         )
         conviction = _num(analysis.get("conviction_score"), 0.0)
 
-        if (
+        if passed_asset_gates and (
             analysis["action_short"] == "BUY"
-            or (passed_asset_gates and conviction >= 74)
-            or (passed_asset_gates and analysis.get("is_crash_shield") and conviction >= 65)
+            or conviction >= 74
+            or (analysis.get("is_crash_shield") and conviction >= 65)
         ):
             if analysis["action_short"] != "BUY":
                 analysis["action_short"] = "BUY"
@@ -2676,11 +2757,14 @@ def scan_watchlist_opportunities(
         else:
             _collect(analysis, f"not selected: conviction {conviction:.0f} below the forced-BUY threshold")
 
-    # Ranking: conviction plus a pullback-zone bonus. The forward 5Y CAGR model estimate is display-only (not ranked on).
+    # Ranking: conviction plus pullback-zone bonus plus orthogonal 12-1m GBP momentum & Frog-in-the-Pan smoothness.
+    # The forward 5Y CAGR model estimate remains display-only (not ranked on).
     opportunities.sort(
         key=lambda x: (
             _num(x.get("conviction_score"), 0.0)
             + (8.0 if 30.0 <= _num(x.get("rsi"), 50.0) <= 48.0 else 0.0)
+            + (4.0 if (_num(x.get("mom_12_1_gbp_pct"), None) or 0.0) >= 20.0 else 0.0)
+            + (3.0 if (_num(x.get("fip_pos_weeks_pct"), None) or 0.0) >= 58.0 else 0.0)
         ),
         reverse=True,
     )
@@ -2712,18 +2796,22 @@ def compute_portfolio_5y_risk_profile(
     total_portfolio_gbp: float,
     sell_orders: Optional[List[Dict[str, Any]]] = None,
     buy_orders: Optional[List[Dict[str, Any]]] = None,
+    excluded_cash_gbp: float = 0.0,
 ) -> Dict[str, Any]:
     """Computes empirical + forward-looking 5-Year Horizon Risk-Adjusted Returns (CAGR, Covariance-Adjusted Sortino, Beta)
     and 2022 Bear Market Crash Stress-Test metrics for both the current portfolio and the post-plan optimized portfolio.
 
-    Earmarked tickers (config.EARMARKED_TICKERS) are excluded from the book and from the total. The post-plan book is
+    Earmarked tickers (config.EARMARKED_TICKERS) and parked reserve top-up cash (e.g. unwithdrawn earmarked proceeds)
+    are excluded from the book and from the total. The post-plan book is
     simulated per (account, ticker), so the same ticker held in two accounts keeps both copies; with no orders the
     post metrics equal the current metrics exactly. Only free cash counts towards the crash shield (blocked cash is
     committed to pending orders), and the true defensive metric is free cash + money-market (CSH2) + physical gold +
     short-dated gilt funds (IGLS/ERNS). The shield uses the same strict definition (is_crash_shield_asset).
     """
     earmarked_set = _earmarked_tickers()
-    free_cash = max(0.0, _num(available_cash_gbp, 0.0))
+    raw_free_cash = max(0.0, _num(available_cash_gbp, 0.0))
+    excl_cash = min(raw_free_cash, max(0.0, _num(excluded_cash_gbp, 0.0)))
+    free_cash = max(0.0, raw_free_cash - excl_cash)
     blocked_cash = max(0.0, _num(blocked_cash_gbp, 0.0))
 
     book: List[Dict[str, Any]] = []
@@ -2737,7 +2825,7 @@ def compute_portfolio_5y_risk_profile(
         book.append(pos)
 
     gross_total = max(0.0, _num(total_portfolio_gbp, 0.0))
-    investable_total = max(0.0, gross_total - earmarked_gbp)
+    investable_total = max(0.0, gross_total - earmarked_gbp - excl_cash)
     denom = max(1.0, investable_total)
     cash_now = free_cash + blocked_cash
 
@@ -3002,6 +3090,7 @@ def compute_portfolio_5y_risk_profile(
         "shield_target_pct": round(shield_target_pct, 1),
         "lev_cap_pct": round(lev_cap_pct, 1),
         "earmarked_gbp": round(earmarked_gbp, 2),
+        "excluded_cash_gbp": round(excl_cash, 2),
         "investable_total_gbp": round(investable_total, 2),
     }
 
@@ -3455,15 +3544,6 @@ def build_consolidated_portfolio_view(
                     order["account"] = acc_name
                 sim_buys.append(order)
 
-    combined_risk_5y = compute_portfolio_5y_risk_profile(
-        analyses=combined_analyses,
-        available_cash_gbp=total_liquid_cash_gbp,
-        blocked_cash_gbp=total_blocked_cash_gbp,
-        total_portfolio_gbp=total_net_worth_gbp,
-        sell_orders=sim_sells,
-        buy_orders=sim_buys,
-    )
-
     # Household strategic mix & US big-tech exposure (both accounts + vested outside holdings as ONE portfolio).
     # Temporary reserve top-up cash (money parked for withdrawal, e.g. the sold part of an earmarked fund) is left out
     # of the basis like earmarked funds; the rest of the uninvested cash counts as defensive.
@@ -3477,6 +3557,16 @@ def build_consolidated_portfolio_view(
         topup_cash = min(free_gbp, max(0.0, _num(acc_cfg.get("reserve_topup_gbp"), 0.0)))
         hh_excluded_cash += topup_cash
         hh_cash += free_gbp - topup_cash + blocked_gbp
+
+    combined_risk_5y = compute_portfolio_5y_risk_profile(
+        analyses=combined_analyses,
+        available_cash_gbp=total_liquid_cash_gbp,
+        blocked_cash_gbp=total_blocked_cash_gbp,
+        total_portfolio_gbp=total_net_worth_gbp,
+        sell_orders=sim_sells,
+        buy_orders=sim_buys,
+        excluded_cash_gbp=hh_excluded_cash,
+    )
     hh_holdings = [
         {"account": p.get("account"), "ticker": p.get("ticker", ""), "value_gbp": p.get("value_gbp")}
         for p in combined_analyses
@@ -3553,6 +3643,7 @@ def build_rebalancing_plan(
     account_name: Optional[str] = None,
     instrument_universe: Optional[List[Dict[str, Any]]] = None,
     as_of: Optional[date] = None,
+    reserve_topup_gbp: float = 0.0,
 ) -> Dict[str, Any]:
     """Builds an institutional 5-Year Horizon & Crash-Protected rebalancing plan with 100% harmonized table status, factoring in all pending transactions, blocked capital, and global unified portfolio context.
 
@@ -3637,8 +3728,9 @@ def build_rebalancing_plan(
     total_invested_gbp = sum(max(0.0, _num(pos.get("value_gbp"), 0.0)) for pos in analyses)
     official_total = _num(official_total_gbp, 0.0)
     total_portfolio_gbp = official_total if official_total > 0 else (total_invested_gbp + available_cash_gbp + blocked_cash_gbp)
-    # Earmarked money is excluded from the investable total used for ALL weights, caps, shield maths and sizing
-    investable_total_gbp = max(0.0, total_portfolio_gbp - earmarked_gbp)
+    # Earmarked money AND parked reserve top-up cash (e.g. unwithdrawn earmarked proceeds) are excluded from the investable total
+    excluded_topup_cash_gbp = min(available_cash_gbp, max(0.0, _num(reserve_topup_gbp, 0.0)))
+    investable_total_gbp = max(0.0, total_portfolio_gbp - earmarked_gbp - excluded_topup_cash_gbp)
     for pos in analyses:
         v = max(0.0, _num(pos.get("value_gbp"), 0.0))
         if pos["is_earmarked"]:
@@ -3823,21 +3915,28 @@ def build_rebalancing_plan(
 
             limit_txt = f" @ limit ${limit_p:,.2f}" if limit_p > 0 else ""
             stop_txt = f" @ stop {stop_p:,.2f}" if stop_p > 0 else ""
+            is_earmarked_sell = bool(pos["is_earmarked"])
+            if is_earmarked_sell:
+                ps_why = (
+                    f"Sell order for {name} ({_fmt_shares(order_qty)} shares) is queued in Trading 212. "
+                    f"Ring-fenced earmarked proceeds (~£{pending_val_gbp:,.0f}) stay protected for withdrawal and will NOT be deployed into stocks."
+                )
+            elif not is_immediate_fill:
+                ps_why = f"Resting {'stop' if is_stop_order else 'limit'} sell order for {name} ({_fmt_shares(order_qty)} shares{stop_txt}{limit_txt}) is queued in Trading 212."
+            else:
+                ps_why = f"Sell order for {name} ({_fmt_shares(order_qty)} shares) is already queued in Trading 212 awaiting execution. No action needed."
             pending_sell_orders.append({
                 "ticker": ticker,
                 "search_symbol": sym,
                 "name": name,
                 "action": "SELL (⏳ ALREADY PENDING IN TRADING 212)",
                 "is_pending": True,
+                "is_earmarked": is_earmarked_sell,
                 "shares": order_qty,
                 "price": pos.get("price", 0.0),
                 "currency": pos.get("currency", "USD"),
                 "estimated_gbp": pending_val_gbp,
-                "plain_english_why": (
-                    f"Resting {'stop' if is_stop_order else 'limit'} sell order for {name} ({_fmt_shares(order_qty)} shares{stop_txt}{limit_txt}) is queued in Trading 212."
-                    if not is_immediate_fill
-                    else f"Sell order for {name} ({_fmt_shares(order_qty)} shares) is already queued in Trading 212 awaiting execution. No action needed."
-                ),
+                "plain_english_why": ps_why,
                 "app_instruction": "Already queued in Trading 212 ➔ Awaiting market fill",
                 "badge_color": "#f59e0b",
                 "limit_price": limit_p,
@@ -3845,7 +3944,7 @@ def build_rebalancing_plan(
                 "order_type": order_type,
                 "is_immediate_fill": is_immediate_fill,
             })
-            if is_immediate_fill:
+            if is_immediate_fill and not is_earmarked_sell:
                 cash_from_sells += pending_val_gbp
                 if _sym(ticker):
                     cap_trimmed_ledger[_sym(ticker)] = _num(cap_trimmed_ledger.get(_sym(ticker)), 0.0) + pending_val_gbp
@@ -4319,12 +4418,14 @@ def build_rebalancing_plan(
         beta_5y = _num(cand.get("beta_5y"), 1.0)
         is_lev_cand = is_leveraged_etf(c_ticker_u)
 
-        # 1. Asymmetry bonus / penalty (R:R None = no valid analyst target: neutral, no bonus and no penalty)
+        # 1. Asymmetry bonus / penalty (R:R None with no target = neutral; analyst target <= live price = -20)
         if rr is not None:
             if rr >= 3.0:
                 cand["rebalance_score"] += 8
             elif rr < 2.0:
                 cand["rebalance_score"] -= 20
+        elif cand.get("analyst_target_bearish"):
+            cand["rebalance_score"] -= 20
 
         # 2. Forensic Quality boost
         if p_score is not None:
@@ -4388,13 +4489,8 @@ def build_rebalancing_plan(
         elif "Heavy Insider Selling" in insider_lbl:
             cand["rebalance_score"] -= 8  # Heavy executive liquidation
 
-        # 7d. Options Market Implied Sentiment (Put/Call Ratio)
-        pcr_val = c_research.get("options_pcr_vol")
-        if pcr_val is not None:
-            if pcr_val < 0.65:
-                cand["rebalance_score"] += 5  # Institutional call accumulation
-            elif pcr_val > 1.25:
-                cand["rebalance_score"] -= 8  # Heavy defensive put hedging skew
+        # 7d. Single-expiry options put/call volume ratio is intentionally NOT scored on a 5-year horizon
+        #     (displayed in research cards for context only; daily front-expiry volume skew is noisy).
 
         # 7e. Top-10 Institutional 13F Ownership Flow Momentum
         inst_chg = c_research.get("institutional_change_pct")
@@ -4414,15 +4510,28 @@ def build_rebalancing_plan(
         elif is_lev_cand or sort_5y < 0.50:
             cand["rebalance_score"] -= 20  # Severe volatility drag
 
-        # 7g. 2022 Bear Market Crash Alpha & Low-Beta Protection
-        if crash_22 >= 10.0:
-            cand["rebalance_score"] += 12  # Proven double-digit positive return in 2022 crash
-        elif crash_22 >= 0.0:
-            cand["rebalance_score"] += 8   # Positive return in 2022 crash
-        elif crash_22 >= -8.0:
-            cand["rebalance_score"] += 5   # Resilient single-digit drawdown in 2022 crash
-        elif crash_22 <= -45.0:
-            cand["rebalance_score"] -= 10
+        # 7g. Rolling 5Y Downside Crisis Alpha + Tempered 2022 Resilience (replaces single-year 2022 double-counting)
+        crisis_alpha_5y = _num(cand.get("crisis_alpha_5y_pct"), None)
+        if (crisis_alpha_5y is not None and crisis_alpha_5y >= 4.0) or crash_22 >= 5.0:
+            cand["rebalance_score"] += 5
+        elif crash_22 <= -50.0 and (crisis_alpha_5y is None or crisis_alpha_5y < -10.0):
+            cand["rebalance_score"] -= 6
+
+        # 7g2. Orthogonal Cross-Sectional GBP Momentum (12-1m) & Frog-in-the-Pan Trend Smoothness
+        mom_12_1_cand = _num(cand.get("mom_12_1_gbp_pct"), None)
+        if mom_12_1_cand is not None:
+            if mom_12_1_cand >= 20.0:
+                cand["rebalance_score"] += 7
+            elif mom_12_1_cand >= 8.0:
+                cand["rebalance_score"] += 4
+            elif mom_12_1_cand <= -10.0:
+                cand["rebalance_score"] -= 10
+        fip_cand = _num(cand.get("fip_pos_weeks_pct"), None)
+        if fip_cand is not None:
+            if fip_cand >= 58.0:
+                cand["rebalance_score"] += 5
+            elif fip_cand < 45.0:
+                cand["rebalance_score"] -= 5
 
         # 7h. ETF data equivalence (satellite funds such as sector / Nasdaq-100 ETFs do not report single-stock
         #     Piotroski / ROIC / EPS revisions). Core and defensive funds are bought through their household buckets,
@@ -4434,14 +4543,14 @@ def build_rebalancing_plan(
 
         # 7i. The forward 5Y CAGR model estimate is display-only (owner decision 2026-10-19): no score boost or penalty.
 
-        # 7j. Institutional Pullback-to-Value Timing Bonus (Buy wide-moat leaders on dips, don't chase spikes)
+        # 7j. Institutional Pullback-to-Value Timing Bonus (Buy wide-moat leaders on dips, without locking out steady trends)
         if cand.get("is_weekly_stage_2", False):
             if 30.0 <= c_rsi <= 46.0:
-                cand["rebalance_score"] += 10  # Prime institutional pullback accumulation zone
-            elif 46.0 < c_rsi <= 55.0:
-                cand["rebalance_score"] += 5   # Constructive mid-channel entry
-            elif c_rsi > 64.0:
-                cand["rebalance_score"] -= 8   # Extended short-term; prefer better pullback entry
+                cand["rebalance_score"] += 8   # Prime institutional pullback accumulation zone
+            elif 46.0 < c_rsi <= 58.0:
+                cand["rebalance_score"] += 4   # Constructive mid-channel entry
+            elif c_rsi > 70.0:
+                cand["rebalance_score"] -= 6   # Extended short-term; prefer better pullback entry
 
         # 8. Momentum Exhaustion Gatekeeper (Bearish Divergence)
         if cand.get("bearish_divergence"):
@@ -4502,13 +4611,17 @@ def build_rebalancing_plan(
 
         # (The old 'crash-shield completion' slot swap is gone: crash protection is now the defensive bucket's job.)
 
-        # Conviction over downside volatility (fractional-Kelly style). The forward 5Y CAGR estimate no longer scales sizes.
+        # Conviction over tempered downside volatility (fractional-Kelly style). The forward 5Y CAGR estimate no longer scales sizes.
         for cand in selected_candidates:
             c_t = cand["ticker"]
             vcp = _num(cand.get("vcp_pct"), None)
             if vcp is None or vcp <= 0:
                 vcp = 2.0
-            vol_risk = max(1.2, float(vcp))
+            dvol_1y = _num(cand.get("downside_vol_1y_pct"), None)
+            if dvol_1y is not None and dvol_1y > 0:
+                vol_risk = max(1.2, 0.5 * float(vcp) + 0.5 * (math.sqrt(float(dvol_1y)) * 0.45))
+            else:
+                vol_risk = max(1.2, float(vcp))
             score_factor = max(15.0, float(cand.get("rebalance_score", 50)))
             candidate_weights[c_t] = score_factor / vol_risk
 
@@ -5019,6 +5132,7 @@ def build_rebalancing_plan(
         total_portfolio_gbp=total_portfolio_gbp,
         sell_orders=sell_orders,
         buy_orders=buy_orders,
+        excluded_cash_gbp=excluded_topup_cash_gbp,
     )
 
     return {
@@ -5130,7 +5244,8 @@ def generate_tldr_summary(results_by_account: Dict[str, Dict[str, Any]]) -> Dict
             lim_str = f" @ limit ${lim:,.2f}" if lim > 0 else ""
             s_name = ps.get("name", ps.get("ticker"))
             s_sym = ps.get("search_symbol", ps.get("ticker"))
-            sells_already_queued.append(f"{s_name} ({s_sym}){lim_str}")
+            ring_str = " [ring-fenced for withdrawal]" if ps.get("is_earmarked") else ""
+            sells_already_queued.append(f"{s_name} ({s_sym}){lim_str}{ring_str}")
 
         buys_already_queued = []
         for pb_sym, pb in pending_buys.items():
@@ -5153,7 +5268,9 @@ def generate_tldr_summary(results_by_account: Dict[str, Dict[str, Any]]) -> Dict
         hold_names = [h.get("name", h.get("ticker")) for h in hold_items]
 
         def _is_market_like(ps: Dict[str, Any]) -> bool:
-            # STOP / STOP_LIMIT orders only fill on a future price move, so they never count as queued proceeds
+            # Earmarked sells are liquidated for withdrawal, never deployable proceeds; STOP orders only fill on future moves
+            if ps.get("is_earmarked"):
+                return False
             order_type = str(ps.get("order_type") or "MARKET").upper()
             if "STOP" in order_type:
                 return False

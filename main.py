@@ -14,6 +14,7 @@ from portfolio_storage import (
     append_recommendation_records,
     compute_day_over_day_delta,
     compute_external_flows,
+    compute_unwithdrawn_earmarked_proceeds_gbp,
     detect_and_record_trades,
     get_position_entries,
     get_position_trims,
@@ -109,12 +110,19 @@ def _reserve_status_text(plan: Dict[str, Any], cfg: Optional[Dict[str, Any]] = N
   floor, funded, shortfall = _reserve_figures(plan)
   topup_note = ""
   if cfg and _num(cfg.get("reserve_topup_gbp"), 0.0) > 0:
-    until = cfg.get("reserve_topup_until")
-    topup_note = (
-        f" (includes £{_num(cfg.get('reserve_topup_gbp')):,.0f} temporary top-up"
-        + (f" until {until}" if until else "")
-        + ")"
-    )
+    topup_amt = _num(cfg.get("reserve_topup_gbp"))
+    earm_amt = _num(cfg.get("earmarked_proceeds_gbp"), 0.0)
+    earm_tickers = cfg.get("earmarked_proceeds_tickers") or []
+    if earm_amt > 0 and earm_amt >= topup_amt - 0.5:
+      t_lbl = ", ".join(str(t) for t in earm_tickers) or "earmarked"
+      topup_note = f" (includes £{topup_amt:,.0f} ring-fenced {t_lbl} sale proceeds awaiting withdrawal)"
+    else:
+      until = cfg.get("reserve_topup_until")
+      topup_note = (
+          f" (includes £{topup_amt:,.0f} temporary top-up"
+          + (f" until {until}" if until else "")
+          + ")"
+      )
   if shortfall > 0.5:
     return (
         f"Cash Reserve Floor £{floor:,.0f}{topup_note}: UNFUNDED — only £{funded:,.0f} is held in free cash"
@@ -534,6 +542,36 @@ def run_pipeline(
     if detected_trades:
       logger.info("Auto-detected %d trade execution events.", len(detected_trades))
 
+  # Auto-ring-fence any unwithdrawn earmarked sale proceeds sitting in free cash (both live and --dry-run)
+  if not use_mock:
+    for account_name, acc_info in raw_accounts_data.items():
+      earmarked_cash = compute_unwithdrawn_earmarked_proceeds_gbp(
+          account_name=account_name,
+          current_positions=acc_info["raw_positions"],
+          cash_data=acc_info["cash"],
+          earmarked_tickers=EARMARKED_TICKERS,
+          current_date_str=run_date,
+          gbp_rate=gbp_rate,
+      )
+      unwithdrawn_gbp = _num(earmarked_cash.get("unwithdrawn_gbp"), 0.0)
+      if unwithdrawn_gbp > 0:
+        cfg_copy = dict(acc_info["cfg"])
+        base_res = _num(cfg_copy.get("base_min_cash_reserve_gbp"), _num(cfg_copy.get("min_cash_reserve_gbp"), 1500.0))
+        manual_topup = _num(cfg_copy.get("reserve_topup_gbp"), 0.0)
+        effective_topup = max(manual_topup, unwithdrawn_gbp)
+        cfg_copy["reserve_topup_gbp"] = effective_topup
+        cfg_copy["min_cash_reserve_gbp"] = base_res + effective_topup
+        cfg_copy["earmarked_proceeds_gbp"] = unwithdrawn_gbp
+        cfg_copy["earmarked_proceeds_tickers"] = earmarked_cash.get("tickers") or []
+        acc_info["cfg"] = cfg_copy
+        logger.info(
+            "Auto-ring-fenced £%.2f of unwithdrawn earmarked proceeds (%s) in %s; protected cash reserve raised to £%.2f.",
+            unwithdrawn_gbp,
+            ", ".join(cfg_copy["earmarked_proceeds_tickers"]) or "earmarked",
+            account_name,
+            cfg_copy["min_cash_reserve_gbp"],
+        )
+
   # Conduct deep fundamental and technical audit on existing holdings with fresh trade/trim history
   for account_name, acc_info in raw_accounts_data.items():
     analyses = []
@@ -591,6 +629,7 @@ def run_pipeline(
     available_cash = cash_data.get("free_gbp", cash_data.get("free", 0.0))
     blocked_cash_val = cash_data.get("blocked_gbp", cash_data.get("blocked", 0.0))
     min_reserve = cfg.get("min_cash_reserve_gbp", 1500.0)
+    topup_reserve = _num(cfg.get("reserve_topup_gbp"), 0.0)
 
     official_total = float(cash_data.get("total", 0.0) or 0.0)
     rebalance_plan = build_rebalancing_plan(
@@ -607,6 +646,7 @@ def run_pipeline(
         # Every scanned watchlist analysis (gate failures included), so the household allocation can price the
         # core / defensive funds it routes new money into.
         instrument_universe=watchlist_scan,
+        reserve_topup_gbp=topup_reserve,
     )
 
     results_by_account[account_name] = {

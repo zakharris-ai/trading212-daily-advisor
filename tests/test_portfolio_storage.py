@@ -287,6 +287,10 @@ class ReadOnlyGetterTests(_TempDataDirMixin, unittest.TestCase):
             ps.load_portfolio_history(),
             ps.compute_external_flows(accounts, current_date_str="2026-10-02", gbp_rate=1.3),
             ps.compute_day_over_day_delta(1000.0, {"Main": 1000.0}, current_date_str="2026-10-02"),
+            ps.compute_unwithdrawn_earmarked_proceeds_gbp(
+                "Main", [], {"recent_transactions": [], "currency": "GBP"}, {"CSH2.L"},
+                current_date_str="2026-10-02", gbp_rate=1.3,
+            ),
         ]
 
     def test_getters_never_create_files_or_directories(self):
@@ -640,6 +644,122 @@ class CleanupScriptTests(unittest.TestCase):
             self.assertEqual(self.cleanup.main(["--data-dir", str(tmp)]), 0)
         self.assertEqual({p.name: p.read_bytes() for p in tmp.iterdir()}, snapshot)
         self.assertIn("none (already clean)", out.getvalue())
+
+
+class EarmarkedProceedsAndTradeCurrencyTests(_TempDataDirMixin, unittest.TestCase):
+    def test_trade_log_records_accurate_currency_and_sell_value_gbp(self):
+        day1 = {
+            "Main": [
+                self._pos("CSH2l_EQ", "CSH2.L", 4000.0, price=500.0),
+                self._pos("VWRPl_EQ", "VWRP.L", 10.0, price=120.5),
+                self._pos("VUAAl_EQ", "VUAA.L", 5.0, price=110.0),
+                self._pos("ASMLa_EQ", "ASML.AS", 2.0, price=1200.0),
+                self._pos("NESNs_EQ", "NESN.SW", 4.0, price=85.0),
+                self._pos("NVDA_US_EQ", "NVDA", 10.0, price=180.0),
+            ]
+        }
+        created = {t["ticker"]: t for t in self._detect("2026-11-01", day1)}
+        self.assertEqual(created["CSH2.L"]["currency"], "GBX")
+        self.assertEqual(created["VWRP.L"]["currency"], "GBP")
+        self.assertEqual(created["VUAA.L"]["currency"], "USD")
+        self.assertEqual(created["ASML.AS"]["currency"], "EUR")
+        self.assertEqual(created["NESN.SW"]["currency"], "CHF")
+        self.assertEqual(created["NVDA"]["currency"], "USD")
+
+        self._snapshot("2026-11-01", day1)
+        snap_path = ps.SNAPSHOTS_DIR / "2026-11-01.json"
+        snap_doc = json.loads(snap_path.read_text(encoding="utf-8"))
+        for p in snap_doc["accounts"]["Main"]["positions"]:
+            if p["ticker"] == "CSH2.L":
+                p["currency"] = "GBX"
+                p["value_gbp"] = round(4000.0 * 500.0 / 100.0, 2)
+        snap_path.write_text(json.dumps(snap_doc), encoding="utf-8")
+
+        day2 = {
+            "Main": [
+                self._pos("VWRPl_EQ", "VWRP.L", 6.0, price=121.0),
+                self._pos("VUAAl_EQ", "VUAA.L", 5.0, price=110.0),
+                self._pos("ASMLa_EQ", "ASML.AS", 2.0, price=1200.0),
+                self._pos("NESNs_EQ", "NESN.SW", 4.0, price=85.0),
+                self._pos("NVDA_US_EQ", "NVDA", 10.0, price=180.0),
+            ]
+        }
+        events = {t["ticker"]: t for t in self._detect("2026-11-02", day2)}
+        self.assertEqual(events["CSH2.L"]["action"], "SELL (CLOSED)")
+        self.assertEqual(events["CSH2.L"]["currency"], "GBX")
+        self.assertAlmostEqual(events["CSH2.L"]["value_gbp"], 20000.0, places=2)
+        self.assertEqual(events["VWRP.L"]["action"], "SELL (TRIMMED)")
+        self.assertEqual(events["VWRP.L"]["currency"], "GBP")
+        self.assertAlmostEqual(events["VWRP.L"]["value_gbp"], 4.0 * 120.5, places=2)
+
+    def test_earmarked_sale_ringfences_proceeds_in_dry_run_and_live_then_clears_on_withdraw(self):
+        day1_pos = [
+            self._pos("CSH2l_EQ", "CSH2.L", 4000.0, price=500.0),
+            self._pos("VWRPl_EQ", "VWRP.L", 100.0, price=120.0),
+        ]
+        self._detect("2026-11-01", {"Main": day1_pos})
+        self._snapshot("2026-11-01", {"Main": day1_pos}, cash={"Main": {"free": 0.25, "free_gbp": 0.25, "currency": "GBP"}})
+        snap_path = ps.SNAPSHOTS_DIR / "2026-11-01.json"
+        snap_doc = json.loads(snap_path.read_text(encoding="utf-8"))
+        for p in snap_doc["accounts"]["Main"]["positions"]:
+            if p["ticker"] == "CSH2.L":
+                p["currency"] = "GBX"
+                p["value_gbp"] = 20000.0
+        snap_path.write_text(json.dumps(snap_doc), encoding="utf-8")
+
+        res_day1 = ps.compute_unwithdrawn_earmarked_proceeds_gbp(
+            "Main", day1_pos, {"free": 0.25, "free_gbp": 0.25, "recent_transactions": [], "currency": "GBP"},
+            {"CSH2.L"}, current_date_str="2026-11-01", gbp_rate=1.28,
+        )
+        self.assertEqual(res_day1["unwithdrawn_gbp"], 0.0)
+
+        day2_pos = [self._pos("VWRPl_EQ", "VWRP.L", 100.0, price=120.5)]
+        cash_filled = {"free": 20000.25, "free_gbp": 20000.25, "recent_transactions": [], "currency": "GBP"}
+        res_dry = ps.compute_unwithdrawn_earmarked_proceeds_gbp(
+            "Main", day2_pos, cash_filled, {"CSH2.L"}, current_date_str="2026-11-02", gbp_rate=1.28,
+        )
+        self.assertAlmostEqual(res_dry["unwithdrawn_gbp"], 20000.0, places=2)
+        self.assertEqual(res_dry["tickers"], ["CSH2.L"])
+
+        self._detect("2026-11-02", {"Main": day2_pos})
+        res_live = ps.compute_unwithdrawn_earmarked_proceeds_gbp(
+            "Main", day2_pos, cash_filled, {"CSH2.L"}, current_date_str="2026-11-02", gbp_rate=1.28,
+        )
+        self.assertAlmostEqual(res_live["unwithdrawn_gbp"], 20000.0, places=2)
+        self._snapshot("2026-11-02", {"Main": day2_pos}, cash={"Main": cash_filled})
+
+        cash_withdrawn = {
+            "free": 0.25,
+            "free_gbp": 0.25,
+            "currency": "GBP",
+            "recent_transactions": [
+                {"type": "WITHDRAW", "amount": -20000.0, "reference": "WD-EARMARK-1", "dateTime": "2026-11-04T09:15:00Z"},
+            ],
+        }
+        res_after_wd = ps.compute_unwithdrawn_earmarked_proceeds_gbp(
+            "Main", day2_pos, cash_withdrawn, {"CSH2.L"}, current_date_str="2026-11-04", gbp_rate=1.28,
+        )
+        self.assertEqual(res_after_wd["unwithdrawn_gbp"], 0.0)
+
+    def test_earmarked_proceeds_self_heal_via_snapshot_cash_clamp_and_rebuy(self):
+        day1_pos = [self._pos("CSH2l_EQ", "CSH2.L", 100.0, price=500.0)]  # £500 in GBX
+        self._detect("2026-11-01", {"Main": day1_pos})
+        self._snapshot("2026-11-01", {"Main": day1_pos}, cash={"Main": {"free": 0.0, "free_gbp": 0.0, "currency": "GBP"}})
+        snap1 = ps.SNAPSHOTS_DIR / "2026-11-01.json"
+        doc1 = json.loads(snap1.read_text(encoding="utf-8"))
+        doc1["accounts"]["Main"]["positions"][0]["currency"] = "GBX"
+        doc1["accounts"]["Main"]["positions"][0]["value_gbp"] = 500.0
+        snap1.write_text(json.dumps(doc1), encoding="utf-8")
+
+        self._detect("2026-11-02", {"Main": []})
+        self._snapshot("2026-11-02", {"Main": []}, cash={"Main": {"free": 500.0, "free_gbp": 500.0, "currency": "GBP"}})
+        self._snapshot("2026-11-03", {"Main": []}, cash={"Main": {"free": 50.0, "free_gbp": 50.0, "currency": "GBP"}})
+
+        res = ps.compute_unwithdrawn_earmarked_proceeds_gbp(
+            "Main", [], {"free": 3050.0, "free_gbp": 3050.0, "recent_transactions": [], "currency": "GBP"},
+            {"CSH2.L"}, current_date_str="2026-11-04", gbp_rate=1.28,
+        )
+        self.assertEqual(res["unwithdrawn_gbp"], 50.0)
 
 
 if __name__ == "__main__":

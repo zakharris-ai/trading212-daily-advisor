@@ -37,6 +37,7 @@ class FakeTicker:
         raise_fast_info: bool = False,
         balance_sheet: Optional[pd.DataFrame] = None,
         financials: Optional[pd.DataFrame] = None,
+        cashflow: Optional[pd.DataFrame] = None,
         calendar: Any = None,
     ):
         self.ticker = symbol
@@ -47,6 +48,7 @@ class FakeTicker:
         self._raise_fast_info = raise_fast_info
         self.balance_sheet = balance_sheet
         self.financials = financials
+        self.cashflow = cashflow
         self.calendar = calendar
         self.earnings_history = None
         self.eps_revisions = None
@@ -691,6 +693,108 @@ class DisplayModuleSmokeTests(_QuietLogsMixin, unittest.TestCase):
                 self.assertIn("True defensive", html)
                 self.assertIn("Ring-fenced (excluded from portfolio maths): CSH2.L £20,000", html)
                 self.assertIn("Holdings outside Trading 212 (ACME)", html)
+
+
+class GoalStrategyReviewResearchTests(_QuietLogsMixin, unittest.TestCase):
+    def test_backfill_info_from_statements_rescues_missing_yahoo_fields(self):
+        sparse_info = {
+            "symbol": "ASML.AS",
+            "shortName": "ASML Holding",
+            "sector": "Technology",
+            "industry": "Semiconductor Equipment & Materials",
+            "currency": "EUR",
+            "financialCurrency": "EUR",
+            "marketCap": 300e9,
+            "forwardPE": 26.0,
+            "trailingPE": 30.0,
+            "recommendationKey": "buy",
+        }
+        financials = pd.DataFrame(
+            {"2025": [28e9, 15e9, 9.5e9, 8.8e9], "2024": [24e9, 12.5e9, 7.8e9, 7.2e9]},
+            index=["Total Revenue", "Gross Profit", "Operating Income", "Net Income"],
+        )
+        cashflow = pd.DataFrame(
+            {"2025": [10.5e9, -1.8e9], "2024": [8.5e9, -1.6e9]},
+            index=["Operating Cash Flow", "Capital Expenditure"],
+        )
+        balance_sheet = pd.DataFrame(
+            {"2025": [12e9, 4.5e9, 16e9, 22e9, 11e9]},
+            index=["Cash And Cash Equivalents", "Total Debt", "Stockholders Equity", "Current Assets", "Current Liabilities"],
+        )
+        fake = FakeTicker("ASML.AS", info=sparse_info, last_price=750.0,
+                          financials=financials, cashflow=cashflow, balance_sheet=balance_sheet)
+        with mock.patch.object(research_agent.yf, "Ticker", side_effect=_ticker_factory({"ASML.AS": fake})):
+            res = DeepResearchAgent().conduct_deep_dive("ASML.AS")
+        self.assertTrue(res["data_ok"])
+        self.assertIsNotNone(res["piotroski_score"])
+        self.assertGreaterEqual(res["piotroski_score"], 8)
+        self.assertIsNotNone(res["fcf_yield_pct"])
+        self.assertGreater(res["operating_margin_pct"], 30.0)
+
+    def test_insufficient_piotroski_inputs_returns_none_and_neutral_pillar_without_false_warnings(self):
+        minimal_info = {
+            "symbol": "INTL.PA",
+            "shortName": "Intl Industrials SA",
+            "sector": "Industrials",
+            "industry": "Specialty Industrial Machinery",
+            "currency": "EUR",
+            "financialCurrency": "EUR",
+            "marketCap": 40e9,
+            "forwardPE": 18.0,
+            "trailingPE": 20.0,
+            "netIncomeToCommon": None,
+            "operatingCashflow": None,
+            "recommendationKey": "buy",
+        }
+        fake = FakeTicker("INTL.PA", info=minimal_info, last_price=120.0)
+        with mock.patch.object(research_agent.yf, "Ticker", side_effect=_ticker_factory({"INTL.PA": fake})):
+            res = DeepResearchAgent().conduct_deep_dive("INTL.PA")
+        self.assertTrue(res["data_ok"])
+        self.assertIsNone(res["piotroski_score"])
+        self.assertIn("Insufficient Fundamental Data", res["piotroski_label"])
+        checks_blob = " | ".join(res["piotroski_factors"])
+        self.assertNotIn("Negative Net Income", checks_blob)
+        self.assertNotIn("Negative Operating Cash Flow", checks_blob)
+        self.assertGreaterEqual(res["fundamental_score"], 50)
+
+    def test_altman_z_na_for_financials_and_insurers_but_active_for_payment_networks(self):
+        agent = DeepResearchAgent()
+        balance_sheet = pd.DataFrame(
+            {"2025": [90e9, 15e9, 35e9, 40e9]},
+            index=["Total Assets", "Working Capital", "Retained Earnings", "Total Liabilities Net Minority Interest"],
+        )
+        financials = pd.DataFrame({"2025": [25e9, 36e9]}, index=["EBIT", "Total Revenue"])
+
+        brk_info = _healthy_stock_info(symbol="BRK-B", sector="Financial Services", industry="Insurance - Diversified")
+        brk_ticker = FakeTicker("BRK-B", info=brk_info, balance_sheet=balance_sheet, financials=financials)
+        z_brk, lbl_brk, _ = agent._compute_altman_z_score(brk_ticker, brk_info)
+        self.assertIsNone(z_brk)
+        self.assertIn("Financial/Insurance Balance Sheet", lbl_brk)
+
+        visa_info = _healthy_stock_info(symbol="V", sector="Financial Services", industry="Credit Services")
+        visa_ticker = FakeTicker("V", info=visa_info, balance_sheet=balance_sheet, financials=financials)
+        z_visa, lbl_visa, _ = agent._compute_altman_z_score(visa_ticker, visa_info)
+        self.assertIsNotNone(z_visa)
+        self.assertGreater(z_visa, 2.0)
+        self.assertNotIn("N/A", lbl_visa)
+
+    def test_intrinsic_5y_compounding_uses_quantitative_moat_not_dossier_membership(self):
+        agent = DeepResearchAgent()
+        metrics = {
+            "roic": 32.0,
+            "operating_margin_pct": 35.0,
+            "gross_margin_pct": 65.0,
+            "revenue_growth_yoy": 18.0,
+            "earnings_growth_yoy": 20.0,
+            "forward_pe": 28.0,
+            "fcf_yield_pct": 3.2,
+            "rule_of_40": 53.0,
+            "eps_revision_momentum_pct": 60.0,
+        }
+        in_dossier = agent._compute_intrinsic_5y_compounding(dict(metrics, ticker="NVDA"))
+        not_in_dossier = agent._compute_intrinsic_5y_compounding(dict(metrics, ticker="NEWCHIP"))
+        self.assertEqual(in_dossier["fair_pe_multiple"], not_in_dossier["fair_pe_multiple"])
+        self.assertEqual(in_dossier["expected_5y_cagr_pct"], not_in_dossier["expected_5y_cagr_pct"])
 
 
 if __name__ == "__main__":

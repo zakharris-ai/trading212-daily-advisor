@@ -972,10 +972,21 @@ def generate_dashboard_html(
         </div>""")
         else:
             has_trims = any("TRIM" in s.get("action", "") for s in actionable_sells)
-            badge_text = "🟠 PROFIT HARVESTING & REALLOCATION ACTIVE" if has_trims else ("🔴 CAPITAL REALLOCATION ACTIVE" if actionable_sells else "🟢 CAPITAL DEPLOYMENT ACTIVE")
+            if not actionable_sells and not buy_orders:
+                badge_text = "✅ ALL SET — PENDING ORDER QUEUED"
+                badge_class = "badge-emerald"
+            elif has_trims:
+                badge_text = "🟠 PROFIT HARVESTING & REALLOCATION ACTIVE"
+                badge_class = "badge-amber"
+            elif actionable_sells:
+                badge_text = "🔴 CAPITAL REALLOCATION ACTIVE"
+                badge_class = "badge-amber"
+            else:
+                badge_text = "🟢 CAPITAL DEPLOYMENT ACTIVE"
+                badge_class = "badge-emerald"
             action_badges_by_account[acc_name] = {
                 "text": badge_text,
-                "class": "badge-amber" if (has_trims or actionable_sells) else "badge-emerald"
+                "class": badge_class,
             }
 
             for pso in pending_sells:
@@ -987,6 +998,11 @@ def generate_dashboard_html(
                 s_name = pso.get("name", pso.get("ticker"))
                 s_sym = pso.get("search_symbol", pso.get("ticker"))
                 shares_amt = _num(pso.get("shares"), 0.0)
+                fill_note = (
+                    f"+£{pso_val:,.0f} ring-fenced cash for withdrawal when filled — never deployed into stocks"
+                    if pso.get("is_earmarked")
+                    else f"+£{pso_val:,.0f} cash when filled"
+                )
                 cards.append(f"""
         <div class="action-card" style="border-left: 5px solid var(--primary); background: linear-gradient(135deg, rgba(59, 130, 246, 0.06), var(--card-bg) 60%);">
           <div class="action-header">
@@ -994,7 +1010,7 @@ def generate_dashboard_html(
             <span class="action-badge" style="background: rgba(59, 130, 246, 0.15); color: var(--primary);">NO ACTION NEEDED</span>
           </div>
           <div class="action-instruction">SELL {s_name} ({s_sym}) ~{shares_amt:,.2f} shares{lim_str}</div>
-          <div class="action-why"><b>Status:</b> Order is resting in Trading 212 awaiting execution (+£{pso_val:,.0f} cash when filled). No duplicate action needed.</div>
+          <div class="action-why"><b>Status:</b> Order is resting in Trading 212 awaiting execution ({fill_note}). No duplicate action needed.</div>
         </div>""")
 
             for so in actionable_sells:

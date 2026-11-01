@@ -472,7 +472,7 @@ BIG_TECH_LOOKTHROUGH: Dict[str, float] = {
 }
 
 # --- MODEL VERSION (stamped on every recommendation-ledger record and snapshot) ---
-MODEL_VERSION = "2026.10.27-max-compounding"
+MODEL_VERSION = "2026.11.01-oos-fortress-v2"
 
 # --- OPTIONAL EXCLUDED TICKERS ---
 # Set EXCLUDED_TICKERS="TSLA,COIN" in .env if you want the engine to never buy specific tickers.

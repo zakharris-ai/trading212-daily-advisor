@@ -34,6 +34,24 @@ EXTERNAL_FLOW_TYPES = ("DEPOSIT", "WITHDRAW")
 # Share-quantity tolerance when comparing holdings (fractional shares).
 _QTY_EPS = 1e-4
 
+# LSE ETFs quoted in USD rather than GBP/GBX (used only when neither live nor snapshot currency is present)
+_USD_QUOTED_LSE_ROOTS = {"VUAA", "CNDX", "VWRA", "CSPX", "EQQQ", "IUIT", "QQQ3"}
+
+
+def _infer_quote_currency(ticker: str, price: float = 0.0) -> str:
+    """Best-effort quote currency when a raw broker position carries no explicit currency field."""
+    t = str(ticker or "").strip().upper()
+    if t.endswith((".AS", ".DE", ".PA")):
+        return "EUR"
+    if t.endswith(".SW"):
+        return "CHF"
+    if t.endswith(".L"):
+        root = t[:-2]
+        if root in _USD_QUOTED_LSE_ROOTS:
+            return "USD"
+        return "GBX" if price >= 500.0 else "GBP"
+    return "USD"
+
 _ISO_TS_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}:\d{2}(?::\d{2})?)(\.\d+)?)?\s*(Z|[+-]\d{2}:?\d{2})?$",
     re.IGNORECASE,
@@ -399,8 +417,12 @@ def detect_and_record_trades(
             prior_qty = _position_qty(prior_pos)
             ref_pos = pos or prior_pos or {}
             pos_price = _to_float(ref_pos.get("currentPrice") or ref_pos.get("price"), 0.0)
-            pos_name = ref_pos.get("name") or ticker
-            pos_currency = ref_pos.get("currency", "USD")
+            pos_name = ref_pos.get("name") or (prior_pos or {}).get("name") or ticker
+            inferred_ccy = _infer_quote_currency(ticker, pos_price)
+            prior_ccy = (prior_pos or {}).get("currency")
+            if prior_ccy == "USD" and inferred_ccy != "USD":
+                prior_ccy = None  # ignore legacy USD defaults on non-US exchange lines (.L/.AS/.DE/.PA/.SW)
+            pos_currency = ref_pos.get("currency") or prior_ccy or inferred_ccy
             timestamp = datetime.now().isoformat()
 
             if prior_qty > _QTY_EPS and curr_qty > _QTY_EPS and _looks_like_split(
@@ -489,6 +511,9 @@ def detect_and_record_trades(
                     "price": pos_price,
                     "currency": pos_currency,
                 }
+                prior_val_gbp = _to_float((prior_pos or {}).get("value_gbp"), 0.0)
+                if prior_val_gbp > 0:
+                    event["value_gbp"] = round(prior_val_gbp, 2)
                 if pos is None:
                     event["price_source"] = "prior_snapshot"
                 if _record(event):
@@ -498,7 +523,7 @@ def detect_and_record_trades(
                 # Reduced position (trimmed, still held)
                 shares_trimmed = prior_qty - curr_qty
                 acc_trims[ticker] = current_date_str
-                if _record({
+                trim_event = {
                     "date": current_date_str,
                     "timestamp": timestamp,
                     "account": acc_name,
@@ -509,7 +534,11 @@ def detect_and_record_trades(
                     "remaining_shares": curr_qty,
                     "price": pos_price,
                     "currency": pos_currency,
-                }):
+                }
+                prior_val_gbp = _to_float((prior_pos or {}).get("value_gbp"), 0.0)
+                if prior_val_gbp > 0 and prior_qty > _QTY_EPS:
+                    trim_event["value_gbp"] = round(prior_val_gbp * min(1.0, shares_trimmed / prior_qty), 2)
+                if _record(trim_event):
                     logger.info("Recorded position trim for %s (%s): -%.2f shares", ticker, acc_name, shares_trimmed)
 
             elif curr_qty > _QTY_EPS:
@@ -611,6 +640,282 @@ def compute_external_flows(
         "total_gbp": round(sum(by_account.values()), 2),
         "prior_date": prior.get("date") if prior else None,
         "complete": complete,
+    }
+
+
+def _earmarked_event_gbp(
+    canon_ticker: str,
+    shares: float,
+    price: float,
+    currency: str,
+    explicit_value_gbp: float,
+    prior_snap_pos: Optional[Dict[str, Any]],
+    gbp_rate: Optional[float],
+) -> float:
+    """Values an earmarked BUY/SELL trade event in GBP without touching network or disk."""
+    if explicit_value_gbp > 0:
+        return explicit_value_gbp
+    if shares <= _QTY_EPS:
+        return 0.0
+    if prior_snap_pos is not None:
+        snap_qty = _position_qty(prior_snap_pos)
+        snap_val = _to_float(prior_snap_pos.get("value_gbp"), 0.0)
+        if snap_qty > _QTY_EPS and snap_val > 0:
+            return shares * (snap_val / snap_qty)
+    if price <= 0:
+        return 0.0
+    ccy = str(currency or "").strip()
+    ccy_u = ccy.upper()
+    raw_val = shares * price
+    if ccy == "GBp" or ccy_u in ("GBX", "PENCE", "GBPX"):
+        return raw_val / 100.0
+    if canon_ticker.endswith(".L") and canon_ticker[:-2] not in _USD_QUOTED_LSE_ROOTS and price >= 250.0:
+        # Historical trade_log entries before currency inference stamped LSE pence lines (e.g. CSH2.L @ 503p / 125680p) as USD
+        return raw_val / 100.0
+    if ccy_u == "USD" and gbp_rate and gbp_rate > 0:
+        return raw_val / float(gbp_rate)
+    return raw_val
+
+
+def compute_unwithdrawn_earmarked_proceeds_gbp(
+    account_name: str,
+    current_positions: Optional[List[Dict[str, Any]]],
+    cash_data: Optional[Dict[str, Any]],
+    earmarked_tickers: Any = None,
+    current_date_str: Optional[str] = None,
+    gbp_rate: Optional[float] = None,
+    lookback_days: int = 30,
+) -> Dict[str, Any]:
+    """Read-only detector for earmarked sale proceeds sitting in free cash awaiting withdrawal.
+
+    Replays earmarked SELLs (+proceeds), earmarked BUYs (-re-parked cash), and account WITHDRAW cash flows
+    (-withdrawn cash) chronologically across the trailing `lookback_days` window, bounded at each daily
+    snapshot (and today) by actual account cash so a missed withdrawal transaction self-clears as soon as
+    the cash leaves the account. Also detects same-day unlogged earmarked sales in `--dry-run` mode by
+    comparing `current_positions` against the latest prior snapshot.
+    """
+    empty = {"unwithdrawn_gbp": 0.0, "tickers": [], "last_sale_date": None}
+    earmark_set = {_canon(t) for t in (earmarked_tickers or []) if _canon(t)}
+    if not account_name or not earmark_set:
+        return empty
+
+    if current_date_str is None:
+        current_date_str = _today_str()
+    try:
+        as_of = date.fromisoformat(str(current_date_str).strip()[:10])
+    except ValueError:
+        return empty
+    as_of_iso = as_of.isoformat()
+    window_start = as_of - timedelta(days=max(1, int(lookback_days)))
+    snap_floor = window_start - timedelta(days=10)
+
+    # 1. Read saved snapshots in range (strictly read-only)
+    snapshots_by_date: Dict[str, Dict[str, Any]] = {}
+    if SNAPSHOTS_DIR.is_dir():
+        for snap_file in sorted(SNAPSHOTS_DIR.glob("*.json")):
+            stem = snap_file.stem[:10]
+            try:
+                sd = date.fromisoformat(stem)
+            except ValueError:
+                continue
+            if snap_floor <= sd <= as_of:
+                snap_obj = _load_json_file(snap_file, None)
+                if isinstance(snap_obj, dict):
+                    snapshots_by_date[sd.isoformat()] = snap_obj
+    sorted_snap_dates = sorted(snapshots_by_date.keys())
+
+    def _prior_snap_pos(before_iso: str, canon_t: str) -> Optional[Dict[str, Any]]:
+        for d_iso in reversed(sorted_snap_dates):
+            if d_iso >= before_iso:
+                continue
+            acc_block = ((snapshots_by_date[d_iso].get("accounts") or {}).get(account_name)) or {}
+            for p in acc_block.get("positions") or []:
+                if isinstance(p, dict) and _canon(p.get("ticker")) == canon_t:
+                    return p
+            return None
+        return None
+
+    # 2. Collect earmarked SELL / BUY events from trade_log.json inside [window_start .. as_of]
+    sells_by_day: Dict[str, List[Tuple[str, float]]] = {}
+    buys_by_day: Dict[str, float] = {}
+    logged_same_day_tickers = set()
+    raw_log = _load_json_file(TRADE_LOG_FILE, [])
+    if isinstance(raw_log, list):
+        for ev in raw_log:
+            if not isinstance(ev, dict) or ev.get("account") != account_name:
+                continue
+            canon_t = _canon(ev.get("ticker"))
+            if canon_t not in earmark_set:
+                continue
+            action = str(ev.get("action") or "").upper()
+            if "CORPORATE ACTION" in action:
+                continue
+            ev_date_raw = str(ev.get("date") or "").strip()[:10]
+            try:
+                ev_d = date.fromisoformat(ev_date_raw)
+            except ValueError:
+                continue
+            if not (window_start <= ev_d <= as_of):
+                continue
+            d_iso = ev_d.isoformat()
+            prior_pos = _prior_snap_pos(d_iso, canon_t)
+            if action.startswith("SELL"):
+                sh = _to_float(ev.get("shares_sold"), 0.0)
+                val = _earmarked_event_gbp(
+                    canon_t,
+                    sh,
+                    _to_float(ev.get("price"), 0.0),
+                    str(ev.get("currency") or ""),
+                    _to_float(ev.get("value_gbp"), 0.0),
+                    prior_pos,
+                    gbp_rate,
+                )
+                if val > 0:
+                    sells_by_day.setdefault(d_iso, []).append((canon_t, val))
+                    if d_iso == as_of_iso:
+                        logged_same_day_tickers.add(canon_t)
+            elif action.startswith("BUY"):
+                sh = _to_float(ev.get("shares_added"), 0.0)
+                val = _earmarked_event_gbp(
+                    canon_t,
+                    sh,
+                    _to_float(ev.get("price"), 0.0),
+                    str(ev.get("currency") or ""),
+                    _to_float(ev.get("value_gbp"), 0.0),
+                    prior_pos,
+                    gbp_rate,
+                )
+                if val > 0:
+                    buys_by_day[d_iso] = buys_by_day.get(d_iso, 0.0) + val
+                    if d_iso == as_of_iso:
+                        logged_same_day_tickers.add(canon_t)
+
+    # 3. Also detect unlogged same-day share reductions vs latest prior snapshot (supports --dry-run)
+    if isinstance(current_positions, list):
+        curr_by_canon: Dict[str, Dict[str, Any]] = {}
+        for pos in current_positions:
+            if isinstance(pos, dict):
+                ct = _canon(pos.get("yf_ticker") or pos.get("ticker"))
+                if ct and ct not in curr_by_canon:
+                    curr_by_canon[ct] = pos
+        for canon_t in earmark_set:
+            if canon_t in logged_same_day_tickers:
+                continue
+            prior_pos = _prior_snap_pos(as_of_iso, canon_t)
+            if prior_pos is None:
+                continue
+            prior_qty = _position_qty(prior_pos)
+            curr_pos = curr_by_canon.get(canon_t)
+            curr_qty = _position_qty(curr_pos)
+            if prior_qty <= _QTY_EPS:
+                continue
+            if curr_qty > _QTY_EPS and _looks_like_split(
+                prior_qty, curr_qty, _position_avg_price(prior_pos), _position_avg_price(curr_pos)
+            ):
+                continue
+            if prior_qty > curr_qty + _QTY_EPS:
+                sold_sh = prior_qty - curr_qty
+                val = _earmarked_event_gbp(
+                    canon_t,
+                    sold_sh,
+                    _to_float((curr_pos or prior_pos).get("currentPrice") or (curr_pos or prior_pos).get("price"), 0.0),
+                    str((curr_pos or prior_pos).get("currency") or ""),
+                    0.0,
+                    prior_pos,
+                    gbp_rate,
+                )
+                if val > 0:
+                    sells_by_day.setdefault(as_of_iso, []).append((canon_t, val))
+
+    if not sells_by_day:
+        return empty
+
+    # 4. Collect deduplicated WITHDRAW flows inside [window_start .. as_of] from snapshots + live cash_data
+    withdraws_by_day: Dict[str, float] = {}
+    seen_refs = set()
+    for d_iso in sorted_snap_dates:
+        if d_iso < window_start.isoformat():
+            continue
+        acc_block = ((snapshots_by_date[d_iso].get("accounts") or {}).get(account_name)) or {}
+        for flow in acc_block.get("external_flows") or []:
+            if not isinstance(flow, dict):
+                continue
+            if str(flow.get("type") or "").upper() != "WITHDRAW":
+                continue
+            ref = str(flow.get("reference") or "").strip() or f"WITHDRAW|{flow.get('dateTime')}|{flow.get('amount_gbp')}"
+            if ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            tx_day = str(flow.get("dateTime") or d_iso).strip()[:10]
+            try:
+                tx_d = date.fromisoformat(tx_day).isoformat()
+            except ValueError:
+                tx_d = d_iso
+            withdraws_by_day[tx_d] = withdraws_by_day.get(tx_d, 0.0) + abs(_to_float(flow.get("amount_gbp"), 0.0))
+
+    cash = cash_data if isinstance(cash_data, dict) else {}
+    cash_ccy = str(cash.get("currency") or "GBP").upper()
+    for tx in cash.get("recent_transactions") or []:
+        if not isinstance(tx, dict):
+            continue
+        if str(tx.get("type") or "").upper() != "WITHDRAW":
+            continue
+        ts = _parse_ts(tx.get("dateTime"))
+        if ts is None:
+            continue
+        tx_date = ts.date()
+        if not (window_start <= tx_date <= as_of):
+            continue
+        ref = str(tx.get("reference") or "").strip() or f"WITHDRAW|{tx.get('dateTime')}|{tx.get('amount')}"
+        if ref in seen_refs:
+            continue
+        seen_refs.add(ref)
+        amt = abs(_to_float(tx.get("amount"), 0.0))
+        if cash_ccy == "USD" and gbp_rate and gbp_rate > 0:
+            amt = amt / float(gbp_rate)
+        tx_iso = tx_date.isoformat()
+        withdraws_by_day[tx_iso] = withdraws_by_day.get(tx_iso, 0.0) + amt
+
+    # 5. Chronological replay bounded by observed snapshot cash & current cash
+    event_days = sorted(
+        {d for d in list(sells_by_day.keys()) + list(buys_by_day.keys()) + list(withdraws_by_day.keys()) + sorted_snap_dates
+         if window_start.isoformat() <= d <= as_of_iso}
+    )
+    pending = 0.0
+    active_tickers = set()
+    last_sale_date: Optional[str] = None
+    for d_iso in event_days:
+        for ct, val in sells_by_day.get(d_iso, []):
+            pending += val
+            active_tickers.add(ct)
+            last_sale_date = d_iso
+        if d_iso in buys_by_day:
+            pending = max(0.0, pending - buys_by_day[d_iso])
+        if d_iso in withdraws_by_day:
+            pending = max(0.0, pending - withdraws_by_day[d_iso])
+        if d_iso < as_of_iso and d_iso in snapshots_by_date:
+            acc_block = ((snapshots_by_date[d_iso].get("accounts") or {}).get(account_name)) or {}
+            if acc_block and ("liquid_cash_gbp" in acc_block or "blocked_cash_gbp" in acc_block):
+                snap_cash = max(0.0, _to_float(acc_block.get("liquid_cash_gbp"), 0.0)) + max(
+                    0.0, _to_float(acc_block.get("blocked_cash_gbp"), 0.0)
+                )
+                pending = min(pending, snap_cash)
+        if pending < 1.0:
+            pending = 0.0
+            active_tickers.clear()
+            last_sale_date = None
+
+    if cash and ("free_gbp" in cash or "free" in cash):
+        curr_free = max(0.0, _to_float(cash.get("free_gbp", cash.get("free")), 0.0))
+        curr_blocked = max(0.0, _to_float(cash.get("blocked_gbp", cash.get("blocked")), 0.0))
+        pending = min(pending, curr_free + curr_blocked)
+
+    if pending < 1.0:
+        return empty
+    return {
+        "unwithdrawn_gbp": round(pending, 2),
+        "tickers": sorted(active_tickers),
+        "last_sale_date": last_sale_date,
     }
 
 
