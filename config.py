@@ -404,15 +404,26 @@ REBALANCE_CONFIG = {
 }
 
 
+# Household target mix and rebalancing defaults. Edit these (not the workflow) to change them in GitHub Actions.
+# Evidence for the options (survivorship-free household study, GBP, after costs, 1991-2026; README "Crash study"):
+# a static 75/20/5 mix returned ~10.7%/yr with a -54% worst fall; 40/55/5 with the circuit-breaker 'active' and
+# DEFAULT_RISK_OFF_SATELLITE_PCT = 0.20 returned ~12.2%/yr with a -45% worst fall (tech-heavy satellites).
+DEFAULT_ALLOCATION_TARGETS: Dict[str, float] = {"core": 0.75, "satellite": 0.20, "defensive": 0.05}
+DEFAULT_REBALANCE_POLICY = "advisory"
+# Satellite level the circuit-breaker cuts to while the tech trend is down (None = the satellite target, i.e. trim only
+# the excess over plan)
+DEFAULT_RISK_OFF_SATELLITE_PCT: Optional[float] = None
+
+
 def _build_allocation_config() -> Dict[str, Any]:
-    """Household strategic allocation, with safe env overrides.
+    """Household strategic allocation (DEFAULT_ALLOCATION_TARGETS), with safe env overrides.
 
     The household = all configured Trading 212 accounts + vested outside holdings, treated as one portfolio.
     New money is steered to the bucket furthest below target. Rebalancing trims follow REBALANCE_POLICY
-    (advisory by default: proposed in the email, never ordered). Targets that do not sum to 1.0 are normalised
-    (with a warning); an all-zero/invalid set falls back to 75/20/5.
+    (DEFAULT_REBALANCE_POLICY; 'advisory' = proposed in the email, never ordered). Targets that do not sum to 1.0 are
+    normalised (with a warning); an all-zero/invalid set falls back to DEFAULT_ALLOCATION_TARGETS.
     """
-    defaults = {"core": 0.75, "satellite": 0.20, "defensive": 0.05}
+    defaults = dict(DEFAULT_ALLOCATION_TARGETS)
     targets = {
         "core": _safe_float(os.getenv("TARGET_CORE_PCT"), defaults["core"]),
         "satellite": _safe_float(os.getenv("TARGET_SATELLITE_PCT"), defaults["satellite"]),
@@ -421,7 +432,7 @@ def _build_allocation_config() -> Dict[str, Any]:
     targets = {k: max(0.0, v) for k, v in targets.items()}
     total = sum(targets.values())
     if total <= 0:
-        logger.warning("Household allocation targets are invalid (sum %.3f); using the 75/20/5 default.", total)
+        logger.warning("Household allocation targets are invalid (sum %.3f); using the default targets.", total)
         targets = dict(defaults)
     elif abs(total - 1.0) > 1e-6:
         logger.warning("Household allocation targets sum to %.3f, not 1.0; normalising them.", total)
@@ -440,12 +451,25 @@ def _build_allocation_config() -> Dict[str, Any]:
     #   "active": those trims become real sell orders (ISA accounts only) and, while the tech trend is down, new money
     #       for core/satellites waits in cash (it earns interest) until the trend recovers.
     #   "off": legacy behaviour (no regime gating, no trims).
-    policy = (os.getenv("REBALANCE_POLICY") or "advisory").strip().lower()
+    policy = (os.getenv("REBALANCE_POLICY") or DEFAULT_REBALANCE_POLICY).strip().lower()
     if policy not in ("off", "advisory", "active"):
-        logger.warning("REBALANCE_POLICY=%r is not 'off', 'advisory' or 'active'; using 'advisory'.", policy)
-        policy = "advisory"
+        logger.warning("REBALANCE_POLICY=%r is not 'off', 'advisory' or 'active'; using %r.", policy, DEFAULT_REBALANCE_POLICY)
+        policy = DEFAULT_REBALANCE_POLICY
     glide_fraction = min(1.0, max(0.05, _safe_float(os.getenv("GLIDE_FRACTION"), 0.25)))
     count_outside = (os.getenv("GLIDE_COUNT_OUTSIDE") or "").strip().lower() in ("1", "true", "yes", "on")
+    # Satellite level while the circuit-breaker is on: a fraction 0-1 (env RISK_OFF_SATELLITE_PCT; 'target' or 'none'
+    # = the satellite target). Never above the satellite target.
+    raw_floor = (os.getenv("RISK_OFF_SATELLITE_PCT") or "").strip().lower()
+    if raw_floor in ("target", "none", "off"):
+        risk_off_floor: Optional[float] = None
+    else:
+        risk_off_floor = _safe_float(raw_floor, -1.0) if raw_floor else DEFAULT_RISK_OFF_SATELLITE_PCT
+        if risk_off_floor is not None and risk_off_floor < 0:
+            risk_off_floor = DEFAULT_RISK_OFF_SATELLITE_PCT  # malformed or GitHub Actions 'true' -> default
+        elif risk_off_floor is not None and risk_off_floor > 1.0:
+            risk_off_floor = risk_off_floor / 100.0  # '20' means 20%
+    if risk_off_floor is not None:
+        risk_off_floor = round(min(targets["satellite"], max(0.0, risk_off_floor)), 6)
 
     return {
         "targets": targets,
@@ -475,6 +499,9 @@ def _build_allocation_config() -> Dict[str, Any]:
         "glide_count_outside": count_outside,
         # Tech crash circuit-breaker: Nasdaq-100 month-end close vs its N-month simple moving average
         "regime_sma_months": max(3, _safe_int(os.getenv("REGIME_SMA_MONTHS"), 10)),
+        # While the circuit-breaker is on, satellites are cut to this share of the household (None = the target);
+        # the cash is reinvested through the normal new-money rules once the trend recovers
+        "risk_off_satellite_pct": risk_off_floor,
     }
 
 
@@ -494,7 +521,7 @@ BIG_TECH_LOOKTHROUGH: Dict[str, float] = {
 }
 
 # --- MODEL VERSION (stamped on every recommendation-ledger record and snapshot) ---
-MODEL_VERSION = "2026.11.01-evidence-v3"
+MODEL_VERSION = "2026.11.01-evidence-v4"
 
 # --- OPTIONAL EXCLUDED TICKERS ---
 # Set EXCLUDED_TICKERS="TSLA,COIN" in .env if you want the engine to never buy specific tickers.

@@ -2152,6 +2152,75 @@ class TestCrashProtectionUpgrade(EngineTestCase):
         tldr = se.generate_tldr_summary({"Main": {"rebalancing_plan": plan, "cash": {}}})["Main"]
         self.assertTrue(any("circuit-breaker" in s["instruction"] for s in tldr["sells_to_place"]))
 
+    # ---- risk-off satellite level (the circuit-breaker cuts to a level below the plan target) -------------------
+    TARGETS_55 = {"core": 0.40, "satellite": 0.55, "defensive": 0.05}
+
+    def _household_55(self, sat=70000.0):
+        return {"basis_gbp": 100000.0, "band_pp": 5.0, "targets": dict(self.TARGETS_55),
+                "values_gbp": {"core": 100000.0 - sat, "satellite": sat, "defensive": 0.0}}
+
+    def _glide_custom(self, regime, as_of, household, book=None, **cfg_overrides):
+        cfg = dict(self.allocation_cfg, targets=dict(self.TARGETS_55), **cfg_overrides)
+        with mock.patch.object(config, "ALLOCATION_CONFIG", cfg, create=True), \
+             mock.patch.object(config, "ACCOUNT_WRAPPERS", {"Main": "ISA"}, create=True):
+            return se.build_glide_path_trims(
+                analyses=book if book is not None else self._glide_book(), account_name="Main", household=household,
+                hh_outside_rows=[], global_context={"tech_regime": {"regime": regime, "sma_months": 10, "pct_vs_sma": -3.0}},
+                existing_sell_orders=[], pending_sells={}, as_of=as_of,
+            )
+
+    def test_risk_off_level_cuts_satellites_below_the_plan_target(self):
+        g = self._glide_custom(se.REGIME_RISK_OFF, self.off_day, self._household_55(), risk_off_satellite_pct=0.20)
+        self.assertEqual(g["trigger"], "circuit_breaker")
+        self.assertAlmostEqual(g["excess_to_target_gbp"], 15000.0)
+        self.assertAlmostEqual(g["tranche_household_gbp"], 50000.0)  # 70% -> 20%, not just back to the 55% plan
+        self.assertAlmostEqual(sum(p["estimated_gbp"] for p in g["proposals"]), 50000.0, delta=1.0)
+        self.assertEqual(g["trim_to_pct"], 20.0)
+        self.assertEqual([p["ticker"] for p in g["proposals"]], ["PLTR", "SMGB.L"])  # V (payments) is kept
+        self.assertIn("20% risk-off level", g["proposals"][0]["plain_english_why"])
+        self.assertEqual(g["proposals"][0]["action"], "TRIM (TECH CIRCUIT-BREAKER — TO CASH)")
+        # While the trend is up the same book only glides a quarter of the excess over the 55% plan
+        up = self._glide_custom(se.REGIME_RISK_ON, self.buy_day, self._household_55(), risk_off_satellite_pct=0.20)
+        self.assertEqual(up["trigger"], "glide_path")
+        self.assertAlmostEqual(up["tranche_household_gbp"], 3750.0)
+        self.assertEqual(up["trim_to_pct"], 55.0)
+
+    def test_risk_off_level_applies_inside_the_band_and_is_optional(self):
+        book = [  # 58% satellites: inside the 55% +/- 5pp band
+            make_analysis("PLTR", 20000.0, macro_cluster="Enterprise Cloud & Software", account="Main"),
+            make_analysis("SMGB.L", 20000.0, macro_cluster="AI Hardware & Semiconductors", account="Main"),
+            make_analysis("V", 18000.0, macro_cluster="Financials & Payment Rails", account="Main"),
+            make_analysis("VWRP.L", 42000.0, macro_cluster="Diversified Index Core", account="Main"),
+        ]
+        hh = self._household_55(sat=58000.0)
+        g = self._glide_custom(se.REGIME_RISK_OFF, self.off_day, hh, book=book, risk_off_satellite_pct=0.20)
+        self.assertFalse(g["out_of_band"])
+        self.assertAlmostEqual(g["tranche_household_gbp"], 38000.0)
+        cut = {p["ticker"]: p["estimated_gbp"] for p in g["proposals"]}
+        self.assertEqual(set(cut), {"SMGB.L", "PLTR"})  # tech/semis first while the breaker is on; V and core kept
+        self.assertAlmostEqual(sum(cut.values()), 38000.0, delta=1.0)
+        # No risk-off level (None = the plan target): inside the band nothing is trimmed, as before
+        legacy = self._glide_custom(se.REGIME_RISK_OFF, self.off_day, hh, book=book, risk_off_satellite_pct=None)
+        self.assertEqual(legacy["proposals"], [])
+        self.assertIsNone(legacy["trigger"])
+        # A level at or above the target changes nothing either
+        same = self._glide_custom(se.REGIME_RISK_OFF, self.off_day, hh, book=book, risk_off_satellite_pct=0.80)
+        self.assertEqual(same["proposals"], [])
+
+    def test_regime_line_mentions_the_risk_off_level(self):
+        cfg = dict(self.allocation_cfg, targets=dict(self.TARGETS_55), risk_off_satellite_pct=0.20)
+        with mock.patch.object(config, "ALLOCATION_CONFIG", cfg, create=True):
+            on = se.describe_tech_regime({"regime": se.REGIME_RISK_ON, "sma_months": 10, "pct_vs_sma": 2.6}, "active")
+            off = se.describe_tech_regime({"regime": se.REGIME_RISK_OFF, "sma_months": 10, "pct_vs_sma": -1.0}, "active")
+            adv = se.describe_tech_regime({"regime": se.REGIME_RISK_OFF, "sma_months": 10, "pct_vs_sma": -1.0}, "advisory")
+        self.assertIn("cut to 20%", on)
+        self.assertIn("cut to 20% of the household", off)
+        self.assertIn("new money waits in cash", off)
+        self.assertIn("no new tech/semiconductor buys", adv)
+        with mock.patch.object(config, "ALLOCATION_CONFIG", dict(self.allocation_cfg), create=True):
+            legacy = se.describe_tech_regime({"regime": se.REGIME_RISK_OFF, "sma_months": 10, "pct_vs_sma": -1.0}, "active")
+        self.assertIn("satellites above plan are trimmed to cash", legacy)
+
 
 class TestCompiles(unittest.TestCase):
     def test_py_compile(self):

@@ -202,9 +202,10 @@ The default target is **75 / 20 / 5** (Gold-only new defensive buys by default v
 
 **Crash protection (`REBALANCE_POLICY`, default `advisory`).**
 - **Historical crash replays:** every digest replays the 2000–02 tech crash, the 2007–09 financial crisis and the 2022 rate shock on today's household (sector-level GBP returns from survivorship-free data) and compares the loss with the target mix.
-- **Tech crash circuit-breaker:** when the Nasdaq-100 (`CNX1.L`, falling back to `CNDX.L` / `QQQ`) closes a month below its 10-month average, no new tech/semiconductor satellites are bought, and trimming all satellites above target to cash is recommended.
+- **Tech crash circuit-breaker:** when the Nasdaq-100 (`CNX1.L`, falling back to `CNDX.L` / `QQQ`) closes a month below its 10-month average, no new tech/semiconductor satellites are bought, and trimming all satellites above target to cash is recommended. With `RISK_OFF_SATELLITE_PCT` set (e.g. `0.20`), satellites are instead cut to that share of the household, even inside the band; the cash is reinvested by the normal new-money rules once the trend recovers.
 - **Glide path:** while the trend is up, a quarter of the remaining satellite excess is proposed for trimming on each monthly buy day (ISA accounts only; never earmarked, core or defensive funds; riskiest first).
 - `advisory` shows these trims as proposals only; `active` turns them into sell orders and, while the breaker is on, keeps new core/satellite money in cash until the trend recovers; `off` restores the legacy behaviour.
+- **Choosing a mix (survivorship-free household study, GBP, after costs, 1991–2026, tech-heavy satellites):** static 75/20/5 returned ~10.7%/yr with a −54% worst fall; 40/55/5 with `REBALANCE_POLICY=active` and `RISK_OFF_SATELLITE_PCT=0.20` returned ~12.2%/yr with a −45% worst fall; 55% satellites with no protection returned ~12.7%/yr but fell −68%; 100% global equity returned 9.4%/yr with a −48% worst fall. Over 1976–2026 (US) the 40/55/5 + circuit-breaker mix trailed the market slightly (12.3% vs 12.8%/yr) because tech lagged for most of 1976–89. Change the defaults in `config.py` (`DEFAULT_ALLOCATION_TARGETS`, `DEFAULT_REBALANCE_POLICY`, `DEFAULT_RISK_OFF_SATELLITE_PCT`); GitHub Actions does not pass these env vars.
 
 How new money is invested:
 - **Core money** buys `VWRP.L`.
@@ -236,6 +237,7 @@ Optional env overrides (all parsed safely):
 | `GLIDE_FRACTION` | `0.25` |
 | `GLIDE_COUNT_OUTSIDE` | `false` |
 | `REGIME_SMA_MONTHS` | `10` |
+| `RISK_OFF_SATELLITE_PCT` | unset = the satellite target (e.g. `0.20`; `15` means 15%; never above the target) |
 
 Targets that don't sum to 1 are normalised. The research model's forward-CAGR estimate is shown for information only and never affects scores or sizes.
 

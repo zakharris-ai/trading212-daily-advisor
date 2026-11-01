@@ -417,6 +417,10 @@ def _allocation_cfg() -> Dict[str, Any]:
     gold_share = min(1.0, max(0.0, _num(raw_split.get("gold"), 1.0)))
     cadence = str(raw.get("buy_cadence") or "monthly").strip().lower()
     policy = str(raw.get("rebalance_policy") or "advisory").strip().lower()
+    raw_floor = raw.get("risk_off_satellite_pct")
+    floor = None if raw_floor is None else _num(raw_floor, None)
+    if floor is not None:
+        floor = min(targets[BUCKET_SATELLITE], max(0.0, floor))
     return {
         "targets": targets,
         "band_pp": max(0.0, _num(raw.get("band_pp"), 5.0)),
@@ -432,6 +436,8 @@ def _allocation_cfg() -> Dict[str, Any]:
         "glide_fraction": min(1.0, max(0.05, _num(raw.get("glide_fraction"), 0.25))),
         "glide_count_outside": bool(raw.get("glide_count_outside", False)),
         "regime_sma_months": max(3, int(_num(raw.get("regime_sma_months"), 10))),
+        # Satellite share the circuit-breaker cuts to while the tech trend is down (None = the satellite target)
+        "risk_off_satellite_pct": floor,
     }
 
 
@@ -3451,6 +3457,20 @@ def compute_crash_scenarios(
         status, color = "🟡 CRASH RISK ABOVE PLAN", "#f59e0b"
     else:
         status, color = "🔴 CRASH RISK FAR ABOVE PLAN", "#ef4444"
+    note = (
+        "Historical replay at sector level in GBP (survivorship-free data). Individual stocks can fall much further "
+        "than their sector, and past crashes are not forecasts."
+    )
+    try:
+        acfg = _allocation_cfg()
+        floor = acfg.get("risk_off_satellite_pct")
+        if acfg["rebalance_policy"] != "off" and floor is not None and floor < acfg["targets"][BUCKET_SATELLITE] - 1e-9:
+            note += (
+                f" Replays are buy-and-hold: they ignore the tech circuit-breaker, which cuts satellites to "
+                f"{floor * 100.0:.0f}% after the first month-end below the Nasdaq-100's 10-month average."
+            )
+    except Exception:  # pragma: no cover - the note is informational only
+        pass
     return {
         "basis_gbp": round(basis, 2),
         "sleeve_weights_pct": {
@@ -3460,10 +3480,7 @@ def compute_crash_scenarios(
         "worst": worst,
         "status": status,
         "status_color": color,
-        "note": (
-            "Historical replay at sector level in GBP (survivorship-free data). Individual stocks can fall much further "
-            "than their sector, and past crashes are not forecasts."
-        ),
+        "note": note,
     }
 
 
@@ -3573,16 +3590,27 @@ def describe_tech_regime(regime: Optional[Dict[str, Any]], policy: str = "adviso
     pct = _num(r.get("pct_vs_sma"), None)
     when = r.get("as_of_month_end") or "last month-end"
     pct_txt = f"{pct:+.1f}% vs its {n}-month average" if pct is not None else f"vs its {n}-month average"
+    try:
+        cfg = _allocation_cfg()
+        floor = cfg.get("risk_off_satellite_pct")
+        floor_pct = floor * 100.0 if floor is not None and floor < cfg["targets"][BUCKET_SATELLITE] - 1e-9 else None
+    except Exception:
+        floor_pct = None
     if state == REGIME_RISK_ON:
+        then_txt = f" (satellites would then be cut to {floor_pct:.0f}%)" if floor_pct is not None and policy != "off" else ""
         return (
             f"🟢 Tech trend UP (circuit-breaker off): Nasdaq-100 closed {when} {pct_txt}. "
-            f"It trips if a month ends below that average."
+            f"It trips if a month ends below that average{then_txt}."
         )
     if state == REGIME_RISK_OFF:
+        trim_txt = (
+            f"satellites are cut to {floor_pct:.0f}% of the household (the rest to cash)" if floor_pct is not None
+            else "satellites above plan are trimmed to cash"
+        )
         action = (
-            "satellites above plan are trimmed to cash and new money waits in cash"
+            f"{trim_txt} and new money waits in cash"
             if policy == "active"
-            else "no new tech/semiconductor buys; trimming the satellites above plan to cash is recommended"
+            else f"no new tech/semiconductor buys; recommended: {trim_txt}"
         )
         return f"🔴 Tech trend DOWN (circuit-breaker ON): Nasdaq-100 closed {when} {pct_txt} — {action}."
     return "⚪ Tech trend unknown (no Nasdaq-100 data): the circuit-breaker cannot trigger today."
@@ -4020,7 +4048,8 @@ def build_glide_path_trims(
     """Sizes this account's share of the household satellite trim (glide path + tech crash circuit-breaker).
 
     When household satellites sit above target + band, the excess over the TARGET is trimmed:
-      * tech trend DOWN (RISK_OFF): the whole excess, now (circuit-breaker);
+      * tech trend DOWN (RISK_OFF): the whole excess, now (circuit-breaker); with risk_off_satellite_pct set below the
+        target, satellites are cut to that level instead, even inside the band;
       * tech trend UP: glide_fraction of it, on the monthly buy day only (glide path).
     Each account trims in proportion to its share of the household's Trading 212 satellites, ranked by risk: broken
     weekly trend first, then tech/semiconductor exposure while the circuit-breaker is on, single names above the
@@ -4072,17 +4101,25 @@ def build_glide_path_trims(
     upper = (target_sat + band_pp / 100.0) * basis
     excess = max(0.0, sat_now - target_sat * basis)
     out_of_band = sat_now > upper + 0.5
+    # Circuit-breaker with a risk-off satellite level below the plan target: cut to that level, band or not
+    floor_cfg = cfg.get("risk_off_satellite_pct")
+    floor_sat = min(target_sat, max(0.0, _num(floor_cfg, target_sat))) if floor_cfg is not None else target_sat
+    cut_to_floor = risk_off and floor_sat < target_sat - 1e-9
+    excess_to_floor = max(0.0, sat_now - floor_sat * basis) if cut_to_floor else excess
     result.update({
         "basis_gbp": round(basis, 2), "satellite_now_gbp": round(sat_now, 2),
         "satellite_now_pct": round(sat_now / basis * 100.0, 1), "target_pct": round(target_sat * 100.0, 1),
         "band_pp": band_pp, "out_of_band": out_of_band, "excess_to_target_gbp": round(excess, 2),
         "counts_outside": bool(cfg["glide_count_outside"]),
+        "risk_off_target_pct": round(floor_sat * 100.0, 1),
+        "trim_to_pct": round((floor_sat if risk_off else target_sat) * 100.0, 1),
+        "excess_to_trim_level_gbp": round(excess_to_floor if risk_off else excess, 2),
     })
-    if not out_of_band:
+    if not (out_of_band or (cut_to_floor and excess_to_floor >= min_order)):
         return result
 
     if risk_off:
-        tranche = excess
+        tranche = excess_to_floor
         result["trigger"] = "circuit_breaker"
     elif is_buy_day:
         tranche = min(excess, max(min_order, cfg["glide_fraction"] * excess))
@@ -4167,7 +4204,8 @@ def build_glide_path_trims(
     active = policy == "active" and wrapper == "ISA" and not data_degraded
     result["active"] = active
     kind = "circuit_breaker" if risk_off else "glide_rebalance"
-    action = "TRIM (TECH CIRCUIT-BREAKER — BACK TO PLAN)" if risk_off else "TRIM (GLIDE PATH — BACK TO PLAN)"
+    action = (("TRIM (TECH CIRCUIT-BREAKER — TO CASH)" if cut_to_floor else "TRIM (TECH CIRCUIT-BREAKER — BACK TO PLAN)")
+              if risk_off else "TRIM (GLIDE PATH — BACK TO PLAN)")
     for score, val, pos, px, sleeve, factors in ranked:
         if remaining < min_order:
             break
@@ -4186,12 +4224,21 @@ def build_glide_path_trims(
             continue
         name = pos.get("name", pos.get("ticker", ""))
         sym = pos.get("search_symbol", clean_search_symbol(str(pos.get("ticker", ""))))
+        if risk_off and cut_to_floor:
+            breaker_txt = (
+                f"The Nasdaq-100 closed the month below its 10-month average, so the circuit-breaker cuts satellites to "
+                f"the {floor_sat * 100.0:.0f}% risk-off level now (£{excess_to_floor:,.0f} to cash, reinvested by the "
+                f"normal buy rules once the trend recovers). "
+            )
+        elif risk_off:
+            breaker_txt = "The Nasdaq-100 closed the month below its 10-month average, so the excess moves to cash now. "
+        else:
+            breaker_txt = f"This month's glide-path step trims {cfg['glide_fraction'] * 100.0:.0f}% of the excess. "
         why = (
-            f"Household satellites are {sat_now / basis * 100.0:.0f}% vs your {target_sat * 100.0:.0f}% plan "
-            f"(£{excess:,.0f} above target). "
-            + ("The Nasdaq-100 closed the month below its 10-month average, so the excess moves to cash now. "
-               if risk_off else f"This month's glide-path step trims {cfg['glide_fraction'] * 100.0:.0f}% of the excess. ")
-            + (f"{name} ranks first because: {'; '.join(factors)}." if factors else "")
+            f"Household satellites are {sat_now / basis * 100.0:.0f}% vs your {target_sat * 100.0:.0f}% plan"
+            + (f" (£{excess:,.0f} above target). " if excess >= 0.5 else ". ")
+            + breaker_txt
+            + (f"Why {name}: {'; '.join(factors)}." if factors else "")
             + " ISA: no capital gains tax; proceeds stay as cash for the next buy day."
         )
         order = {
@@ -4703,7 +4750,8 @@ def build_rebalancing_plan(
     #     Evidence (survivorship-free 1928-2026 study, GBP, after costs): a tech-concentrated satellite sleeve of ~70%
     #     had ~73% worst drawdowns for little extra long-run return; trimming the excess to cash while the Nasdaq-100
     #     is below its 10-month average cut the 2000-02 loss from ~67% to ~22%. Trims are ISA-only (no CGT), never touch
-    #     earmarked money, core or defensive funds, and are only PROPOSED unless the policy is 'active'.
+    #     earmarked money, core or defensive funds, and are only PROPOSED unless the policy is 'active'. With
+    #     risk_off_satellite_pct set, the circuit-breaker cuts satellites to that level (band or not), not just to target.
     glide = build_glide_path_trims(
         analyses=analyses,
         account_name=acc_name,
@@ -5925,7 +5973,7 @@ def generate_tldr_summary(results_by_account: Dict[str, Dict[str, Any]]) -> Dict
                 if s.get("order_reason") in ("leverage_cap", "position_cap"):
                     inst_text = f"Sell {shares_txt} shares (cap rebalance)"
                 elif s.get("order_reason") == "circuit_breaker":
-                    inst_text = f"Sell {shares_txt} shares (tech circuit-breaker: back to plan, keep as cash)"
+                    inst_text = f"Sell {shares_txt} shares (tech circuit-breaker: keep as cash until the trend recovers)"
                 elif s.get("order_reason") == "glide_rebalance":
                     inst_text = f"Sell {shares_txt} shares (glide path back to your target mix)"
                 elif s.get("is_profit", True):

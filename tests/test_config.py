@@ -246,7 +246,8 @@ class AllocationConfigTests(unittest.TestCase):
     # Shape / parsing checks only (these tests gate the daily email in CI, so never assert personal values).
     ENV_KEYS = ("TARGET_CORE_PCT", "TARGET_SATELLITE_PCT", "TARGET_DEFENSIVE_PCT", "DEFENSIVE_GOLD_SHARE",
                 "BUY_CADENCE", "BIG_TECH_CAP_PCT", "ALLOCATION_BAND_PP", "SATELLITE_MAX_SINGLE_PCT",
-                "OFF_CYCLE_MIN_DEPLOY_GBP", "CORE_BUY_TICKER", "GOLD_BUY_TICKER", "SHORT_GILT_BUY_TICKER")
+                "OFF_CYCLE_MIN_DEPLOY_GBP", "CORE_BUY_TICKER", "GOLD_BUY_TICKER", "SHORT_GILT_BUY_TICKER",
+                "REBALANCE_POLICY", "RISK_OFF_SATELLITE_PCT", "GLIDE_FRACTION")
 
     def _build(self, **env):
         clean = {k: v for k, v in os.environ.items() if k not in self.ENV_KEYS}
@@ -277,7 +278,7 @@ class AllocationConfigTests(unittest.TestCase):
         cfg = self._build(TARGET_CORE_PCT="true", TARGET_SATELLITE_PCT="", TARGET_DEFENSIVE_PCT="0.05",
                           DEFENSIVE_GOLD_SHARE="true", BUY_CADENCE="weekly", BIG_TECH_CAP_PCT="true",
                           ALLOCATION_BAND_PP="abc", OFF_CYCLE_MIN_DEPLOY_GBP="null")
-        self.assertEqual(cfg["targets"], {"core": 0.75, "satellite": 0.20, "defensive": 0.05})
+        self.assertEqual(cfg["targets"], config.DEFAULT_ALLOCATION_TARGETS)
         self.assertEqual(cfg["defensive_split"], {"gold": 1.0, "short_gilts": 0.0})
         self.assertEqual(cfg["buy_cadence"], "monthly")
         self.assertEqual(cfg["big_tech_cap_pct"], 0.30)
@@ -293,9 +294,33 @@ class AllocationConfigTests(unittest.TestCase):
         self.assertAlmostEqual(cfg["targets"]["satellite"], 0.25)
         self.assertAlmostEqual(cfg["targets"]["defensive"], 0.25)
         cfg = self._build(TARGET_CORE_PCT="0", TARGET_SATELLITE_PCT="0", TARGET_DEFENSIVE_PCT="0")
-        self.assertEqual(cfg["targets"], {"core": 0.75, "satellite": 0.20, "defensive": 0.05})
+        self.assertEqual(cfg["targets"], config.DEFAULT_ALLOCATION_TARGETS)
         cfg = self._build(TARGET_CORE_PCT="-1")
         self.assertGreaterEqual(min(cfg["targets"].values()), 0.0)
+
+    def test_default_targets_and_policy_are_well_formed(self):
+        self.assertAlmostEqual(sum(config.DEFAULT_ALLOCATION_TARGETS.values()), 1.0, places=6)
+        self.assertIn(config.DEFAULT_REBALANCE_POLICY, ("off", "advisory", "active"))
+        floor = config.DEFAULT_RISK_OFF_SATELLITE_PCT
+        self.assertTrue(floor is None or 0.0 <= floor <= config.DEFAULT_ALLOCATION_TARGETS["satellite"])
+
+    def test_rebalance_policy_and_risk_off_level_are_parsed_safely(self):
+        cfg = self._build(REBALANCE_POLICY="true", RISK_OFF_SATELLITE_PCT="true")
+        self.assertEqual(cfg["rebalance_policy"], config.DEFAULT_REBALANCE_POLICY)
+        expected_floor = config.DEFAULT_RISK_OFF_SATELLITE_PCT
+        if expected_floor is not None:
+            expected_floor = min(expected_floor, cfg["targets"]["satellite"])
+        self.assertEqual(cfg["risk_off_satellite_pct"], expected_floor)
+        self.assertEqual(self._build(REBALANCE_POLICY=" Advisory ")["rebalance_policy"], "advisory")
+        self.assertEqual(self._build(REBALANCE_POLICY="off")["rebalance_policy"], "off")
+        self.assertIsNone(self._build(RISK_OFF_SATELLITE_PCT="target")["risk_off_satellite_pct"])
+        self.assertAlmostEqual(self._build(TARGET_CORE_PCT="0.5", TARGET_SATELLITE_PCT="0.45", TARGET_DEFENSIVE_PCT="0.05",
+                                           RISK_OFF_SATELLITE_PCT="0.1")["risk_off_satellite_pct"], 0.1)
+        self.assertAlmostEqual(self._build(TARGET_CORE_PCT="0.5", TARGET_SATELLITE_PCT="0.45", TARGET_DEFENSIVE_PCT="0.05",
+                                           RISK_OFF_SATELLITE_PCT="15")["risk_off_satellite_pct"], 0.15)  # '15' = 15%
+        # Never above the satellite target
+        self.assertAlmostEqual(self._build(TARGET_CORE_PCT="0.75", TARGET_SATELLITE_PCT="0.20", TARGET_DEFENSIVE_PCT="0.05",
+                                           RISK_OFF_SATELLITE_PCT="0.35")["risk_off_satellite_pct"], 0.20)
 
     def test_big_tech_settings_are_well_formed(self):
         self.assertTrue(config.BIG_TECH_TICKERS)

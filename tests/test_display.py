@@ -28,8 +28,8 @@ TRACKING_TEXT = (
 )
 EXPLAINER = (
     "New money goes to whichever part of the mix is furthest below target. Satellites above plan are trimmed back "
-    "gradually on monthly buy days (all at once if the tech circuit-breaker trips): proposed only, unless "
-    "REBALANCE_POLICY is set to active."
+    "gradually on monthly buy days, and all at once (to the risk-off level) if the tech circuit-breaker trips. "
+    "With REBALANCE_POLICY set to active these trims are sell instructions; otherwise they are proposals only."
 )
 BIG_TECH_LINE = "41% of household wealth (cap 30%) — no new big-tech buys"
 CORE_REASON = "Core is 22% vs a 65% target, the furthest below target."
