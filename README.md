@@ -217,6 +217,13 @@ How new money is invested:
 
 **Buy cadence:** buys happen on the **first London business day of each month** (bank holidays respected), or on any day when deployable cash is at least £2,000. Sells and risk alerts stay daily.
 
+**Event radar:** every digest lists the next two weeks of scheduled events and what to do about each (usually nothing).
+- **What it covers:** Fed and Bank of England decisions, US/UK CPI, US jobs reports, elections, market closures, the tax-year end, each holding's next results date and time (from Yahoo Finance; estimated dates are labelled), and the next circuit-breaker check, with the Nasdaq-100 level that would trip it.
+- **Results:** sells of a company reporting within two days carry a "place this before the results" note. New buys are already blocked in the 5 days before results.
+- **Order timing:** the radar says when to place orders, avoiding the opening and closing auctions.
+- **No trades:** events never create or cancel a trade. On average shares earn slightly more around results (the earnings announcement premium), and the S&P 500 was higher 12 months after all 19 US midterms since 1950. Neither is a reason to sell.
+- **Upkeep:** macro dates live in `event_calendar.py` (`MACRO_SCHEDULE`). Extend it each year from the Fed, Bank of England, BLS and ONS calendars.
+
 Optional env overrides (all parsed safely):
 
 | Variable | Default |
@@ -238,6 +245,7 @@ Optional env overrides (all parsed safely):
 | `GLIDE_COUNT_OUTSIDE` | `false` |
 | `REGIME_SMA_MONTHS` | `10` |
 | `RISK_OFF_SATELLITE_PCT` | unset = the satellite target (e.g. `0.20`; `15` means 15%; never above the target) |
+| `EVENT_RADAR_DAYS` | `14` (days ahead shown in the event radar) |
 
 Targets that don't sum to 1 are normalised. The research model's forward-CAGR estimate is shown for information only and never affects scores or sizes.
 

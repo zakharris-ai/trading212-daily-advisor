@@ -382,6 +382,55 @@ def build_crash_protection_html(consolidated_view: Optional[Dict[str, Any]], res
     """
 
 
+def build_event_radar_html(consolidated_view: Optional[Dict[str, Any]], max_items: int = 14) -> str:
+    """'Event radar' card: scheduled macro events, holdings' results dates and the next circuit-breaker check, each
+    with what to do (usually nothing), plus when to place today's orders. '' when the engine supplied no radar.
+    Every engine string is escaped."""
+    esc = _html.escape
+    cv = consolidated_view if isinstance(consolidated_view, dict) else {}
+    radar = cv.get("event_radar") if isinstance(cv.get("event_radar"), dict) else None
+    if not radar or not (radar.get("items") or radar.get("headline")):
+        return ""
+    chip = {"high": ("#fee2e2", "#b91c1c", "HIGH"), "medium": ("#fef3c7", "#b45309", "MEDIUM"), "low": ("#e2e8f0", "#475569", "LOW")}
+    rows = ""
+    for it in (radar.get("items") or [])[:max_items]:
+        if not isinstance(it, dict):
+            continue
+        bg, fg, label = chip.get(str(it.get("impact") or "low"), chip["low"])
+        when = " ".join(x for x in (str(it.get("day_label") or ""), f"{it['time_uk']} UK" if it.get("time_uk") else "") if x)
+        extra = f" · {esc(str(it['when_label']))}" if it.get("when_label") else ""
+        held = (f'<div style="font-size: 11px; color: #64748b;">Held: {esc(str(it["holders"]))}'
+                f'{" (" + format(_num(it.get("household_pct"), 0.0), ".1f") + "% of household)" if it.get("household_pct") else ""}</div>'
+                if it.get("holders") else "")
+        flag = "⚠️ " if it.get("action_needed") else ""
+        why = f'<div style="font-size: 11px; color: #64748b; margin-top: 1px;">{esc(str(it.get("why") or ""))}</div>' if it.get("why") else ""
+        rows += (
+            '<tr><td style="padding: 6px 8px 6px 0; vertical-align: top; white-space: nowrap; font-size: 12px; '
+            f'font-weight: 700; color: #0f172a;">{esc(when)}</td>'
+            '<td style="padding: 6px 0; vertical-align: top; font-size: 12px; color: #334155;">'
+            f'<span style="background: {bg}; color: {fg}; font-size: 9px; font-weight: 800; padding: 1px 5px; '
+            f'border-radius: 4px; margin-right: 4px;">{label}</span><b>{flag}{esc(str(it.get("title") or ""))}</b>{extra}'
+            f'{held}<div style="margin-top: 2px;"><b>What to do:</b> {esc(str(it.get("what_to_do") or ""))}</div>{why}</td></tr>'
+        )
+    timing = "".join(
+        f'<li style="margin-bottom: 2px;">{esc(str(t))}</li>' for t in (radar.get("order_timing") or [])
+    )
+    timing_html = (
+        '<div style="margin-top: 8px; font-size: 12px; color: #334155;"><b>⏱️ When to place today\'s orders</b>'
+        f'<ul style="margin: 4px 0 0 18px; padding: 0;">{timing}</ul></div>' if timing else ""
+    )
+    return f"""
+    <!-- 📅 EVENT RADAR — scheduled events and what to do -->
+    <div style="background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 12px; padding: 14px 16px; margin-bottom: 16px;">
+      <div style="font-size: 13px; font-weight: 800; color: #075985; text-transform: uppercase;">📅 Event radar — next {int(_num(radar.get("horizon_days"), 14))} days</div>
+      <div style="font-size: 12px; color: #334155; margin-top: 4px;">{esc(str(radar.get("headline") or ""))}</div>
+      <table role="presentation" style="width: 100%; border-collapse: collapse; margin-top: 6px;">{rows}</table>
+      {timing_html}
+      <div style="font-size: 11px; color: #64748b; margin-top: 6px;">{esc(str(radar.get("footnote") or ""))}</div>
+    </div>
+    """
+
+
 def build_household_mix_html(consolidated_view: Optional[Dict[str, Any]]) -> str:
     """Compact 'Household mix' card for the top of the email (inline styles, table layout).
 
@@ -754,6 +803,8 @@ def generate_html_digest(
 
     # Household strategic mix card (Phase 1): renders nothing when the engine supplied none of its data
     household_mix_html = build_household_mix_html(consolidated_view)
+    # Event radar (scheduled macro events + holdings' results dates + circuit-breaker check)
+    event_radar_html = build_event_radar_html(consolidated_view)
     # Crash protection check (historical replays + tech circuit-breaker + trim proposals)
     crash_protection_html = build_crash_protection_html(consolidated_view, results_by_account)
 
@@ -1701,6 +1752,9 @@ def generate_html_digest(
 
         <!-- ⚡ 30-SECOND TL;DR — WHAT TO DO TODAY -->
         {tldr_section_html}
+
+        <!-- 📅 Event radar (scheduled events and what to do) -->
+        {event_radar_html}
 
         <!-- 🧭 Household Mix (strategic allocation) -->
         {household_mix_html}

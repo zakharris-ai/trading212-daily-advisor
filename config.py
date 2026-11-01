@@ -507,6 +507,11 @@ def _build_allocation_config() -> Dict[str, Any]:
 
 ALLOCATION_CONFIG: Dict[str, Any] = _build_allocation_config()
 
+# --- EVENT RADAR ---
+# Days ahead shown in the email's event radar (scheduled macro events, holdings' results dates, circuit-breaker check).
+# Display and order-timing notes only: events never trigger trades (see event_calendar.py for the evidence).
+EVENT_RADAR_DAYS: int = max(1, min(60, _safe_int(os.getenv("EVENT_RADAR_DAYS"), 14)))
+
 # --- US BIG TECH (household concentration cap) ---
 BIG_TECH_TICKERS: Set[str] = {"AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "AVGO", "TSLA"}
 # Approximate share of each fund held in BIG_TECH_TICKERS (fund look-through), keyed by ticker root.

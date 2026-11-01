@@ -3507,6 +3507,9 @@ def tech_regime_from_closes(
     out: Dict[str, Any] = {
         "regime": REGIME_UNKNOWN, "proxy": proxy, "sma_months": int(sma_months), "as_of_month_end": None,
         "close": None, "sma": None, "pct_vs_sma": None, "months_in_regime": 0,
+        # Level the CURRENT month must close below (RISK_ON) / above (RISK_OFF) to flip the signal at month-end:
+        # close_t < (sum of the last n-1 month-ends + close_t) / n  <=>  close_t < mean(last n-1 month-ends)
+        "trip_level": None, "latest_close": None, "latest_close_date": None, "trip_distance_pct": None,
     }
     if daily_closes is None or len(daily_closes) == 0:
         return out
@@ -3523,6 +3526,7 @@ def tech_regime_from_closes(
             as_of = config.london_date()
         except Exception:  # pragma: no cover - config always provides london_date
             as_of = datetime.now().date()
+    upto = s[s.index < pd.Timestamp(as_of) + pd.Timedelta(days=1)]
     month_start = pd.Timestamp(year=as_of.year, month=as_of.month, day=1)
     s = s[s.index < month_start]
     if s.empty:
@@ -3551,6 +3555,15 @@ def tech_regime_from_closes(
         "pct_vs_sma": round((last_close / last_sma - 1.0) * 100.0, 1) if last_sma > 0 else None,
         "months_in_regime": streak,
     })
+    if n >= 2 and len(me) >= n - 1 and not upto.empty:
+        trip = float(me.iloc[-(n - 1):].mean())
+        latest = float(upto.iloc[-1])
+        out.update({
+            "trip_level": round(trip, 4),
+            "latest_close": round(latest, 4),
+            "latest_close_date": pd.Timestamp(upto.index[-1]).date().isoformat(),
+            "trip_distance_pct": round((trip / latest - 1.0) * 100.0, 1) if latest > 0 else None,
+        })
     return out
 
 
@@ -5982,6 +5995,7 @@ def generate_tldr_summary(results_by_account: Dict[str, Dict[str, Any]]) -> Dict
                     inst_text = f"Sell {shares_txt} shares (de-risk)"
             else:
                 inst_text = f"Sell all {shares_txt} shares"
+            event_txt = f" ⏰ {s['event_note']}" if s.get("event_note") else ""
             sells_to_place.append({
                 "name": s.get("name", s.get("ticker")),
                 "symbol": s.get("search_symbol", s.get("ticker")),
@@ -5989,7 +6003,7 @@ def generate_tldr_summary(results_by_account: Dict[str, Dict[str, Any]]) -> Dict
                 "is_trim": is_trim,
                 "order_reason": s.get("order_reason"),
                 "estimated_gbp": s.get("estimated_gbp", 0.0),
-                "instruction": f"{action_verb} {s.get('name', s.get('ticker'))} ({s.get('search_symbol', s.get('ticker'))}) ➔ {inst_text} (+£{_num(s.get('estimated_gbp'), 0.0):,.0f})"
+                "instruction": f"{action_verb} {s.get('name', s.get('ticker'))} ({s.get('search_symbol', s.get('ticker'))}) ➔ {inst_text} (+£{_num(s.get('estimated_gbp'), 0.0):,.0f}){event_txt}"
             })
 
         sells_already_queued = []
@@ -6017,6 +6031,7 @@ def generate_tldr_summary(results_by_account: Dict[str, Dict[str, Any]]) -> Dict
                 "is_new": b.get("is_new", False),
                 "bucket": b.get("bucket"),
                 "instruction": f"BUY {b.get('name', b.get('ticker'))} ({b.get('search_symbol', b.get('ticker'))}) ➔ Enter £{_num(b.get('estimated_gbp'), 0.0):,.0f}"
+                + (f" ⏰ {b['event_note']}" if b.get("event_note") else "")
             })
 
         hold_names = [h.get("name", h.get("ticker")) for h in hold_items]

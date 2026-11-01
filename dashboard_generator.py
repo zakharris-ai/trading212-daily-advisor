@@ -673,6 +673,40 @@ def _household_mix_panel_html(
     </div>{grid_html}{crash_html}{cadence_html}"""
 
 
+def _event_radar_panel_html(consolidated_view: Optional[Dict[str, Any]], max_items: int = 14) -> str:
+    """Dashboard 'Event radar' card (scheduled events, holdings' results dates, circuit-breaker check); '' if none."""
+    esc = _html.escape
+    radar = (consolidated_view or {}).get("event_radar") if isinstance(consolidated_view, dict) else None
+    if not isinstance(radar, dict) or not (radar.get("items") or radar.get("headline")):
+        return ""
+    color = {"high": "var(--rose)", "medium": "var(--amber, #f59e0b)", "low": "var(--slate-500, #64748b)"}
+    rows = ""
+    for it in (radar.get("items") or [])[:max_items]:
+        if not isinstance(it, dict):
+            continue
+        when = " ".join(x for x in (str(it.get("day_label") or ""), f"{it['time_uk']} UK" if it.get("time_uk") else "") if x)
+        sub = " · ".join(str(x) for x in (it.get("when_label"), it.get("holders") and f"held: {it['holders']}") if x)
+        rows += (
+            f'<tr><td><b>{esc(when)}</b></td>'
+            f'<td><b style="color: {color.get(str(it.get("impact") or "low"), color["low"])};">'
+            f'{"⚠️ " if it.get("action_needed") else ""}{esc(str(it.get("title") or ""))}</b>'
+            + (f'<div class="mix-sub-cell">{esc(sub)}</div>' if sub else "")
+            + f'</td><td>{esc(str(it.get("what_to_do") or ""))}'
+            + (f'<div class="mix-sub-cell">{esc(str(it.get("why") or ""))}</div>' if it.get("why") else "")
+            + "</td></tr>"
+        )
+    timing = "".join(f"<li>{esc(str(t))}</li>" for t in (radar.get("order_timing") or []))
+    return (
+        f'\n    <div class="mix-card mix-wide"><div class="mix-head">📅 Event radar — next '
+        f'{int(radar.get("horizon_days") or 14)} days</div>'
+        f'<div class="mix-sub">{esc(str(radar.get("headline") or ""))}</div>'
+        + ('<table class="mix-table"><thead><tr><th>When</th><th>Event</th><th>What to do</th></tr></thead>'
+           f"<tbody>{rows}</tbody></table>" if rows else "")
+        + (f'<div class="mix-sub"><b>⏱️ When to place today\'s orders</b><ul>{timing}</ul></div>' if timing else "")
+        + f'<div class="mix-sub">{esc(str(radar.get("footnote") or ""))}</div></div>'
+    )
+
+
 def generate_dashboard_html(
     results_by_account: Dict[str, Dict[str, Any]],
     consolidated_view: Dict[str, Any],
@@ -941,6 +975,8 @@ def generate_dashboard_html(
 
     # Household mix panel (Phase 1 strategic allocation); empty when the engine supplies none of the data
     household_mix_panel_html = _household_mix_panel_html(consolidated_view, results_by_account)
+    # Event radar card (scheduled events and what to do); appended to the household panel
+    household_mix_panel_html += _event_radar_panel_html(consolidated_view)
 
     # Build dynamic action cards and status badges per account
     action_cards_by_account: Dict[str, List[str]] = {}

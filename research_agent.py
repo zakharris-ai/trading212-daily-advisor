@@ -1020,6 +1020,32 @@ class DeepResearchAgent:
             return None, None, "⚪ Unknown (earnings calendar unavailable)"
         return None, None, "✅ Clear (No imminent date)"
 
+    @staticmethod
+    def _earnings_timing(info: Dict[str, Any], date_str: Optional[str]) -> Tuple[Optional[str], Optional[bool]]:
+        """(announcement time as a UTC ISO string or None, Yahoo's 'date is an estimate' flag or None).
+
+        The time is only returned when one of Yahoo's earnings timestamps falls on the scheduled date (UTC), so a
+        stale timestamp from the previous quarter is never attached to the next report.
+        """
+        info = info if isinstance(info, dict) else {}
+        est_raw = info.get("isEarningsDateEstimate")
+        is_estimate = bool(est_raw) if est_raw is not None else None
+        if not date_str:
+            return None, is_estimate
+        try:
+            target = datetime.datetime.strptime(str(date_str), "%b %d, %Y").date()
+        except (ValueError, TypeError):
+            return None, is_estimate
+        for key in ("earningsTimestampStart", "earningsTimestamp"):
+            ts = info.get(key)
+            try:
+                when = datetime.datetime.fromtimestamp(float(ts), tz=datetime.timezone.utc) if ts else None
+            except (TypeError, ValueError, OverflowError, OSError):
+                when = None
+            if when is not None and when.date() == target:
+                return when.isoformat(), is_estimate
+        return None, is_estimate
+
     def _backfill_info_from_statements(self, ticker_obj: Any, info: Dict[str, Any]) -> Dict[str, Any]:
         """Backfills missing Yahoo `info` financialData fields from verified `financials`, `cashflow` and `balance_sheet`."""
         merged = dict(info or {})
@@ -1938,6 +1964,8 @@ class DeepResearchAgent:
             "insider_ownership_pct": None,
             "earnings_date_str": None,
             "days_to_earnings": None,
+            "earnings_ts_utc": None,
+            "earnings_is_estimate": None,
             "earnings_catalyst_status": "⚪ Unknown (no earnings data)",
             "economic_moat": "Narrow",
             "roic": None,
@@ -2111,6 +2139,8 @@ class DeepResearchAgent:
             research["earnings_date_str"] = e_str
             research["days_to_earnings"] = e_days
             research["earnings_catalyst_status"] = e_status
+            # Announcement time (UTC ISO) when Yahoo's timestamp falls on that date, and whether the date is estimated
+            research["earnings_ts_utc"], research["earnings_is_estimate"] = self._earnings_timing(info, e_str)
 
             # Forensic Solvency & Financial Structure Audit
             z_score, z_label, z_color = self._compute_altman_z_score(t, info)
@@ -2491,6 +2521,8 @@ class DeepResearchAgent:
             "insider_ownership_pct": None,
             "earnings_date_str": None,
             "days_to_earnings": None,
+            "earnings_ts_utc": None,
+            "earnings_is_estimate": None,
             "earnings_catalyst_status": "✅ Clear (Index Basket)",
             "economic_moat": moat,
             "roic": None,

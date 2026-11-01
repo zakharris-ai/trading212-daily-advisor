@@ -35,6 +35,7 @@ from dashboard_generator import (
     generate_dashboard_html,
 )
 from research_agent import DeepResearchAgent
+from event_calendar import build_event_radar, radar_text_lines
 from strategy_engine import (
     analyze_position,
     build_rebalancing_plan,
@@ -716,6 +717,21 @@ def run_pipeline(
   except Exception as e:
     logger.warning("Performance tracking vs VWRP unavailable for this run: %s", e)
 
+  # 5c. Event radar: scheduled macro events (Fed, BoE, CPI, jobs, elections, market closures), holdings' results dates
+  #     and the next circuit-breaker check, with what (if anything) to do. Display and order-timing notes only: it
+  #     stamps 'place before the results' notes on today's orders but never creates or cancels a trade.
+  try:
+    import config as _cfg
+    consolidated_view["event_radar"] = build_event_radar(
+        results_by_account,
+        tech_regime=tech_regime,
+        horizon_days=int(getattr(_cfg, "EVENT_RADAR_DAYS", 14) or 14),
+        household_basis_gbp=_num((consolidated_view.get("household_mix") or {}).get("basis_gbp"), 0.0),
+        outside_rows=consolidated_view.get("outside_holdings"),
+    )
+  except Exception as e:
+    logger.warning("Event radar unavailable for this run: %s", e)
+
   # Build the HTML output with Consolidated Portfolio Overview
   html_report = generate_html_digest(
       results_by_account, macro_regime=macro_regime, consolidated_view=consolidated_view
@@ -886,6 +902,8 @@ def run_pipeline(
       out(f"     Biggest losses in a {worst.get('label')} replay: {top_txt}. {crash.get('note', '')}")
   if consolidated_view.get("tech_regime"):
     out(f"  🚦 {describe_tech_regime(consolidated_view.get('tech_regime'), str(ALLOCATION_CONFIG.get('rebalance_policy') or 'advisory'))}")
+  for line in radar_text_lines(consolidated_view.get("event_radar")):
+    out(f"  {line}")
   if cons_5y:
     out(
         f"  🛡️ Risk (ISAs, GBP basis): Portfolio Beta: {_fmt(cons_5y.get('current_beta_5y'), '{:.2f}')} |"
