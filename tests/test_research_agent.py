@@ -652,7 +652,7 @@ class DisplayModuleSmokeTests(_QuietLogsMixin, unittest.TestCase):
         self.assertIn("24% Maximum Cluster Cap", html)
         self.assertIn("plan adds £1,250 of 2022-style stress", html)
         self.assertIn("True defensive", html)
-        self.assertIn("Bear £52,000", html)
+        self.assertIn("Low £52,000", html)
         self.assertIn("Ring-fenced (excluded from portfolio maths): CSH2.L £20,000", html)
         self.assertIn("Holdings outside Trading 212 (ACME): vested £40,000 (counted in concentration caps)"
                       " + unvested £60,000 (not counted)", html)
@@ -689,7 +689,7 @@ class DisplayModuleSmokeTests(_QuietLogsMixin, unittest.TestCase):
                 self.assertIn("UNFUNDED", text)
                 self.assertIn("DATA QUALITY WARNING", html)
                 self.assertIn("⚠️ below stop", html)
-                self.assertIn("Bear £52,000", html)
+                self.assertIn("Low £52,000", html)
                 self.assertIn("True defensive", html)
                 self.assertIn("Ring-fenced (excluded from portfolio maths): CSH2.L £20,000", html)
                 self.assertIn("Holdings outside Trading 212 (ACME)", html)

@@ -225,5 +225,58 @@ class GetAccountCashTests(unittest.TestCase):
         self.assertFalse(cash["recent_transactions_ok"])
 
 
+class GetPendingOrdersTests(unittest.TestCase):
+    """VALUE orders ("sell £2,000 of X") arrive with quantity 0 and a negative value; they must never look like
+    a whole-position sale, and several orders on one instrument must add up."""
+
+    def setUp(self):
+        self.client = Trading212Client(key_id="k", secret="s", base_url="https://example.invalid/api/v0")
+        sleep_patcher = mock.patch.object(t212_client.time, "sleep")
+        sleep_patcher.start()
+        self.addCleanup(sleep_patcher.stop)
+
+    def _orders(self, payload):
+        with mock.patch.object(self.client.session, "get", return_value=_response(200, json_data=payload)):
+            return self.client.get_pending_orders()
+
+    def test_value_sell_order_is_sized_by_abs_value(self):
+        live_shape = [{
+            "id": 123456789, "strategy": "VALUE", "type": "MARKET", "ticker": "CSH2l_EQ", "status": "NEW",
+            "value": -2000, "filledValue": 0, "currency": "GBP", "side": "SELL",
+            "instrument": {"ticker": "CSH2l_EQ", "name": "Amundi Smart Overnight Return", "currency": "GBX"},
+        }]
+        res = self._orders(live_shape)
+        self.assertEqual(res["pending_buys"], {})
+        sell = res["pending_sells"]["CSH2.L"]
+        self.assertEqual(sell["side"], "SELL")
+        self.assertEqual(sell["quantity"], 0.0)
+        self.assertEqual(sell["value_abs"], 2000.0)
+        self.assertEqual(sell["estimated_value"], 2000.0)
+        self.assertEqual(sell["strategy"], "VALUE")
+        self.assertEqual(sell["order_currency"], "GBP")
+        self.assertEqual(res["total_pending_sell_value"], 2000.0)
+
+    def test_explicit_side_wins_over_quantity_sign(self):
+        res = self._orders([{"ticker": "AAPL_US_EQ", "side": "SELL", "quantity": 5.0, "type": "MARKET", "status": "NEW"}])
+        self.assertIn("AAPL", res["pending_sells"])
+        self.assertEqual(res["pending_buys"], {})
+
+    def test_value_buy_without_side_is_a_buy(self):
+        res = self._orders([{"ticker": "VWRPl_EQ", "strategy": "VALUE", "value": 500.0, "type": "MARKET", "status": "NEW"}])
+        self.assertIn("VWRP.L", res["pending_buys"])
+        self.assertEqual(res["pending_buys"]["VWRP.L"]["estimated_value"], 500.0)
+
+    def test_two_orders_on_one_instrument_are_combined(self):
+        res = self._orders([
+            {"ticker": "MSFT_US_EQ", "side": "SELL", "quantity": -2.0, "type": "LIMIT", "limitPrice": 600.0, "status": "NEW"},
+            {"ticker": "MSFT_US_EQ", "side": "SELL", "strategy": "VALUE", "value": -300.0, "type": "MARKET", "status": "NEW"},
+        ])
+        sell = res["pending_sells"]["MSFT"]
+        self.assertEqual(sell["quantity"], 2.0)
+        self.assertEqual(sell["value_abs"], 300.0)
+        self.assertEqual(sell["order_count"], 2)
+        self.assertEqual(sell["strategy"], "MIXED")
+
+
 if __name__ == "__main__":
     unittest.main()

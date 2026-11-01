@@ -761,6 +761,33 @@ class EarmarkedProceedsAndTradeCurrencyTests(_TempDataDirMixin, unittest.TestCas
         )
         self.assertEqual(res["unwithdrawn_gbp"], 50.0)
 
+    def test_partial_value_sale_stays_ring_fenced_past_30_days_until_withdrawn(self):
+        # Day 2: a £2,000 VALUE sell of an earmarked money-market fund fills; the money is NOT withdrawn for 6 weeks.
+        day1_pos = [self._pos("CSH2l_EQ", "CSH2.L", 4000.0, price=503.30)]
+        self._detect("2026-11-01", {"Main": day1_pos})
+        self._snapshot("2026-11-01", {"Main": day1_pos}, cash={"Main": {"free": 0.11, "free_gbp": 0.11, "currency": "GBP"}})
+        snap_path = ps.SNAPSHOTS_DIR / "2026-11-01.json"
+        snap_doc = json.loads(snap_path.read_text(encoding="utf-8"))
+        snap_doc["accounts"]["Main"]["positions"][0]["currency"] = "GBX"
+        snap_doc["accounts"]["Main"]["positions"][0]["value_gbp"] = 20132.0
+        snap_path.write_text(json.dumps(snap_doc), encoding="utf-8")
+        sold = 2000.0 / 5.033
+        day2_pos = [self._pos("CSH2l_EQ", "CSH2.L", 4000.0 - sold, price=503.30)]
+        cash2 = {"free": 2000.11, "free_gbp": 2000.11, "recent_transactions": [], "currency": "GBP"}
+        res2 = ps.compute_unwithdrawn_earmarked_proceeds_gbp("Main", day2_pos, cash2, {"CSH2.L"}, current_date_str="2026-11-02", gbp_rate=1.34)
+        self.assertAlmostEqual(res2["unwithdrawn_gbp"], 2000.0, delta=0.5)
+        self._detect("2026-11-02", {"Main": day2_pos})
+        self._snapshot("2026-11-02", {"Main": day2_pos}, cash={"Main": cash2})
+        # 42 days later: still in cash, never withdrawn -> still ring-fenced (a 30-day window released it)
+        cash_later = {"free": 2002.50, "free_gbp": 2002.50, "recent_transactions": [], "currency": "GBP"}
+        res_later = ps.compute_unwithdrawn_earmarked_proceeds_gbp("Main", day2_pos, cash_later, {"CSH2.L"}, current_date_str="2026-12-14", gbp_rate=1.34)
+        self.assertAlmostEqual(res_later["unwithdrawn_gbp"], 2000.0, delta=0.5)
+        # A £1,000 partial withdrawal leaves £1,000 ring-fenced
+        cash_part = {"free": 1002.50, "free_gbp": 1002.50, "currency": "GBP", "recent_transactions": [
+            {"type": "WITHDRAW", "amount": -1000.0, "reference": "WD-PART-1", "dateTime": "2026-12-15T10:00:00Z"}]}
+        res_part = ps.compute_unwithdrawn_earmarked_proceeds_gbp("Main", day2_pos, cash_part, {"CSH2.L"}, current_date_str="2026-12-15", gbp_rate=1.34)
+        self.assertAlmostEqual(res_part["unwithdrawn_gbp"], 1000.0, delta=0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

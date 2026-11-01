@@ -584,6 +584,8 @@ class TestRiskProfile(EngineTestCase):
         self.assertIn("BUILDING", status(10000.0, 0.0))
         self.assertIn("HIGH BETA", status(5000.0, 0.0))
         self.assertIn("BUILDING", status(20000.0, 10000.0))  # 10% leverage breaches the 8% cap
+        # The defensive-buffer label never claims the book is crash-proof
+        self.assertNotIn("ALL-WEATHER", status(20000.0, 0.0))
 
     def test_projections_bear_base_bull_and_aliases(self):
         rp = se.compute_portfolio_5y_risk_profile([], 10000.0, 0.0, 10000.0)
@@ -1912,6 +1914,243 @@ class TestGoalAuditFixes(EngineTestCase):
         self.assertEqual(len(opps), 1)
         self.assertEqual(opps[0]["ticker"], "LIN")
         self.assertEqual(opps[0]["action_short"], "BUY")
+
+
+class TestCrashProtectionUpgrade(EngineTestCase):
+    """Goal-2 upgrade: VALUE-order sizing, honest 2022 window, crash replays, tech circuit-breaker and glide path."""
+
+    allocation_cfg = dict(HOUSEHOLD_ALLOCATION_CFG, rebalance_policy="advisory", glide_fraction=0.25,
+                          glide_count_outside=False, regime_sma_months=10)
+
+    def setUp(self):
+        super().setUp()
+        from datetime import date
+        self.buy_day = date(2026, 11, 2)       # first London business day of November 2026
+        self.off_day = date(2026, 11, 10)
+
+    # ---- pending VALUE orders -------------------------------------------------------------------------------
+    def test_size_pending_order_value_sell_uses_value_not_position(self):
+        order = {"side": "SELL", "quantity": 0.0, "value": -2400.0, "value_abs": 2400.0, "strategy": "VALUE", "order_currency": "GBP"}
+        shares, gbp, known = se.size_pending_order(order, 5.033, held_qty=4000.0, held_value_gbp=20132.0)
+        self.assertTrue(known)
+        self.assertAlmostEqual(gbp, 2400.0, places=2)
+        self.assertAlmostEqual(shares, 2400.0 / 5.033, places=3)
+
+    def test_size_pending_order_quantity_cap_and_unknown(self):
+        shares, gbp, known = se.size_pending_order({"side": "SELL", "quantity": 10.0}, 100.0, held_qty=50.0, held_value_gbp=5000.0)
+        self.assertEqual((shares, gbp, known), (10.0, 1000.0, True))
+        shares, gbp, known = se.size_pending_order({"side": "SELL", "quantity": 80.0}, 100.0, held_qty=50.0, held_value_gbp=5000.0)
+        self.assertEqual((shares, gbp), (50.0, 5000.0))  # never more than the position
+        shares, gbp, known = se.size_pending_order({"side": "SELL"}, 100.0, held_qty=50.0, held_value_gbp=5000.0)
+        self.assertFalse(known)  # manual PENDING_SELLS fallback: size unknown -> whole position, flagged
+        self.assertEqual(gbp, 5000.0)
+        _, buy_gbp, buy_known = se.size_pending_order({"side": "BUY", "value": 500.0}, 100.0)
+        self.assertEqual((buy_gbp, buy_known), (500.0, True))
+
+    def test_pending_value_sell_in_plan_is_sized_by_value_and_breach_stays_open(self):
+        nvda = make_analysis("NVDA", 40000.0, macro_cluster="AI Hardware & Semiconductors")
+        rest = make_analysis("VUAA.L", 60000.0, macro_cluster="Diversified Index Core")
+        pending = {"has_orders_scope": True, "pending_buys": {}, "pending_sells": {
+            "NVDA": {"side": "SELL", "quantity": 0.0, "value": -500.0, "value_abs": 500.0, "strategy": "VALUE",
+                     "order_type": "MARKET", "order_currency": "GBP"},
+        }}
+        plan = self.plan([nvda, rest], cash=0.0, pending_orders_data=pending, account_name="Main", as_of=self.off_day)
+        pso = plan["pending_sell_orders"]
+        self.assertEqual(len(pso), 1)
+        self.assertAlmostEqual(pso[0]["estimated_gbp"], 500.0, places=2)
+        self.assertAlmostEqual(pso[0]["shares"], 5.0, places=4)
+        self.assertAlmostEqual(plan["cash_from_sells_gbp"], 500.0, places=2)
+        breach = [b for b in plan["cap_breaches"] if b.get("ticker") == "NVDA"][0]
+        self.assertFalse(breach["actioned"])  # a £500 sell does not fix a £25,000 excess over the 15% cap
+        self.assertTrue(breach["pending_order"])
+
+    # ---- honest 2022 window ---------------------------------------------------------------------------------
+    def test_period_return_uses_last_close_before_the_window(self):
+        idx = pd.date_range("2021-12-20", periods=56, freq="W-MON")  # weekly bars labelled by week start
+        vals = np.linspace(100.0, 80.0, len(idx))
+        s = pd.Series(vals, index=idx)
+        got = se._period_return_pct(s, "2022-01-01", "2022-12-31")
+        base = s[s.index < "2022-01-01"].iloc[-1]
+        end = s[s.index <= "2022-12-31"].iloc[-1]
+        self.assertAlmostEqual(got, (end / base - 1.0) * 100.0, places=6)
+
+    # ---- crash replays ---------------------------------------------------------------------------------------
+    def test_crash_sleeve_mapping(self):
+        expected = {
+            ("CNDX.L", "Diversified Index Core"): "tech", ("CNX1.L", None): "tech", ("SMGB.L", "AI Hardware & Semiconductors"): "semis",
+            ("VUAA.L", "Diversified Index Core"): "core_us", ("VWRP.L", "Diversified Index Core"): "core_global",
+            ("SGLN.L", None): "gold", ("CSH2.L", None): "cash", ("IGLS.L", None): "cash",
+            ("LLY", "Healthcare & Biopharma"): "health", ("V", "Financials & Payment Rails"): "other_equity",
+            ("GOOGL", "Consumer & Digital Platforms"): "tech", ("NVDA", "AI Hardware & Semiconductors"): "semis",
+            ("PLTR", "Enterprise Cloud & Software"): "tech",
+        }
+        for (ticker, cluster), sleeve in expected.items():
+            self.assertEqual(se.crash_sleeve(ticker, cluster), sleeve, ticker)
+
+    def test_crash_scenarios_known_values_and_target_mix(self):
+        res = se.compute_crash_scenarios(
+            [{"ticker": "VWRP.L", "value_gbp": 100.0}, {"ticker": "NVDA", "value_gbp": 100.0, "macro_cluster": "AI Hardware & Semiconductors"}],
+            100.0,
+            outside_rows=[{"ticker": "GOOGL", "vested_gbp": 100.0, "unvested_gbp": 1e6, "macro_cluster": "Consumer & Digital Platforms"}],
+        )
+        self.assertEqual(res["basis_gbp"], 400.0)  # unvested never counts
+        dot = {s["key"]: s for s in res["scenarios"]}["dotcom"]
+        self.assertAlmostEqual(dot["loss_gbp"], round(-43.8 - 79.6 - 79.3 + 13.4, 0), places=0)
+        self.assertAlmostEqual(dot["loss_pct"], round((-43.8 - 79.6 - 79.3 + 13.4) / 4.0, 1), places=1)
+        self.assertAlmostEqual(dot["target_mix_loss_pct"], round(0.75 * -43.8 + 0.20 * -44.1 + 0.05 * 13.3, 1), places=1)
+        self.assertEqual(dot["top_contributors"][0]["ticker"], "NVDA")
+        self.assertIn("CRASH RISK ABOVE PLAN", res["status"])  # 25% cash softens it: -47% vs the plan's -41%
+        tech_heavy = se.compute_crash_scenarios(
+            [{"ticker": "VWRP.L", "value_gbp": 30.0}, {"ticker": "CNDX.L", "value_gbp": 70.0}], 0.0)
+        self.assertIn("FAR ABOVE PLAN", tech_heavy["status"])
+        calm = se.compute_crash_scenarios([{"ticker": "VWRP.L", "value_gbp": 95.0}, {"ticker": "SGLN.L", "value_gbp": 5.0}], 0.0)
+        self.assertIn("IN LINE WITH PLAN", calm["status"])
+
+    def test_risk_profile_reports_crash_status_not_all_weather(self):
+        book = [make_analysis("NVDA", 90000.0, macro_cluster="AI Hardware & Semiconductors"),
+                make_analysis("SGLN.L", 10000.0, macro_cluster="Uncorrelated Crash Hedge & Gold")]
+        rp = se.compute_portfolio_5y_risk_profile(book, 0.0, 0.0, 100000.0)
+        self.assertIn("CRASH RISK", rp["crash_readiness_grade"])
+        self.assertNotIn("ALL-WEATHER", rp["shield_status"])
+        self.assertIn("scenarios", rp["crash_scenarios"])
+
+    # ---- tech crash circuit-breaker ---------------------------------------------------------------------------
+    def test_tech_regime_uses_completed_months_only(self):
+        from datetime import date
+        idx = pd.bdate_range("2025-01-01", "2026-11-20")
+        up = pd.Series(np.linspace(100.0, 200.0, len(idx)), index=idx)
+        on = se.tech_regime_from_closes(up, as_of=date(2026, 11, 20), sma_months=10, proxy="TEST")
+        self.assertEqual(on["regime"], se.REGIME_RISK_ON)
+        self.assertEqual(on["as_of_month_end"], "2026-10-31")  # November is incomplete and ignored
+        self.assertGreaterEqual(on["months_in_regime"], 5)
+        crash_now = up.copy()
+        crash_now[crash_now.index >= "2026-11-01"] = 50.0  # an intra-month crash cannot flip the monthly signal
+        self.assertEqual(se.tech_regime_from_closes(crash_now, as_of=date(2026, 11, 20))["regime"], se.REGIME_RISK_ON)
+        down = up.copy()
+        down[down.index >= "2026-09-01"] = 120.0  # September + October closed far below the 10-month average
+        off = se.tech_regime_from_closes(down, as_of=date(2026, 11, 20))
+        self.assertEqual(off["regime"], se.REGIME_RISK_OFF)
+        self.assertEqual(off["months_in_regime"], 2)
+        self.assertEqual(se.tech_regime_from_closes(up.iloc[:50], as_of=date(2026, 11, 20))["regime"], se.REGIME_UNKNOWN)
+
+    # ---- crisis alpha annualisation ----------------------------------------------------------------------------
+    def test_crisis_alpha_annualises_by_stress_weeks_not_52(self):
+        idx = pd.date_range(start="2021-06-07", periods=300, freq="W-MON")
+        spy, asset = [100.0], [100.0]
+        for k in range(1, len(idx)):
+            if k % 5 == 0:   # one S&P down-week in five (-2%); the asset falls 0.5 percentage points less
+                spy.append(spy[-1] * 0.98)
+                asset.append(asset[-1] * 0.985)
+            else:
+                spy.append(spy[-1] * 1.008)
+                asset.append(asset[-1] * 1.008)
+        stock_wk = pd.DataFrame({"Close": asset}, index=idx)
+        spy_s = pd.Series(spy, index=idx)
+        fx_wk = pd.Series([1.0] * len(idx), index=idx)
+        with mock.patch.object(se, "get_spy_5y_weekly_history_gbp", return_value=spy_s), \
+             mock.patch.object(se, "get_spy_5y_weekly_history", return_value=spy_s), \
+             mock.patch.object(se, "get_fx_weekly_history", return_value=fx_wk):
+            wk = se.evaluate_weekly_trend(FakeTicker(weekly=stock_wk, fast_info={"currency": "GBP"}), yf_ticker="TEST.L", currency="GBP")
+        # ~10.4 stress weeks a year x 0.5% = ~5.2%/yr (the old x52 scaling reported the 35% clamp)
+        self.assertAlmostEqual(wk["crisis_alpha_5y_pct"], 5.2, delta=0.4)
+
+    # ---- glide path ------------------------------------------------------------------------------------------
+    def _glide_book(self):
+        return [
+            make_analysis("PLTR", 30000.0, signal=se.TREND_REVIEW_SIGNAL, macro_cluster="Enterprise Cloud & Software", account="Main"),
+            make_analysis("SMGB.L", 20000.0, macro_cluster="AI Hardware & Semiconductors", account="Main"),
+            make_analysis("V", 20000.0, macro_cluster="Financials & Payment Rails", account="Main"),
+            make_analysis("VWRP.L", 30000.0, macro_cluster="Diversified Index Core", account="Main"),
+        ]
+
+    def _household(self):
+        return {"basis_gbp": 100000.0, "band_pp": 5.0, "targets": {"core": 0.75, "satellite": 0.20, "defensive": 0.05},
+                "values_gbp": {"core": 30000.0, "satellite": 70000.0, "defensive": 0.0}}
+
+    def _glide(self, regime, as_of, policy="advisory", wrapper="ISA"):
+        cfg = dict(self.allocation_cfg, rebalance_policy=policy)
+        with mock.patch.object(config, "ALLOCATION_CONFIG", cfg, create=True), \
+             mock.patch.object(config, "ACCOUNT_WRAPPERS", {"Main": wrapper}, create=True):
+            return se.build_glide_path_trims(
+                analyses=self._glide_book(), account_name="Main", household=self._household(), hh_outside_rows=[],
+                global_context={"tech_regime": {"regime": regime, "sma_months": 10, "pct_vs_sma": 2.0}},
+                existing_sell_orders=[], pending_sells={}, as_of=as_of,
+            )
+
+    def test_glide_path_buy_day_trims_a_quarter_of_the_excess_riskiest_first(self):
+        g = self._glide(se.REGIME_RISK_ON, self.buy_day)
+        self.assertTrue(g["out_of_band"])
+        self.assertAlmostEqual(g["excess_to_target_gbp"], 50000.0)
+        self.assertAlmostEqual(g["tranche_household_gbp"], 12500.0)
+        self.assertEqual(g["trigger"], "glide_path")
+        self.assertFalse(g["active"])
+        self.assertEqual(g["orders"], [])
+        props = g["proposals"]
+        self.assertEqual(props[0]["ticker"], "PLTR")  # broken weekly trend ranks first
+        self.assertAlmostEqual(sum(p["estimated_gbp"] for p in props), 12500.0, delta=1.0)
+        self.assertTrue(all(p["ticker"] not in ("VWRP.L",) for p in props))  # core is never trimmed
+        self.assertTrue(all(p["order_reason"] == "glide_rebalance" for p in props))
+
+    def test_glide_path_waits_for_the_buy_day_when_the_trend_is_up(self):
+        g = self._glide(se.REGIME_RISK_ON, self.off_day)
+        self.assertEqual(g["proposals"], [])
+        self.assertTrue(any("buy day" in n for n in g["notes"]))
+
+    def test_glide_step_trims_at_most_half_of_one_position(self):
+        with mock.patch.dict(self.allocation_cfg, {"glide_fraction": 0.5}):
+            g = self._glide(se.REGIME_RISK_ON, self.buy_day)
+        self.assertAlmostEqual(g["tranche_household_gbp"], 25000.0)
+        by_t = {p["ticker"]: p["estimated_gbp"] for p in g["proposals"]}
+        self.assertAlmostEqual(by_t["PLTR"], 15000.0, delta=1.0)   # half of the £30k position, not £25k
+        self.assertAlmostEqual(sum(by_t.values()), 25000.0, delta=1.0)
+        self.assertIn("SMGB.L", by_t)
+
+    def test_circuit_breaker_trims_the_whole_excess_when_the_trend_is_down(self):
+        g = self._glide(se.REGIME_RISK_OFF, self.off_day)
+        self.assertEqual(g["trigger"], "circuit_breaker")
+        self.assertAlmostEqual(g["tranche_household_gbp"], 50000.0)
+        self.assertAlmostEqual(sum(p["estimated_gbp"] for p in g["proposals"]), 50000.0, delta=1.0)
+        self.assertEqual(g["proposals"][0]["ticker"], "PLTR")
+        self.assertEqual(g["proposals"][1]["ticker"], "SMGB.L")  # tech/semis while the breaker is on, before V
+
+    def test_active_policy_orders_only_in_an_isa_and_off_does_nothing(self):
+        active = self._glide(se.REGIME_RISK_OFF, self.off_day, policy="active")
+        self.assertTrue(active["active"])
+        self.assertEqual(len(active["orders"]), len(active["proposals"]))
+        gia = self._glide(se.REGIME_RISK_OFF, self.off_day, policy="active", wrapper="GIA")
+        self.assertFalse(gia["active"])
+        self.assertEqual(gia["orders"], [])
+        self.assertTrue(any("ISA" in n for n in gia["notes"]))
+        off = self._glide(se.REGIME_RISK_OFF, self.off_day, policy="off")
+        self.assertEqual((off["proposals"], off["orders"]), ([], []))
+
+    def test_active_circuit_breaker_sells_appear_in_the_plan_and_park_new_money(self):
+        cfg = dict(self.allocation_cfg, rebalance_policy="active")
+        # Five satellites each under the 15% position cap (so no cap trims interfere) + 30% core
+        book = [
+            make_analysis("PLTR", 14000.0, signal=se.TREND_REVIEW_SIGNAL, macro_cluster="Enterprise Cloud & Software", account="Main"),
+            make_analysis("SMGB.L", 14000.0, macro_cluster="AI Hardware & Semiconductors", account="Main"),
+            make_analysis("MSFT", 14000.0, macro_cluster="Enterprise Cloud & Software", account="Main"),
+            make_analysis("V", 14000.0, macro_cluster="Financials & Payment Rails", account="Main"),
+            make_analysis("LLY", 14000.0, macro_cluster="Healthcare & Biopharma", account="Main"),
+            make_analysis("VWRP.L", 30000.0, macro_cluster="Diversified Index Core", account="Main"),
+        ]
+        hh = self._household()
+        gc = {"tech_regime": {"regime": se.REGIME_RISK_OFF, "sma_months": 10, "pct_vs_sma": -4.0},
+              "household_mix": dict(hh, ledger={"core": 0.0, "satellite": 0.0, "gold": 0.0, "short_gilts": 0.0, "big_tech_gbp": 0.0})}
+        meta = make_analysis("META", 0.0, conviction_score=95, is_new_addition=True, macro_cluster="Consumer & Digital Platforms")
+        with mock.patch.object(config, "ALLOCATION_CONFIG", cfg, create=True), \
+             mock.patch.object(config, "ACCOUNT_WRAPPERS", {"Main": "ISA"}, create=True):
+            plan = self.plan(book, cash=8000.0, opps=[meta], account_name="Main", global_context=gc,
+                             instrument_universe=bucket_universe(), as_of=self.buy_day)
+        cb = [s for s in plan["sell_orders"] if s["order_reason"] == "circuit_breaker"]
+        self.assertEqual([s["ticker"] for s in cb][:3], ["PLTR", "SMGB.L", "MSFT"])
+        self.assertAlmostEqual(sum(s["estimated_gbp"] for s in cb), 50000.0, delta=1.0)
+        self.assertTrue(all(b["ticker"] not in ("META", "VWRP.L") for b in plan["buy_orders"]))  # parked / blocked
+        self.assertEqual(plan["household_allocation"]["by_bucket_gbp"]["core"], 0.0)
+        self.assertTrue(any("circuit-breaker" in n for n in plan["household_allocation"]["notes"]))
+        tldr = se.generate_tldr_summary({"Main": {"rebalancing_plan": plan, "cash": {}}})["Main"]
+        self.assertTrue(any("circuit-breaker" in s["instruction"] for s in tldr["sells_to_place"]))
 
 
 class TestCompiles(unittest.TestCase):

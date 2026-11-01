@@ -101,10 +101,17 @@ def describe_reserve(
     """
     rs: Dict[str, Any] = dict(_reserve_status(plan, cash_info, acc_name))
     rs["unfunded"] = rs["shortfall"] > 0.005
-    if rs["unfunded"]:
+    ring_fenced = _num((plan or {}).get("ring_fenced_cash_gbp")) if isinstance(plan, dict) else None
+    rs["ring_fenced"] = max(0.0, min(rs["free"], ring_fenced or 0.0))
+    if rs["unfunded"] and rs["ring_fenced"] > 0.5:
+        rs["status_text"] = (
+            f"🔒 £{rs['ring_fenced']:,.0f} of your free cash is ring-fenced sale money — safe to withdraw now; "
+            f"the rest of the £{rs['floor']:,.0f} floor is £{rs['shortfall']:,.0f} short, so buys stay blocked"
+        )
+    elif rs["unfunded"]:
         rs["status_text"] = (
             f"⚠️ UNFUNDED — £{rs['shortfall']:,.0f} short of the £{rs['floor']:,.0f} floor "
-            f"(free cash £{rs['free']:,.2f}); not available to withdraw until rebuilt"
+            f"(free cash £{rs['free']:,.2f}); buys stay blocked until it is rebuilt"
         )
     else:
         rs["status_text"] = f"✅ Funded from free cash (£{rs['funded']:,.0f} of the £{rs['floor']:,.0f} floor)"
@@ -170,13 +177,23 @@ def _risk_texts(rp: Optional[Dict[str, Any]]) -> Dict[str, str]:
         "crash_delta": _crash_delta_text(g("crash_delta_gbp")),
         "grade": str(rp.get("crash_readiness_grade") or "N/A"),
     }
+    crash = rp.get("crash_scenarios") if isinstance(rp.get("crash_scenarios"), dict) else {}
+    worst = crash.get("worst") if isinstance(crash.get("worst"), dict) else {}
+    if worst:
+        texts["worst_replay"] = f"{_num(worst.get('loss_pct')) or 0.0:+.1f}%"
+        texts["worst_replay_sub"] = (
+            f"{worst.get('label')} ({_gbp(worst.get('loss_gbp'))}); your plan mix "
+            f"{_num(worst.get('target_mix_loss_pct')) or 0.0:+.1f}%"
+        )
+    else:
+        texts["worst_replay"], texts["worst_replay_sub"] = "N/A", "crash replays unavailable"
     bear, base, bull = g("projected_5y_bear_gbp"), g("projected_5y_base_gbp"), g("projected_5y_bull_gbp")
     if bear is not None or base is not None or bull is not None:
-        texts["projection"] = f"Bear {_gbp(bear)} · Base {_gbp(base)} · Bull {_gbp(bull)}"
+        texts["projection"] = f"Low {_gbp(bear)} · Base {_gbp(base)} · High {_gbp(bull)}"
         texts["projection_rates"] = " · ".join(
-            f"{name} {_fmt(rp.get(f'projected_5y_{name}_cagr_pct'), '+.0f', '%/yr')}"
-            for name in ("bear", "base", "bull")
-        )
+            f"{label} {_fmt(rp.get(f'projected_5y_{name}_cagr_pct'), '+.0f', '%/yr')}"
+            for name, label in (("bear", "low"), ("base", "base"), ("bull", "high"))
+        ) + " (long-run asset-class assumptions; a crash is shown separately)"
     else:
         cons, target = g("projected_5y_conservative_gbp"), g("projected_5y_target_gbp")
         if cons is None and target is None:
@@ -287,6 +304,82 @@ def _bucket_badge_html(bucket: Any) -> str:
         f'<span style="background: {pal["bg"]}; color: {pal["fg"]}; font-size: 11px; font-weight: 800; '
         f'padding: 2px 8px; border-radius: 6px; letter-spacing: 0.03em;">{key.upper()}</span>'
     )
+
+
+def build_crash_protection_html(consolidated_view: Optional[Dict[str, Any]], results_by_account: Optional[Dict[str, Any]] = None) -> str:
+    """'Crash protection check' card: tech crash circuit-breaker state, the three historical crash replays on the
+    whole household vs the plan mix, the biggest losers, and any glide-path / circuit-breaker trim proposals.
+
+    Renders '' when the engine supplied neither crash replays nor a tech regime. Every engine string is escaped.
+    """
+    esc = _html.escape
+    cv = consolidated_view if isinstance(consolidated_view, dict) else {}
+    crash = cv.get("crash_scenarios") if isinstance(cv.get("crash_scenarios"), dict) else {}
+    regime = cv.get("tech_regime") if isinstance(cv.get("tech_regime"), dict) else None
+    scenarios = [s for s in (crash.get("scenarios") or []) if isinstance(s, dict)]
+    if not scenarios and not regime:
+        return ""
+    try:
+        from strategy_engine import describe_tech_regime  # local import: mailer must stay importable without it
+        policy = str((getattr(_config, "ALLOCATION_CONFIG", {}) or {}).get("rebalance_policy") or "advisory")
+        regime_line = describe_tech_regime(regime, policy) if regime else ""
+    except Exception:
+        regime_line = ""
+    status = str(crash.get("status") or "")
+    status_color = str(crash.get("status_color") or "#64748b")
+    tiles = ""
+    for s in scenarios:
+        loss_pct = _num(s.get("loss_pct"), 0.0)
+        tgt_pct = _num(s.get("target_mix_loss_pct"), 0.0)
+        tiles += (
+            '<td style="width: 33%; padding: 4px; vertical-align: top;">'
+            '<div style="background: #ffffff; border: 1px solid #fecaca; border-radius: 8px; padding: 8px;">'
+            f'<div style="font-size: 10px; color: #64748b; text-transform: uppercase; font-weight: 700;">{esc(str(s.get("label") or ""))}</div>'
+            f'<div style="font-size: 16px; font-weight: 800; color: #b91c1c;">{loss_pct:+.1f}%</div>'
+            f'<div style="font-size: 11px; color: #334155;">£{abs(_num(s.get("loss_gbp"), 0.0)):,.0f} {"lost" if loss_pct < 0 else "gained"}</div>'
+            f'<div style="font-size: 11px; color: #0f766e; margin-top: 2px;">Your target mix: <b>{tgt_pct:+.1f}%</b></div>'
+            '</div></td>'
+        )
+    worst = crash.get("worst") if isinstance(crash.get("worst"), dict) else {}
+    losers = ", ".join(
+        f"{esc(str(c.get('ticker')))} £{abs(_num(c.get('loss_gbp'), 0.0)):,.0f}"
+        for c in (worst.get("top_contributors") or []) if isinstance(c, dict)
+    )
+    proposals_html = ""
+    for acc_name, acc in (results_by_account or {}).items():
+        plan = (acc or {}).get("rebalancing_plan") if isinstance(acc, dict) else None
+        glide = (plan or {}).get("rebalance_glide") if isinstance(plan, dict) else None
+        if not isinstance(glide, dict) or not glide.get("proposals") or glide.get("active"):
+            continue
+        items = "".join(
+            f"<li><b>{esc(str(p.get('name') or p.get('ticker')))} ({esc(str(p.get('search_symbol') or ''))})</b>: "
+            f"~£{_num(p.get('estimated_gbp'), 0.0):,.0f} — {esc('; '.join(p.get('rank_factors') or []) or 'largest satellite')}</li>"
+            for p in glide["proposals"]
+        )
+        label = "circuit-breaker" if glide.get("trigger") == "circuit_breaker" else "glide-path"
+        proposals_html += (
+            f'<div style="margin-top: 6px; font-size: 12px; color: #334155;"><b>👤 {esc(str(acc_name))} — proposed {label} trims '
+            f'(not active):</b><ul style="margin: 4px 0 0 18px; padding: 0;">{items}</ul></div>'
+        )
+    if proposals_html:
+        proposals_html += (
+            '<div style="font-size: 11px; color: #64748b; margin-top: 4px;">These are proposals only. Set '
+            '<code>REBALANCE_POLICY=active</code> to turn them into orders (ISA accounts only; no capital gains tax).</div>'
+        )
+    return f"""
+    <!-- 💥 CRASH PROTECTION CHECK — historical replays + tech circuit-breaker -->
+    <div style="background: #fff7ed; border: 1px solid #fed7aa; border-radius: 12px; padding: 14px 16px; margin-bottom: 16px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
+        <div style="font-size: 13px; font-weight: 800; color: #9a3412; text-transform: uppercase;">💥 Crash protection check (household incl. vested shares outside T212)</div>
+        <span style="background: {esc(status_color)}; color: #ffffff; font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 6px;">{esc(status)}</span>
+      </div>
+      <div style="font-size: 12px; color: #334155; margin-top: 6px;">🚦 {esc(regime_line)}</div>
+      <table role="presentation" style="width: 100%; border-collapse: collapse; margin-top: 6px;"><tr>{tiles}</tr></table>
+      {f'<div style="font-size: 12px; color: #334155; margin-top: 4px;">Biggest losses in a {esc(str(worst.get("label") or ""))} replay: {losers}.</div>' if losers else ''}
+      <div style="font-size: 11px; color: #64748b; margin-top: 4px;">{esc(str(crash.get("note") or ""))}</div>
+      {proposals_html}
+    </div>
+    """
 
 
 def build_household_mix_html(consolidated_view: Optional[Dict[str, Any]]) -> str:
@@ -661,6 +754,8 @@ def generate_html_digest(
 
     # Household strategic mix card (Phase 1): renders nothing when the engine supplied none of its data
     household_mix_html = build_household_mix_html(consolidated_view)
+    # Crash protection check (historical replays + tech circuit-breaker + trim proposals)
+    crash_protection_html = build_crash_protection_html(consolidated_view, results_by_account)
 
 
     consolidated_overview_html = ""
@@ -772,11 +867,11 @@ def generate_html_digest(
             </div>
           </div>
 
-          <!-- 5-Year Horizon Crash Stress-Test & Compounding Trajectory -->
+          <!-- Risk snapshot (Trading 212 ISAs) -->
           <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; padding: 12px 16px; margin-bottom: 16px;">
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 8px;">
               <div style="font-size: 12px; font-weight: 800; color: #166534; text-transform: uppercase;">
-                🛡️ 5-Year Horizon All-Weather & Crash Stress-Test (2026–2031)
+                🛡️ Risk snapshot — Trading 212 ISAs (see the crash protection check above for the household)
               </div>
               <span style="background: {defcon_pal['solid']}; color: #ffffff; font-size: 11px; font-weight: 800; padding: 2px 8px; border-radius: 6px;">
                 {macro_defcon}
@@ -784,27 +879,23 @@ def generate_html_digest(
             </div>
             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; font-size: 12px;">
               <div style="background: #ffffff; border: 1px solid #dcfce7; border-radius: 6px; padding: 8px;">
-                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">Combined 5Y Sortino</span><br>
-                <b style="color: #15803d; font-size: 14px;">{cons_rt['sortino']}</b> <span style="font-size: 10px; color: #64748b;">(Est. 5Y CAGR, blended hist./model estimate, info only: now {cons_rt['cagr_now']} ➔ after plan {cons_rt['cagr_post']})</span>
+                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">Portfolio Beta (vs S&amp;P 500)</span><br>
+                <b style="color: #15803d; font-size: 14px;">{cons_rt['beta']}</b> <span style="font-size: 10px; color: #64748b;">(1.00 = moves with the market)</span>
               </div>
               <div style="background: #ffffff; border: 1px solid #dcfce7; border-radius: 6px; padding: 8px;">
-                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">2022 Crash Stress-Test</span><br>
+                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">2022 replay of each holding (GBP)</span><br>
                 <b style="color: #dc2626; font-size: 14px;">{cons_rt['stress']}</b> <span style="font-size: 10px; color: #64748b;">({cons_rt['stress_gbp']})</span>
                 {cons_crash_delta_html}
               </div>
               <div style="background: #ffffff; border: 1px solid #dcfce7; border-radius: 6px; padding: 8px;">
-                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">All-Weather Shield</span><br>
-                <b style="color: #0284c7; font-size: 14px;">{cons_rt['shield']}</b> <span style="font-size: 10px; color: #64748b;">(Beta: {cons_rt['beta']})</span>
-                <div style="font-size: 10px; color: #334155; margin-top: 2px;">True defensive (cash, money-market, gold): <b>{cons_rt['defensive']}</b></div>
+                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">Defensive buffer</span><br>
+                <b style="color: #0284c7; font-size: 14px;">{cons_rt['defensive']}</b> <span style="font-size: 10px; color: #64748b;">(cash, money-market, gold, short gilts)</span>
               </div>
               <div style="background: #ffffff; border: 1px solid #dcfce7; border-radius: 6px; padding: 8px;">
-                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">2031 5Y Projection</span><br>
+                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">2031 growth paths (no crash assumed)</span><br>
                 <b style="color: #0f172a; font-size: 12px;">{cons_rt['projection']}</b>
                 <div style="font-size: 10px; color: #64748b; margin-top: 2px;">{cons_rt['projection_rates']}</div>
               </div>
-            </div>
-            <div style="font-size: 11px; color: #166534; margin-top: 6px;">
-              💡 <b>5-Year Crash Directive:</b> {macro_regime.get('crash_shield_directive') or 'N/A'}
             </div>
           </div>
 
@@ -885,13 +976,14 @@ def generate_html_digest(
                     val = float(ps.get("estimated_value", ps.get("value", 0.0)) or 0.0)
                     qty = float(ps.get("quantity", 0.0) or 0.0)
                     matching_pso = next((p for p in pending_sell_orders if p.get("ticker") == pt or p.get("search_symbol") == pt), None)
-                    if math.isnan(val) or val <= 0:
-                        if matching_pso:
-                            val = float(matching_pso.get("estimated_gbp", 0.0) or 0.0)
-                            if math.isnan(val):
-                                val = 0.0
-                            if qty == 0:
-                                qty = matching_pso.get("shares", 0.0)
+                    if matching_pso:
+                        # The plan sizes every pending order at today's GBP price (VALUE orders by their £ value)
+                        pso_val = float(matching_pso.get("estimated_gbp", 0.0) or 0.0)
+                        pso_qty = float(matching_pso.get("shares", 0.0) or 0.0)
+                        if not math.isnan(pso_val) and pso_val > 0:
+                            val = pso_val
+                        if not math.isnan(pso_qty) and pso_qty > 0:
+                            qty = pso_qty
                     if math.isnan(val):
                         val = 0.0
                     lim_p = ps.get("limit_price", 0.0)
@@ -906,7 +998,8 @@ def generate_html_digest(
                         )
                     else:
                         val_str = ""
-                    pending_items_html += f"<li>🔴 <b>SELL {name} ({pt}):</b> ~{qty:,.2f} shares{limit_str} queued{val_str}.</li>"
+                    size_str = f"~{qty:,.2f} shares" if qty > 0 else f"£{val:,.0f} value order"
+                    pending_items_html += f"<li>🔴 <b>SELL {name} ({pt}):</b> {size_str}{limit_str} queued{val_str}.</li>"
                 pending_items_html += "</ul>"
             elif pending_sell_orders:
                 pending_items_html = f"<div>👉 <b>Committed Pending Balance:</b> £{blocked_cash:,.2f} in Trading 212.</div>"
@@ -951,7 +1044,19 @@ def generate_html_digest(
         non_pending_sells = [s for s in sell_orders if not s.get("is_pending")]
         if not non_pending_sells and not buy_orders:
             free_label = cash_info.get("free_label") or f"£{avail_cash:,.2f}"
-            if reserve["unfunded"]:
+            if reserve["unfunded"] and reserve.get("ring_fenced", 0.0) > 0.5:
+                reserve_card_style = "background-color: #f0f9ff; border: 2px solid #bae6fd;"
+                reserve_title = f"STEP {step_number}: 🔒 £{reserve['ring_fenced']:,.0f} RING-FENCED SALE MONEY — SAFE TO WITHDRAW"
+                reserve_title_color = "#0369a1"
+                reserve_badge = "RING-FENCED"
+                reserve_badge_bg = "#0284c7"
+                reserve_status_txt = (
+                    f"<b>£{reserve['ring_fenced']:,.0f}</b> of your free cash is earmarked sale money awaiting withdrawal; "
+                    f"it is never invested. The rest of your <b>£{reserve_floor:,.0f}</b> floor is "
+                    f"<b>£{reserve['shortfall']:,.0f} short</b>."
+                )
+                reserve_rationale = "No new buy orders are recommended until free cash covers the whole floor."
+            elif reserve["unfunded"]:
                 reserve_card_style = "background-color: #fffbeb; border: 2px solid #fcd34d;"
                 reserve_title = f"STEP {step_number}: ⚠️ CASH RESERVE UNFUNDED — £{reserve['shortfall']:,.0f} SHORT"
                 reserve_title_color = "#b45309"
@@ -959,7 +1064,7 @@ def generate_html_digest(
                 reserve_badge_bg = "#d97706"
                 reserve_status_txt = (
                     f"Your <b>£{reserve_floor:,.0f}</b> reserve floor is <b>£{reserve['shortfall']:,.0f} short</b> "
-                    f"(free cash covers £{reserve['funded']:,.0f}), so it is not available to withdraw until rebuilt."
+                    f"(free cash covers £{reserve['funded']:,.0f}), so buys stay blocked until it is rebuilt."
                 )
                 reserve_rationale = "No new buy orders are recommended while the reserve floor is unfunded."
             else:
@@ -1426,11 +1531,11 @@ def generate_html_digest(
                 if acc_rt["crash_delta"] else ""
             )
             acc_5y_html = f"""
-          <!-- 5-Year Horizon Crash-Protection & Stress-Test Panel -->
+          <!-- Per-account crash risk panel -->
           <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; padding: 14px 18px; margin-bottom: 24px;">
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;">
               <div style="font-size: 13px; font-weight: 800; color: #166534;">
-                🛡️ {acc_name}'s 5-Year Horizon Crash-Protection & Compounding Profile (2026–2031)
+                🛡️ {acc_name}'s crash risk (historical replays vs your target mix)
               </div>
               <span style="background: #ffffff; border: 1px solid #86efac; color: #15803d; font-size: 11px; font-weight: 800; padding: 2px 10px; border-radius: 9999px;">
                 {acc_rt['grade']}
@@ -1438,23 +1543,23 @@ def generate_html_digest(
             </div>
             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 10px; font-size: 12px;">
               <div style="background: #ffffff; border: 1px solid #dcfce7; border-radius: 8px; padding: 8px 10px;">
-                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">5Y Sortino (now ➔ after plan)</span><br>
-                <b style="color: #15803d; font-size: 14px;">{acc_rt['sortino']}</b>
-                <div style="font-size: 10px; color: #64748b; margin-top: 2px;">Est. 5Y CAGR (blended hist./model estimate, info only): now {acc_rt['cagr_now']} ➔ after plan {acc_rt['cagr_post']}</div>
+                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">Worst crash replay</span><br>
+                <b style="color: #dc2626; font-size: 14px;">{acc_rt['worst_replay']}</b>
+                <div style="font-size: 10px; color: #64748b; margin-top: 2px;">{acc_rt['worst_replay_sub']}</div>
               </div>
               <div style="background: #ffffff; border: 1px solid #dcfce7; border-radius: 8px; padding: 8px 10px;">
-                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">2022 Crash Stress-Test</span><br>
+                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">2022 replay of each holding</span><br>
                 <b style="color: #dc2626; font-size: 14px;">{acc_rt['stress']}</b>
                 <div style="font-size: 10px; color: #64748b; margin-top: 2px;">{acc_rt['stress_gbp']}</div>
                 {acc_crash_delta_html}
               </div>
               <div style="background: #ffffff; border: 1px solid #dcfce7; border-radius: 8px; padding: 8px 10px;">
-                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">All-Weather Shield</span><br>
+                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">Defensive buffer</span><br>
                 <b style="color: #0284c7; font-size: 14px;">{acc_rt['shield']}</b>
-                <div style="font-size: 10px; color: #334155; margin-top: 2px;">True defensive (cash, money-market, gold): <b>{acc_rt['defensive']}</b></div>
+                <div style="font-size: 10px; color: #334155; margin-top: 2px;">True defensive (cash, money-market, gold): <b>{acc_rt['defensive']}</b> · Beta {acc_rt['beta']}</div>
               </div>
               <div style="background: #ffffff; border: 1px solid #dcfce7; border-radius: 8px; padding: 8px 10px;">
-                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">2031 5Y Projection</span><br>
+                <span style="color: #64748b; font-size: 10px; text-transform: uppercase; font-weight: 700;">2031 growth paths (no crash assumed)</span><br>
                 <b style="color: #0f172a; font-size: 12px;">{acc_rt['projection']}</b>
                 <div style="font-size: 10px; color: #64748b; margin-top: 2px;">{acc_rt['projection_rates']}</div>
               </div>
@@ -1599,6 +1704,9 @@ def generate_html_digest(
 
         <!-- 🧭 Household Mix (strategic allocation) -->
         {household_mix_html}
+
+        <!-- 💥 Crash protection check -->
+        {crash_protection_html}
 
         <!-- Consolidated Portfolio Dashboard -->
         {consolidated_overview_html}

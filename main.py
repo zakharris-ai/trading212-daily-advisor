@@ -8,7 +8,7 @@ import math
 import os
 import sys
 from typing import Any, Dict, List, Optional, Tuple
-from config import ACCOUNTS, EARMARKED_TICKERS, LONDON_TZ, MODEL_VERSION, REBALANCE_CONFIG, RECIPIENT_EMAILS
+from config import ACCOUNTS, ALLOCATION_CONFIG, EARMARKED_TICKERS, LONDON_TZ, MODEL_VERSION, REBALANCE_CONFIG, RECIPIENT_EMAILS
 from mailer import format_price, generate_html_digest, send_email_digest
 from portfolio_storage import (
     append_recommendation_records,
@@ -40,6 +40,8 @@ from strategy_engine import (
     build_rebalancing_plan,
     build_consolidated_portfolio_view,
     classify_bucket,
+    compute_tech_regime,
+    describe_tech_regime,
     generate_tldr_summary,
     get_gbp_usd_rate,
     scan_watchlist_opportunities,
@@ -51,6 +53,12 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("main")
+
+
+def _signed_gbp_text(v: Any) -> str:
+  """'-£29,799' / '+£1,250' (sign before the pound sign)."""
+  n = _num(v, 0.0)
+  return f"{'-' if n < 0 else '+'}£{abs(n):,.0f}"
 
 
 def london_today() -> str:
@@ -124,9 +132,17 @@ def _reserve_status_text(plan: Dict[str, Any], cfg: Optional[Dict[str, Any]] = N
           + ")"
       )
   if shortfall > 0.5:
+    earm_amt = _num((cfg or {}).get("earmarked_proceeds_gbp"), 0.0)
+    if earm_amt > 0.5:
+      ring_fenced = min(funded, earm_amt)
+      return (
+          f"Cash Reserve Floor £{floor:,.0f}{topup_note}: £{ring_fenced:,.0f} of your £{funded:,.0f} free cash is the"
+          f" ring-fenced sale money (safe to withdraw now); the rest of the floor is unfunded (£{shortfall:,.0f} short),"
+          " so buys stay blocked."
+      )
     return (
         f"Cash Reserve Floor £{floor:,.0f}{topup_note}: UNFUNDED — only £{funded:,.0f} is held in free cash"
-        f" (£{shortfall:,.0f} short). Buys stay blocked; this money is not sitting in cash to withdraw."
+        f" (£{shortfall:,.0f} short). Buys stay blocked until free cash covers the floor."
     )
   return (
       f"Cash Reserve Floor £{floor:,.0f}{topup_note}: FUNDED — £{funded:,.0f} held in free cash;"
@@ -610,6 +626,14 @@ def run_pipeline(
   consolidated_view = build_consolidated_portfolio_view(
       raw_accounts_data, gbp_rate=gbp_rate
   )
+  # 1b. Tech crash circuit-breaker (Nasdaq-100 month-end close vs its 10-month average); never aborts the run
+  try:
+    tech_regime = compute_tech_regime()
+  except Exception as e:
+    logger.warning("Tech crash circuit-breaker unavailable for this run: %s", e)
+    tech_regime = {"regime": "UNKNOWN"}
+  consolidated_view["tech_regime"] = tech_regime
+  logger.info("Tech crash circuit-breaker: %s", describe_tech_regime(tech_regime))
 
   # 2. Deep Research Watchlist Scan for High-Alpha Opportunities
   logger.info("Scanning watchlist for high-conviction alpha...")
@@ -664,6 +688,7 @@ def run_pipeline(
       acc_name: res["rebalancing_plan"] for acc_name, res in results_by_account.items()
   }
   consolidated_view = _build_consolidated_view_with_plans(raw_accounts_data, gbp_rate, account_plans)
+  consolidated_view["tech_regime"] = tech_regime
   for res in results_by_account.values():
     res["consolidated_view"] = consolidated_view
 
@@ -748,7 +773,7 @@ def run_pipeline(
     out("   The market backdrop below is built from partial data; treat the regime reading as unverified.")
     out("!" * 85)
   out(f"🌍 Market Backdrop: {macro_regime.get('risk_climate') or 'n/a'} (Macro Score: {_fmt(macro_regime.get('macro_score'), '{:.0f}')}/100)")
-  out(f"🛡️ Crash Defcon: {macro_regime.get('crash_defcon') or 'n/a'} (Tail-Crash Prob: {_fmt(macro_regime.get('crash_probability_pct'), '{:.0f}')}%) | {macro_regime.get('crash_shield_directive', '')}")
+  out(f"🛡️ Crash Defcon: {macro_regime.get('crash_defcon') or 'n/a'} (tail-risk heuristic score: {_fmt(macro_regime.get('crash_probability_pct'), '{:.0f}')}/100, not a probability) | {macro_regime.get('crash_shield_directive', '')}")
   out(f"   VIX: {_fmt(macro_regime.get('vix'))} (Term Structure: {_fmt(macro_regime.get('vix_term_structure'), '{:.2f}')}x) | Inst. Distribution: SPY {_fmt(macro_regime.get('spy_dist_days'), '{:.0f}')}d / QQQ {_fmt(macro_regime.get('qqq_dist_days'), '{:.0f}')}d ({macro_regime.get('dist_status') or 'n/a'})")
   out(f"   Real Rates (TIP/IEF): {_fmt(macro_regime.get('real_rate_ratio'), '{:.3f}')} | Oil: ${_fmt(macro_regime.get('crude_oil_price'))} | {macro_regime.get('yield_curve_label', '10Y–3M spread')}: {_fmt(macro_regime.get('yield_curve_spread'), '{:+.2f}')}% | DXY: {_fmt(macro_regime.get('dxy_index'))} | Credit: {_fmt(macro_regime.get('credit_spread_ratio'), '{:.3f}')}")
   out("=" * 85)
@@ -785,7 +810,12 @@ def run_pipeline(
       for idx, b in enumerate(t_info["buys_to_place"], 1):
         out(f"      {idx}. {tags_by_symbol.get(str(b.get('symbol') or ''), '')}{b['instruction']}")
     if t_info["phase"] == "ALL_SET":
-      if t_info.get("cap_breaches"):
+      if t_info.get("glide_note"):
+        out(
+            "   ✨ No orders placed today. The proposed trims above would move the household back towards your plan;"
+            " they only become orders if you switch REBALANCE_POLICY to 'active'."
+        )
+      elif t_info.get("cap_breaches"):
         acc_outside = [
             r for r in (consolidated_view.get("outside_holdings") or [])
             if r.get("account") == acc_name and _num(r.get("vested_gbp"), 0.0) > 0
@@ -795,7 +825,7 @@ def run_pipeline(
             + " held outside Trading 212, so trimming that outside holding is the main lever."
             if acc_outside else ""
         )
-        out("   ✨ No new orders today. The limit(s) above can't be fixed by trading this account today; avoid adding to that sector." + outside_note)
+        out("   ✨ No new orders today. Avoid adding to the over-limit area(s); on monthly buy days the glide path sizes trims of satellites above plan." + outside_note)
       else:
         out("   ✨ Within all configured limits. No new orders required today.")
     out(f"   🛡️ {_reserve_status_text(acc_plan, acc_cfg)}")
@@ -838,19 +868,34 @@ def run_pipeline(
   ])
   out(f"  📊 Global Thematic Allocation: {clusters_str}")
   cons_5y = consolidated_view.get("portfolio_5y_risk_profile", {})
+  crash = consolidated_view.get("crash_scenarios") or {}
+  if crash.get("scenarios"):
+    def _signed_gbp(v: Any) -> str:
+      n = _num(v, 0.0)
+      return f"{'-' if n < 0 else '+'}£{abs(n):,.0f}"
+
+    parts = []
+    for sc in crash["scenarios"]:
+      parts.append(
+          f"{sc['label']} {sc['loss_pct']:+.1f}% ({_signed_gbp(sc['loss_gbp'])}) vs plan mix {sc['target_mix_loss_pct']:+.1f}%"
+      )
+    out(f"  💥 Crash replays (household incl. vested shares outside T212, GBP): {' | '.join(parts)} ➔ {crash.get('status', '')}")
+    worst = crash.get("worst") or {}
+    if worst.get("top_contributors"):
+      top_txt = ", ".join(f"{c['ticker']} {_signed_gbp(c['loss_gbp'])}" for c in worst["top_contributors"])
+      out(f"     Biggest losses in a {worst.get('label')} replay: {top_txt}. {crash.get('note', '')}")
+  if consolidated_view.get("tech_regime"):
+    out(f"  🚦 {describe_tech_regime(consolidated_view.get('tech_regime'), str(ALLOCATION_CONFIG.get('rebalance_policy') or 'advisory'))}")
   if cons_5y:
     out(
-        f"  🛡️ 5-Year Stress-Test (GBP basis): 5Y Sortino: {_fmt(cons_5y.get('current_sortino_5y'), '{:.2f}')} |"
-        f" Est. 5Y CAGR (blended hist./model estimate, info only): {_fmt(cons_5y.get('current_cagr_5y_pct'), '{:+.1f}%')} |"
-        f" Portfolio Beta: {_fmt(cons_5y.get('current_beta_5y'), '{:.2f}')} |"
-        f" 2022-style Stress: {_fmt(cons_5y.get('current_stress_2022_pct'), '{:+.1f}%')} (£{_num(cons_5y.get('current_stress_2022_gbp'), 0.0):,.0f}) |"
+        f"  🛡️ Risk (ISAs, GBP basis): Portfolio Beta: {_fmt(cons_5y.get('current_beta_5y'), '{:.2f}')} |"
+        f" 2022 replay of each holding's own GBP return: {_fmt(cons_5y.get('current_stress_2022_pct'), '{:+.1f}%')} ({_signed_gbp_text(cons_5y.get('current_stress_2022_gbp'))}) |"
         f" Defensive (cash/money-market/gold/short gilts): {_fmt(cons_5y.get('post_defensive_pct'), '{:.1f}%')}"
     )
     out(
-        f"  🔮 5-Year (2031) scenarios: bear £{_num(cons_5y.get('projected_5y_bear_gbp'), 0.0):,.0f} |"
+        f"  🔮 2031 growth paths (long-run asset-class assumptions, no crash assumed — see the replays above): low £{_num(cons_5y.get('projected_5y_bear_gbp'), 0.0):,.0f} |"
         f" base £{_num(cons_5y.get('projected_5y_base_gbp'), 0.0):,.0f} |"
-        f" bull £{_num(cons_5y.get('projected_5y_bull_gbp'), 0.0):,.0f} (long-run asset-class assumptions, not a forecast) |"
-        f" {cons_5y.get('crash_readiness_grade', '')}"
+        f" high £{_num(cons_5y.get('projected_5y_bull_gbp'), 0.0):,.0f}"
     )
   outside_rows = [r for r in (consolidated_view.get("outside_holdings") or []) if _num(r.get("vested_gbp"), 0.0) > 0 or _num(r.get("unvested_gbp"), 0.0) > 0]
   for r in outside_rows:
@@ -890,14 +935,31 @@ def run_pipeline(
       out("  🔒 Earmarked: none held in this account.")
     for line in _allocation_console_lines(plan):
       out(line)
+    glide = plan.get("rebalance_glide") if isinstance(plan.get("rebalance_glide"), dict) else {}
+    if glide.get("proposals") and not glide.get("active"):
+      label = "CIRCUIT-BREAKER" if glide.get("trigger") == "circuit_breaker" else "GLIDE PATH"
+      out(
+          f"  📉 PROPOSED {label} TRIMS (not active — REBALANCE_POLICY={glide.get('policy')}): household satellites"
+          f" {_num(glide.get('satellite_now_pct'), 0.0):.0f}% vs {_num(glide.get('target_pct'), 0.0):.0f}% target"
+          f" (£{_num(glide.get('excess_to_target_gbp'), 0.0):,.0f} above target{'' if glide.get('counts_outside') else ', vested shares outside T212 not counted'});"
+          f" this account's share now £{_num(glide.get('account_share_gbp'), 0.0):,.0f}"
+      )
+      for p in glide["proposals"]:
+        reasons = "; ".join(p.get("rank_factors") or []) or "largest satellite"
+        out(f"     • TRIM {p.get('name')} ({p.get('search_symbol')}): ~{_num(p.get('shares'), 0.0):,.4f} shares (~£{_num(p.get('estimated_gbp'), 0.0):,.0f}) — {reasons}")
     acc_5y = plan.get("portfolio_5y_risk_profile", {})
     if acc_5y:
+      acc_crash = acc_5y.get("crash_scenarios") or {}
+      acc_worst = acc_crash.get("worst") or {}
+      worst_txt = (
+          f"{acc_worst.get('label')} replay {_num(acc_worst.get('loss_pct'), 0.0):+.1f}% vs plan mix {_num(acc_worst.get('target_mix_loss_pct'), 0.0):+.1f}% |"
+          if acc_worst else ""
+      )
       out(
-          f"  🛡️ 5-Year Risk ({acc_5y.get('crash_readiness_grade', '')}):"
-          f" 5Y Sortino {_fmt(acc_5y.get('current_sortino_5y'), '{:.2f}')} ➔ {_fmt(acc_5y.get('post_sortino_5y'), '{:.2f}')} |"
-          f" 2022-style Stress {_fmt(acc_5y.get('current_stress_2022_pct'), '{:+.1f}%')} ➔ {_fmt(acc_5y.get('post_stress_2022_pct'), '{:+.1f}%')} (£{_num(acc_5y.get('post_stress_2022_gbp'), 0.0):,.0f}) |"
-          f" Shield: {_fmt(acc_5y.get('post_shield_pct'), '{:.1f}%')} (defensive cash/MMF/gold: {_fmt(acc_5y.get('post_defensive_pct'), '{:.1f}%')}) |"
-          f" 2031 bear/base/bull: £{_num(acc_5y.get('projected_5y_bear_gbp'), 0.0):,.0f} / £{_num(acc_5y.get('projected_5y_base_gbp'), 0.0):,.0f} / £{_num(acc_5y.get('projected_5y_bull_gbp'), 0.0):,.0f}"
+          f"  🛡️ Crash risk ({acc_5y.get('crash_readiness_grade', '')}): {worst_txt}"
+          f" 2022 replay of own holdings {_fmt(acc_5y.get('current_stress_2022_pct'), '{:+.1f}%')} ➔ {_fmt(acc_5y.get('post_stress_2022_pct'), '{:+.1f}%')} ({_signed_gbp_text(acc_5y.get('post_stress_2022_gbp'))}) |"
+          f" Defensive buffer: {_fmt(acc_5y.get('post_defensive_pct'), '{:.1f}%')} ({acc_5y.get('shield_status', '')}) |"
+          f" 2031 low/base/high growth (no crash assumed): £{_num(acc_5y.get('projected_5y_bear_gbp'), 0.0):,.0f} / £{_num(acc_5y.get('projected_5y_base_gbp'), 0.0):,.0f} / £{_num(acc_5y.get('projected_5y_bull_gbp'), 0.0):,.0f}"
       )
 
     pending_sells_list = plan.get("pending_sell_orders", [])
@@ -911,7 +973,8 @@ def run_pipeline(
         limit_str = f" @ limit {curr_sym}{limit_p:,.2f}" if limit_p > 0 else ""
         pso_val = float(pso.get("estimated_gbp", 0.0) or 0.0)
         if math.isnan(pso_val): pso_val = 0.0
-        out(f"     • SELL {pso['name']} ({pso['search_symbol']}): ~{pso['shares']:,.2f} shares{limit_str} queued for execution (+£{pso_val:,.0f} cash when filled).")
+        cash_note = "ring-fenced cash for withdrawal when filled" if pso.get("is_earmarked") else "cash when filled"
+        out(f"     • SELL {pso['name']} ({pso['search_symbol']}): ~{pso['shares']:,.2f} shares{limit_str} queued for execution (+£{pso_val:,.0f} {cash_note}).")
       for p_ticker, pb in pending_buys_dict.items():
         name = pb.get("name", p_ticker)
         val = pb.get("estimated_value", pb.get("value", 0.0))

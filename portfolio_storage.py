@@ -684,7 +684,7 @@ def compute_unwithdrawn_earmarked_proceeds_gbp(
     earmarked_tickers: Any = None,
     current_date_str: Optional[str] = None,
     gbp_rate: Optional[float] = None,
-    lookback_days: int = 30,
+    lookback_days: int = 400,
 ) -> Dict[str, Any]:
     """Read-only detector for earmarked sale proceeds sitting in free cash awaiting withdrawal.
 
@@ -692,7 +692,9 @@ def compute_unwithdrawn_earmarked_proceeds_gbp(
     (-withdrawn cash) chronologically across the trailing `lookback_days` window, bounded at each daily
     snapshot (and today) by actual account cash so a missed withdrawal transaction self-clears as soon as
     the cash leaves the account. Also detects same-day unlogged earmarked sales in `--dry-run` mode by
-    comparing `current_positions` against the latest prior snapshot.
+    comparing `current_positions` against the latest prior snapshot. The window is long (400 days by default)
+    so unwithdrawn proceeds stay ring-fenced until the money actually leaves the account; a short window would
+    silently release them to buys once the sale ages out.
     """
     empty = {"unwithdrawn_gbp": 0.0, "tickers": [], "last_sale_date": None}
     earmark_set = {_canon(t) for t in (earmarked_tickers or []) if _canon(t)}

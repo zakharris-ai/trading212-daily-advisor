@@ -408,8 +408,9 @@ def _build_allocation_config() -> Dict[str, Any]:
     """Household strategic allocation, with safe env overrides.
 
     The household = all configured Trading 212 accounts + vested outside holdings, treated as one portfolio.
-    New money is steered to the bucket furthest below target; profitable holdings are never sold to rebalance.
-    Targets that do not sum to 1.0 are normalised (with a warning); an all-zero/invalid set falls back to 75/20/5.
+    New money is steered to the bucket furthest below target. Rebalancing trims follow REBALANCE_POLICY
+    (advisory by default: proposed in the email, never ordered). Targets that do not sum to 1.0 are normalised
+    (with a warning); an all-zero/invalid set falls back to 75/20/5.
     """
     defaults = {"core": 0.75, "satellite": 0.20, "defensive": 0.05}
     targets = {
@@ -433,6 +434,19 @@ def _build_allocation_config() -> Dict[str, Any]:
 
     gold_share = min(1.0, max(0.0, _safe_float(os.getenv("DEFENSIVE_GOLD_SHARE"), 1.0)))
 
+    # Rebalancing policy (evidence: survivorship-free 1928-2026 household study, Nov 2026):
+    #   "advisory" (default): the tech crash circuit-breaker blocks new tech/semiconductor satellite buys while the
+    #       Nasdaq-100 trend is down, and the glide-path / circuit-breaker trims are computed and SHOWN, never ordered.
+    #   "active": those trims become real sell orders (ISA accounts only) and, while the tech trend is down, new money
+    #       for core/satellites waits in cash (it earns interest) until the trend recovers.
+    #   "off": legacy behaviour (no regime gating, no trims).
+    policy = (os.getenv("REBALANCE_POLICY") or "advisory").strip().lower()
+    if policy not in ("off", "advisory", "active"):
+        logger.warning("REBALANCE_POLICY=%r is not 'off', 'advisory' or 'active'; using 'advisory'.", policy)
+        policy = "advisory"
+    glide_fraction = min(1.0, max(0.05, _safe_float(os.getenv("GLIDE_FRACTION"), 0.25)))
+    count_outside = (os.getenv("GLIDE_COUNT_OUTSIDE") or "").strip().lower() in ("1", "true", "yes", "on")
+
     return {
         "targets": targets,
         # Rebalancing band in percentage points: a bucket further than this from target is "out of band" and
@@ -453,6 +467,14 @@ def _build_allocation_config() -> Dict[str, Any]:
         # (sells and risk alerts are always daily). 'daily' restores daily buying.
         "buy_cadence": cadence,
         "off_cycle_min_deploy_gbp": max(0.0, _safe_float(os.getenv("OFF_CYCLE_MIN_DEPLOY_GBP"), 2000.0)),
+        "rebalance_policy": policy,
+        # Share of the remaining satellite excess trimmed on each monthly buy day while the tech trend is up
+        # (1/4 a month gets ~80% of the way back to target in six months); the whole excess when the trend is down
+        "glide_fraction": round(glide_fraction, 4),
+        # Count vested outside holdings (e.g. RSUs) when sizing ISA trims (default no: they can't be sold in T212)
+        "glide_count_outside": count_outside,
+        # Tech crash circuit-breaker: Nasdaq-100 month-end close vs its N-month simple moving average
+        "regime_sma_months": max(3, _safe_int(os.getenv("REGIME_SMA_MONTHS"), 10)),
     }
 
 
@@ -472,7 +494,7 @@ BIG_TECH_LOOKTHROUGH: Dict[str, float] = {
 }
 
 # --- MODEL VERSION (stamped on every recommendation-ledger record and snapshot) ---
-MODEL_VERSION = "2026.11.01-oos-fortress-v2"
+MODEL_VERSION = "2026.11.01-evidence-v3"
 
 # --- OPTIONAL EXCLUDED TICKERS ---
 # Set EXCLUDED_TICKERS="TSLA,COIN" in .env if you want the engine to never buy specific tickers.

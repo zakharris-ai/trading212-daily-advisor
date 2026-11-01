@@ -27,7 +27,9 @@ TRACKING_TEXT = (
     "(time-weighted, net of deposits and withdrawals)."
 )
 EXPLAINER = (
-    "New money goes to whichever part of the mix is furthest below target. Nothing profitable is sold to rebalance."
+    "New money goes to whichever part of the mix is furthest below target. Satellites above plan are trimmed back "
+    "gradually on monthly buy days (all at once if the tech circuit-breaker trips): proposed only, unless "
+    "REBALANCE_POLICY is set to active."
 )
 BIG_TECH_LINE = "41% of household wealth (cap 30%) — no new big-tech buys"
 CORE_REASON = "Core is 22% vs a 65% target, the furthest below target."
@@ -453,9 +455,9 @@ class DashboardPhase1Tests(_OfflineMixin, unittest.TestCase):
         self.assertIn("bucket-badge bucket-core", "".join(cards["Main"]))
         self.assertIn("bucket-badge bucket-core", "".join(cards["ALL"]))
 
-    def test_blended_cagr_is_labelled_model_estimate_info_only(self):
+    def test_blended_cagr_is_labelled_hindsight_not_forecast(self):
         html = self._render()
-        self.assertIn("Est. 5Y CAGR (blended hist./model estimate, info only):", html)
+        self.assertIn("Holdings' trailing/model return blend (hindsight-biased, not a forecast):", html)
         self.assertNotIn("Est. 5Y CAGR (blended hist./model):", html)
 
     def test_engine_strings_cannot_break_out_of_html_or_script(self):
@@ -591,6 +593,23 @@ class ConsoleSummaryTests(unittest.TestCase):
         ])
         self.assertEqual(self.main._allocation_console_lines({}), [])
         self.assertEqual(self.main._allocation_console_lines(None), [])
+
+    def test_ring_fenced_sale_money_is_described_as_safe_to_withdraw(self):
+        # £2,000 of earmarked sale proceeds in free cash; floor £1,500 + £2,000 = £3,500
+        plan = {"reserve_floor_gbp": 3500.0, "available_cash_gbp": 2000.11, "reserve_funded_gbp": 2000.11,
+                "reserve_shortfall_gbp": 1499.89, "ring_fenced_cash_gbp": 2000.0}
+        cfg = {"reserve_topup_gbp": 2000.0, "earmarked_proceeds_gbp": 2000.0, "earmarked_proceeds_tickers": ["CSH2.L"]}
+        txt = self.main._reserve_status_text(plan, cfg)
+        self.assertIn("ring-fenced sale money (safe to withdraw now)", txt)
+        self.assertNotIn("not sitting in cash", txt)
+        import mailer
+        rs = mailer.describe_reserve(plan, {"free": 2000.11}, "Main")
+        self.assertAlmostEqual(rs["ring_fenced"], 2000.0)
+        self.assertIn("safe to withdraw now", rs["status_text"])
+        plain = self.main._reserve_status_text({"reserve_floor_gbp": 1500.0, "available_cash_gbp": 0.0,
+                                               "reserve_funded_gbp": 0.0, "reserve_shortfall_gbp": 1500.0}, {})
+        self.assertIn("UNFUNDED", plain)
+        self.assertNotIn("not sitting in cash", plain)
 
 
 if __name__ == "__main__":

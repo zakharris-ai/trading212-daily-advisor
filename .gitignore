@@ -6,3 +6,6 @@ latest_digest.html
 logs/
 # data/last_email_sent.json tracked for cloud deduplication
 .failure-alert/
+
+# scripts/crash_study.py download cache
+.crash_study_cache/

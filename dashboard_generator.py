@@ -236,7 +236,7 @@ def _risk_kpi_texts(rp: Optional[Dict[str, Any]]) -> Dict[str, str]:
         cagr_parts.append(f"now {cur_cagr:+.0f}%/yr")
     if post_cagr is not None:
         cagr_parts.append(f"after plan {post_cagr:+.0f}%/yr")
-    cagr = "Est. 5Y CAGR (blended hist./model estimate, info only): " + (" ➔ ".join(cagr_parts) if cagr_parts else "N/A")
+    cagr = "Holdings' trailing/model return blend (hindsight-biased, not a forecast): " + (" ➔ ".join(cagr_parts) if cagr_parts else "N/A")
     beta_txt = arrow(cur_beta, post_beta, lambda v: f"{v:.2f}")
     if beta_txt != "N/A":
         cagr += f" · Beta {beta_txt}"
@@ -257,10 +257,10 @@ def _risk_kpi_texts(rp: Optional[Dict[str, Any]]) -> Dict[str, str]:
 
     bear, base, bull = (_num(rp.get(f"projected_5y_{k}_gbp")) for k in ("bear", "base", "bull"))
     if bear is not None or base is not None or bull is not None:
-        proj = f"Bear {_gbp(bear)} · Base {_gbp(base)} · Bull {_gbp(bull)}"
+        proj = f"Low {_gbp(bear)} · Base {_gbp(base)} · High {_gbp(bull)}"
         rates = [_num(rp.get(f"projected_5y_{k}_cagr_pct")) for k in ("bear", "base", "bull")]
-        proj_sub = "5-yr scenarios: " + " · ".join(
-            f"{name} {_pct(r)}/yr" for name, r in zip(("bear", "base", "bull"), rates)
+        proj_sub = "5-yr growth paths, no crash assumed: " + " · ".join(
+            f"{name} {_pct(r)}/yr" for name, r in zip(("low", "base", "high"), rates)
         )
     else:
         cons, target = _num(rp.get("projected_5y_conservative_gbp")), _num(rp.get("projected_5y_target_gbp"))
@@ -314,7 +314,9 @@ _BUCKET_SHORT_LABELS = {"core": "Core", "satellite": "Satellites", "defensive": 
 _BUCKET_ALIASES = {"satellites": "satellite", "defence": "defensive", "defense": "defensive"}
 _MIX_STATUS_TEXT = {"under": "Under target", "over": "Over target", "in_band": "In band"}
 _MIX_EXPLAINER = (
-    "New money goes to whichever part of the mix is furthest below target. Nothing profitable is sold to rebalance."
+    "New money goes to whichever part of the mix is furthest below target. Satellites above plan are trimmed back "
+    "gradually on monthly buy days (all at once if the tech circuit-breaker trips): proposed only, unless "
+    "REBALANCE_POLICY is set to active."
 )
 _BIG_TECH_SOURCE_LABELS = {
     "direct": "Direct",
@@ -627,6 +629,38 @@ def _household_mix_panel_html(
         cards.append('<div class="mix-card">' + "".join(body) + "</div>")
 
     grid_html = f'\n    <div class="mix-grid">\n      {"".join(cards)}\n    </div>' if cards else ""
+    crash = (consolidated_view or {}).get("crash_scenarios") if isinstance(consolidated_view, dict) else None
+    regime = (consolidated_view or {}).get("tech_regime") if isinstance(consolidated_view, dict) else None
+    crash_html = ""
+    if isinstance(crash, dict) and crash.get("scenarios"):
+        try:
+            from strategy_engine import describe_tech_regime  # local import keeps this module importable alone
+            policy = str((getattr(_config, "ALLOCATION_CONFIG", {}) or {}).get("rebalance_policy") or "advisory")
+            regime_line = describe_tech_regime(regime, policy) if isinstance(regime, dict) else ""
+        except Exception:
+            regime_line = ""
+        rows = "".join(
+            f'<tr><td><b>{esc(str(s.get("label") or ""))}</b><div class="mix-sub-cell">{esc(str(s.get("window") or ""))}</div></td>'
+            f'<td class="mix-num"><b>{_num(s.get("loss_pct"), 0.0):+.1f}%</b></td>'
+            f'<td class="mix-num">{_gbp(_num(s.get("loss_gbp"), 0.0))}</td>'
+            f'<td class="mix-num">{_num(s.get("target_mix_loss_pct"), 0.0):+.1f}%</td></tr>'
+            for s in crash["scenarios"] if isinstance(s, dict)
+        )
+        worst = crash.get("worst") if isinstance(crash.get("worst"), dict) else {}
+        losers = ", ".join(
+            f"{c.get('ticker')} {_gbp(_num(c.get('loss_gbp'), 0.0))}" for c in (worst.get("top_contributors") or [])
+            if isinstance(c, dict)
+        )
+        crash_html = (
+            '\n    <div class="mix-card mix-wide"><div class="mix-head">💥 Crash protection check: '
+            f'<span style="color: {esc(str(crash.get("status_color") or "var(--rose)"))};">{esc(str(crash.get("status") or ""))}</span></div>'
+            + (f'<div class="mix-sub">🚦 {esc(regime_line)}</div>' if regime_line else "")
+            + '<table class="mix-table"><thead><tr><th>Historical replay (GBP)</th><th class="mix-num">Household</th>'
+            '<th class="mix-num">£</th><th class="mix-num">Plan mix</th></tr></thead>'
+            f"<tbody>{rows}</tbody></table>"
+            + (f'<div class="mix-sub">Biggest losses in a {esc(str(worst.get("label") or ""))} replay: {esc(losers)}</div>' if losers else "")
+            + f'<div class="mix-sub">{esc(str(crash.get("note") or ""))}</div></div>'
+        )
     cadence_html = (
         '\n    <div class="mix-card mix-wide"><div class="mix-head">🗓️ New money today, by account</div>'
         + "".join(alloc_blocks) + "</div>"
@@ -636,7 +670,7 @@ def _household_mix_panel_html(
     <!-- Household Mix (strategic allocation: core / satellites / defensive) -->
     <div class="section-title">
       <span>🧭 Household Mix — all accounts + vested outside shares, as one household</span>
-    </div>{grid_html}{cadence_html}"""
+    </div>{grid_html}{crash_html}{cadence_html}"""
 
 
 def generate_dashboard_html(
@@ -945,10 +979,18 @@ def generate_dashboard_html(
             if _all_stage2_verified(analyses):
                 status_parts.append("All positions are in confirmed weekly Stage 2 uptrends.")
             if rs["shortfall"] > 0.005:
-                status_parts.append(
-                    f"⚠️ Cash reserve UNFUNDED — £{rs['shortfall']:,.0f} short of the £{reserve_val:,.0f} floor "
-                    f"(£{avail_cash:,.2f} free cash), so it is not available to withdraw until rebuilt."
-                )
+                ring_fenced = max(0.0, min(avail_cash, _num(plan.get("ring_fenced_cash_gbp"), 0.0)))
+                if ring_fenced > 0.5:
+                    status_parts.append(
+                        f"🔒 £{ring_fenced:,.0f} of your £{avail_cash:,.2f} free cash is ring-fenced sale money — safe to "
+                        f"withdraw now. The rest of the £{reserve_val:,.0f} floor is £{rs['shortfall']:,.0f} short, so "
+                        "buys stay blocked."
+                    )
+                else:
+                    status_parts.append(
+                        f"⚠️ Cash reserve UNFUNDED — £{rs['shortfall']:,.0f} short of the £{reserve_val:,.0f} floor "
+                        f"(£{avail_cash:,.2f} free cash), so buys stay blocked until it is rebuilt."
+                    )
                 card_badge = '<span class="action-badge" style="background: var(--amber-glow); color: var(--amber);">⚠️ RESERVE UNFUNDED</span>'
             else:
                 status_parts.append(

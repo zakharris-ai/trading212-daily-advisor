@@ -41,6 +41,38 @@ SCENARIO_RATES: Dict[str, Tuple[float, float, float]] = {
     "gold": (0.00, 0.03, 0.05),     # physical gold ETCs
 }
 
+# Historical crash replays, per sleeve, as cumulative GBP total returns (%) over each crisis window.
+# Source: survivorship-free Kenneth French Data Library portfolios (CRSP, includes delisted firms: US market, Business
+# Equipment industry = tech, Health industry, developed-markets market), PHLX Semiconductor index (price), London gold
+# (datahub/LBMA spliced with GLD), Bank of England month-end USD/GBP (XUMLUSS) and Bank Rate; computed 1 Nov 2026 by the
+# household crash-protection study. Sector-level: individual stocks can fall much further than their sector, and the
+# GFC row includes sterling's 31% fall, which cushioned GBP investors and may not repeat.
+CRASH_SCENARIOS: Tuple[Dict[str, Any], ...] = (
+    {
+        "key": "dotcom", "label": "2000–02 tech crash", "window": "Mar 2000 – Sep 2002",
+        "returns": {"core_global": -43.8, "core_us": -44.1, "tech": -79.3, "semis": -79.6, "health": -15.3,
+                    "other_equity": -44.1, "gold": 13.3, "cash": 13.4},
+    },
+    {
+        "key": "gfc", "label": "2007–09 financial crisis", "window": "Oct 2007 – Feb 2009",
+        "returns": {"core_global": -32.4, "core_us": -27.6, "tech": -27.2, "semis": -37.4, "health": 0.9,
+                    "other_equity": -27.6, "gold": 71.7, "cash": 6.0},
+    },
+    {
+        "key": "rates2022", "label": "2022 rate shock", "window": "Jan – Dec 2022",
+        "returns": {"core_global": -7.8, "core_us": -10.4, "tech": -24.2, "semis": -28.2, "health": 5.5,
+                    "other_equity": -10.4, "gold": 11.1, "cash": 1.5},
+    },
+)
+CRASH_SLEEVE_LABELS: Dict[str, str] = {
+    "core_global": "Global index", "core_us": "US index", "tech": "Tech & Nasdaq-100", "semis": "Semiconductors",
+    "health": "Healthcare", "other_equity": "Other stocks", "gold": "Gold", "cash": "Cash, money-market & gilts",
+}
+_TECH_CLUSTERS = ("ENTERPRISE CLOUD", "CONSUMER & DIGITAL", "HIGH-BETA TECH", "TECHNOLOGY")
+_SEMIS_CLUSTERS = ("AI HARDWARE", "SEMICONDUCTOR")
+_SEMIS_FUND_KEYS = ("SMGB", "SMH", "SOXX", "SEMI")
+_GLOBAL_CORE_KEYS = ("VWRP", "VWRA", "VWRL", "ACWI", "SWDA", "IWDA")
+
 # Instrument classification keys
 LEVERAGED_ETF_KEYS = ("QQQ3", "3LUS", "3SEM", "3X", "LQQ3", "3USL", "TQQQ")
 BROAD_INDEX_ETF_KEYS = ("VUAA", "VUSA", "VUAG", "CSPX", "VWRP", "VWRA", "VWRL", "CNDX", "CNX1")
@@ -384,6 +416,7 @@ def _allocation_cfg() -> Dict[str, Any]:
     raw_split = raw.get("defensive_split") if isinstance(raw.get("defensive_split"), dict) else {}
     gold_share = min(1.0, max(0.0, _num(raw_split.get("gold"), 1.0)))
     cadence = str(raw.get("buy_cadence") or "monthly").strip().lower()
+    policy = str(raw.get("rebalance_policy") or "advisory").strip().lower()
     return {
         "targets": targets,
         "band_pp": max(0.0, _num(raw.get("band_pp"), 5.0)),
@@ -395,6 +428,10 @@ def _allocation_cfg() -> Dict[str, Any]:
         "big_tech_cap_pct": max(0.0, _num(raw.get("big_tech_cap_pct"), 0.30)),
         "buy_cadence": cadence if cadence in ("monthly", "daily") else "monthly",
         "off_cycle_min_deploy_gbp": max(0.0, _num(raw.get("off_cycle_min_deploy_gbp"), 2000.0)),
+        "rebalance_policy": policy if policy in ("off", "advisory", "active") else "advisory",
+        "glide_fraction": min(1.0, max(0.05, _num(raw.get("glide_fraction"), 0.25))),
+        "glide_count_outside": bool(raw.get("glide_count_outside", False)),
+        "regime_sma_months": max(3, int(_num(raw.get("regime_sma_months"), 10))),
     }
 
 
@@ -545,6 +582,47 @@ def _fmt_shares(qty: Any) -> str:
     q = _num(qty, 0.0)
     txt = f"{q:,.4f}".rstrip("0").rstrip(".")
     return txt if txt not in ("", "-0") else "0"
+
+
+def size_pending_order(
+    order: Optional[Dict[str, Any]],
+    price_gbp: float,
+    held_qty: float = 0.0,
+    held_value_gbp: float = 0.0,
+    gbp_rate: Optional[float] = None,
+) -> Tuple[float, float, bool]:
+    """Sizes a pending Trading 212 order as (shares, GBP value, size_known).
+
+    QUANTITY orders are sized by their share count; VALUE orders ("sell £500 of X") arrive with quantity 0 and a
+    signed value in the order currency, so they are sized by abs(value) converted into GBP and converted back into
+    shares at today's GBP price. A sell is capped at the position held. Only an order with neither a quantity nor a
+    value (e.g. the PENDING_SELLS / PENDING_BUYS config fallback) has an unknown size: a sell then assumes the whole
+    position (size_known=False) and a buy is valued at 0.
+    """
+    o = order if isinstance(order, dict) else {}
+    px = max(0.0, _num(price_gbp, 0.0))
+    held_q = max(0.0, _num(held_qty, 0.0))
+    held_v = max(0.0, _num(held_value_gbp, 0.0))
+    is_sell = str(o.get("side") or "").upper() == "SELL"
+    qty = max(0.0, abs(_num(o.get("quantity"), 0.0)))
+    value_abs = abs(_num(o.get("value_abs"), 0.0)) or abs(_num(o.get("value"), 0.0))
+    value_gbp = 0.0
+    if value_abs > 0:
+        ccy = str(o.get("order_currency") or "GBP")
+        converted = to_gbp(value_abs, ccy, gbp_rate)
+        value_gbp = converted if (converted == converted and converted > 0) else value_abs
+    order_gbp = qty * px + value_gbp
+    shares = qty + ((value_gbp / px) if px > 0 else 0.0)
+    size_known = qty > 0 or value_gbp > 0
+    if not size_known:
+        if is_sell or held_q > 0:
+            shares = held_q
+            order_gbp = held_v if held_v > 0 else held_q * px
+        return shares, order_gbp, False
+    if is_sell and held_q > 0 and shares > held_q:
+        shares = held_q
+        order_gbp = min(order_gbp, held_v if held_v > 0 else held_q * px)
+    return shares, order_gbp, True
 
 
 def _fmt_fwd_cagr(value: Any, capped: Any = None) -> str:
@@ -1083,12 +1161,21 @@ def get_spy_5y_weekly_history_gbp() -> Optional[pd.Series]:
 
 
 def _period_return_pct(series: Optional[pd.Series], start: str, end: str, min_bars: int = 25) -> Optional[float]:
-    """Point-to-point % return of a weekly series inside [start, end]; None when the window is too short."""
+    """Point-to-point % return of a weekly series over [start, end]; None when the window is too short.
+
+    The base is the last close BEFORE `start` when the series has one (e.g. the 31 Dec 2021 close for a 2022 window),
+    so the first days of the window are not skipped. Weekly bars are labelled by week start, so the first bar inside
+    the window already closes several days after `start`.
+    """
     if series is None or len(series) == 0:
         return None
     window = series[(series.index >= start) & (series.index <= end)]
-    if len(window) >= min_bars and float(window.iloc[0]) > 0:
-        return ((float(window.iloc[-1]) / float(window.iloc[0])) - 1.0) * 100.0
+    if len(window) < min_bars:
+        return None
+    before = series[series.index < start]
+    base = float(before.iloc[-1]) if len(before) > 0 else float(window.iloc[0])
+    if base > 0:
+        return ((float(window.iloc[-1]) / base) - 1.0) * 100.0
     return None
 
 
@@ -1120,6 +1207,7 @@ def reset_runtime_caches() -> None:
     _CACHED_FX_TO_GBP.clear()
     _CACHED_FX_WEEKLY.clear()
     _CACHED_OUTSIDE_PRICE_GBP.clear()
+    _CACHED_TECH_REGIME.clear()
 
 
 def calculate_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
@@ -1375,13 +1463,17 @@ def evaluate_weekly_trend(
                     corr_5y = round(float(c_mat), 2)
                 stress_wks = aligned[aligned["spy"] < -0.01]
                 if len(stress_wks) >= 8:
+                    # Average excess return in S&P down-weeks x the number of such weeks per year (not x52: only
+                    # ~20-25% of weeks are stress weeks), i.e. the annual return the asset saved in market sell-offs.
                     excess_wk = float((stress_wks["asset"] - stress_wks["spy"]).mean())
-                    crisis_alpha_5y_pct = round(max(-35.0, min(35.0, excess_wk * 52.0 * 100.0)), 1)
+                    years_aligned = max(len(aligned) / 52.0, 1e-9)
+                    stress_wks_per_year = len(stress_wks) / years_aligned
+                    crisis_alpha_5y_pct = round(max(-35.0, min(35.0, excess_wk * stress_wks_per_year * 100.0)), 1)
 
-        # 2022 Inflation & Tech Bear Market Stress Return (Jan 2022 - Dec 2022)
-        c_2022 = c_tz_free[(c_tz_free.index >= "2022-01-01") & (c_tz_free.index <= "2022-12-31")]
-        if len(c_2022) >= 25 and float(c_2022.iloc[0]) > 0:
-            crash_2022_ret_pct = round(((float(c_2022.iloc[-1]) / float(c_2022.iloc[0])) - 1.0) * 100.0, 1)
+        # 2022 Inflation & Tech Bear Market Stress Return (31 Dec 2021 close -> 30 Dec 2022 close)
+        own_2022 = _period_return_pct(c_tz_free, "2022-01-01", "2022-12-31")
+        if own_2022 is not None:
+            crash_2022_ret_pct = round(own_2022, 1)
         else:
             # For instruments listed after 2022 (e.g. DFND.SW), estimate 2022 shock via empirical beta x the
             # benchmark's own 2022 return on the same currency basis, clamped to at most +2.0% (no invented crisis alpha)
@@ -3034,15 +3126,33 @@ def compute_portfolio_5y_risk_profile(
 
     shield_target_pct = _rebalance_cfg_frac("target_crash_shield_pct", 0.05) * 100.0
     lev_cap_pct = _rebalance_cfg_frac("max_leveraged_etf_pct", 0.08) * 100.0
+    # Defensive buffer status: only says whether genuinely defensive assets reach their target (it is NOT a claim that
+    # the book is crash-proof; the crash replays below measure that)
     if post_metrics["shield_pct"] >= shield_target_pct and post_metrics["lev_3x_pct"] <= lev_cap_pct:
-        shield_status = "🟢 ALL-WEATHER CRASH SHIELD ACTIVE"
+        shield_status = "🟢 DEFENSIVE BUFFER AT TARGET (ACTIVE)"
         shield_color = "#10b981"
     elif post_metrics["shield_pct"] >= shield_target_pct / 2.0:
-        shield_status = "🟡 BUILDING CRASH SHIELD BUFFER"
+        shield_status = "🟡 DEFENSIVE BUFFER BUILDING"
         shield_color = "#f59e0b"
     else:
-        shield_status = "🔴 HIGH BETA — DEPLOY CRASH SHIELD"
+        shield_status = "🔴 HIGH BETA — DEFENSIVE BUFFER BELOW HALF ITS TARGET"
         shield_color = "#ef4444"
+
+    # Historical crash replays (2000–02 / 2007–09 / 2022) on this book now and after the plan, vs the target mix
+    def _crash_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [
+            {
+                "ticker": r.get("ticker", ""),
+                "value_gbp": r.get("value_gbp"),
+                "macro_cluster": r.get("macro_cluster") or (r.get("research") or {}).get("macro_cluster"),
+            }
+            for r in rows if isinstance(r, dict)
+        ]
+
+    curr_crash = compute_crash_scenarios(_crash_rows(book), cash_now)
+    post_crash = compute_crash_scenarios(_crash_rows(sim_rows), sim_free + blocked_cash)
+    crash_status = post_crash["status"]
+    crash_color = post_crash["status_color"]
 
     bear_rate, bear_gbp = projections["bear"]
     base_rate, base_gbp = projections["base"]
@@ -3085,8 +3195,10 @@ def compute_portfolio_5y_risk_profile(
         "projected_5y_target_cagr_pct": round(bull_rate * 100.0, 1),
         "shield_status": shield_status,
         "shield_color": shield_color,
-        "crash_readiness_grade": shield_status,
-        "crash_readiness_color": shield_color,
+        "crash_readiness_grade": crash_status,
+        "crash_readiness_color": crash_color,
+        "crash_scenarios": curr_crash,
+        "post_crash_scenarios": post_crash,
         "shield_target_pct": round(shield_target_pct, 1),
         "lev_cap_pct": round(lev_cap_pct, 1),
         "earmarked_gbp": round(earmarked_gbp, 2),
@@ -3223,6 +3335,257 @@ def compute_household_mix(
         "post_trade_available": post_available,
         "summary": summary,
     }
+
+
+def crash_sleeve(ticker: str, macro_cluster: Any = None) -> str:
+    """Maps a holding onto the sleeve used by the historical crash replays (CRASH_SCENARIOS).
+
+    Funds are mapped by what they track (Nasdaq-100 -> tech, semiconductor ETFs -> semis, All-World -> global index,
+    S&P 500 lines -> US index, gold, cash-like). Single stocks are mapped by their macro cluster: AI hardware ->
+    semis; cloud/software and consumer & digital platforms -> tech; healthcare -> health; anything else -> other stocks.
+    """
+    sym = _sym(ticker)
+    root = sym.split(".")[0]
+    if is_money_market_fund(sym) or is_short_gilt_fund(sym):
+        return "cash"
+    if is_gold_etc(sym):
+        return "gold"
+    if is_leveraged_etf(sym) or root in NASDAQ100_ETF_EXACT or any(k in sym for k in NASDAQ100_ETF_KEYS):
+        return "tech"
+    if any(k in root for k in _SEMIS_FUND_KEYS):
+        return "semis"
+    if any(k in root for k in _GLOBAL_CORE_KEYS):
+        return "core_global"
+    if is_broad_index_etf(sym):
+        return "core_us"
+    cl = str(macro_cluster or "").upper()
+    if any(k in cl for k in _SEMIS_CLUSTERS):
+        return "semis"
+    if any(k in cl for k in _TECH_CLUSTERS):
+        return "tech"
+    if "HEALTH" in cl:
+        return "health"
+    if "GOLD" in cl:
+        return "gold"
+    if "GILTS" in cl or "CASH" in cl:
+        return "cash"
+    return "other_equity"
+
+
+def compute_crash_scenarios(
+    holdings: Optional[List[Dict[str, Any]]],
+    cash_gbp: float,
+    outside_rows: Optional[List[Dict[str, Any]]] = None,
+    targets: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """Replays the 2000–02 tech crash, the 2007–09 financial crisis and the 2022 rate shock on today's book.
+
+    Each holding is mapped to a sleeve (crash_sleeve) and given that sleeve's historical GBP return over the crisis
+    window (CRASH_SCENARIOS); vested outside holdings (e.g. RSUs) count, unvested never do; uninvested cash earns the
+    cash return. The same replay is run on the household target mix (core = global index, satellites = a
+    diversified, market-like sleeve, defensive split per config) so the email can show what the plan itself would
+    have lost. Sector-level estimates: single stocks can fall much further than their sector.
+    """
+    sleeve_gbp: Dict[str, float] = {k: 0.0 for k in CRASH_SLEEVE_LABELS}
+    by_holding: Dict[str, Dict[str, Any]] = {}
+
+    def _add(ticker: str, value: float, cluster: Any, source: str) -> None:
+        if value <= 0:
+            return
+        sl = crash_sleeve(ticker, cluster)
+        sleeve_gbp[sl] += value
+        key = _sym(ticker) or ticker
+        row = by_holding.setdefault(key, {"ticker": ticker, "sleeve": sl, "value_gbp": 0.0, "source": source})
+        row["value_gbp"] += value
+
+    for h in holdings or []:
+        if isinstance(h, dict):
+            _add(str(h.get("ticker", "")), max(0.0, _num(h.get("value_gbp"), 0.0)), h.get("macro_cluster"), "isa")
+    for h in outside_rows or []:
+        if isinstance(h, dict):
+            _add(str(h.get("ticker", "")), max(0.0, _num(h.get("vested_gbp"), 0.0)), h.get("macro_cluster"), "outside")
+    cash_v = max(0.0, _num(cash_gbp, 0.0))
+    sleeve_gbp["cash"] += cash_v
+    basis = sum(sleeve_gbp.values())
+
+    cfg = _allocation_cfg()
+    tg = targets or cfg["targets"]
+    gold_share = min(1.0, max(0.0, _num(cfg.get("defensive_gold_share"), 1.0)))
+    target_w = {
+        "core_global": _num(tg.get(BUCKET_CORE), 0.75),
+        "other_equity": _num(tg.get(BUCKET_SATELLITE), 0.20),
+        "gold": _num(tg.get(BUCKET_DEFENSIVE), 0.05) * gold_share,
+        "cash": _num(tg.get(BUCKET_DEFENSIVE), 0.05) * (1.0 - gold_share),
+    }
+    scenarios = []
+    for sc in CRASH_SCENARIOS:
+        rets = sc["returns"]
+        loss_gbp = sum(v * rets.get(sl, 0.0) / 100.0 for sl, v in sleeve_gbp.items())
+        loss_pct = (loss_gbp / basis * 100.0) if basis > 0 else 0.0
+        tgt_pct = sum(w * rets.get(sl, 0.0) for sl, w in target_w.items())
+        contributors = sorted(
+            (
+                {"ticker": r["ticker"], "sleeve": r["sleeve"], "loss_gbp": round(r["value_gbp"] * rets.get(r["sleeve"], 0.0) / 100.0, 0)}
+                for r in by_holding.values()
+            ),
+            key=lambda c: c["loss_gbp"],
+        )
+        scenarios.append({
+            "key": sc["key"],
+            "label": sc["label"],
+            "window": sc["window"],
+            "loss_pct": round(loss_pct, 1),
+            "loss_gbp": round(loss_gbp, 0),
+            "target_mix_loss_pct": round(tgt_pct, 1),
+            "target_mix_loss_gbp": round(basis * tgt_pct / 100.0, 0),
+            "excess_loss_pp": round(loss_pct - tgt_pct, 1),
+            "top_contributors": [c for c in contributors if c["loss_gbp"] < 0][:5],
+        })
+    worst = min(scenarios, key=lambda s: s["loss_pct"]) if scenarios else None
+    excess = _num(worst.get("excess_loss_pp"), 0.0) if worst else 0.0
+    if basis <= 0 or worst is None:
+        status, color = "⚪ NO DATA", "#64748b"
+    elif excess >= -5.0:
+        status, color = "🟢 CRASH RISK IN LINE WITH PLAN", "#10b981"
+    elif excess >= -12.0:
+        status, color = "🟡 CRASH RISK ABOVE PLAN", "#f59e0b"
+    else:
+        status, color = "🔴 CRASH RISK FAR ABOVE PLAN", "#ef4444"
+    return {
+        "basis_gbp": round(basis, 2),
+        "sleeve_weights_pct": {
+            sl: round(v / basis * 100.0, 1) for sl, v in sleeve_gbp.items() if basis > 0 and v > 0
+        },
+        "scenarios": scenarios,
+        "worst": worst,
+        "status": status,
+        "status_color": color,
+        "note": (
+            "Historical replay at sector level in GBP (survivorship-free data). Individual stocks can fall much further "
+            "than their sector, and past crashes are not forecasts."
+        ),
+    }
+
+
+# Tech crash circuit-breaker: Nasdaq-100 trend on completed month-end closes (GBP line first, then fallbacks)
+TECH_REGIME_PROXIES: Tuple[str, ...] = ("CNX1.L", "CNDX.L", "QQQ")
+REGIME_RISK_ON = "RISK_ON"
+REGIME_RISK_OFF = "RISK_OFF"
+REGIME_UNKNOWN = "UNKNOWN"
+_CACHED_TECH_REGIME: Dict[str, Dict[str, Any]] = {}
+
+
+def tech_regime_from_closes(
+    daily_closes: Optional[pd.Series],
+    as_of: Optional[date] = None,
+    sma_months: int = 10,
+    proxy: str = "",
+) -> Dict[str, Any]:
+    """Classifies the tech trend from daily closes: RISK_ON when the last COMPLETED month-end close is above its
+    `sma_months`-month simple moving average of month-end closes, RISK_OFF when below, UNKNOWN without enough data.
+
+    Only completed months count (the month containing `as_of` is dropped), so the signal changes at most once a
+    month and never on intra-month noise. months_in_regime counts consecutive month-ends on the current side.
+    """
+    out: Dict[str, Any] = {
+        "regime": REGIME_UNKNOWN, "proxy": proxy, "sma_months": int(sma_months), "as_of_month_end": None,
+        "close": None, "sma": None, "pct_vs_sma": None, "months_in_regime": 0,
+    }
+    if daily_closes is None or len(daily_closes) == 0:
+        return out
+    s = pd.to_numeric(daily_closes, errors="coerce").dropna()
+    s = s[s > 0]
+    if s.empty:
+        return out
+    idx = pd.DatetimeIndex(s.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    s = pd.Series(s.values, index=idx).sort_index()
+    if as_of is None:
+        try:
+            as_of = config.london_date()
+        except Exception:  # pragma: no cover - config always provides london_date
+            as_of = datetime.now().date()
+    month_start = pd.Timestamp(year=as_of.year, month=as_of.month, day=1)
+    s = s[s.index < month_start]
+    if s.empty:
+        return out
+    # Month-end closes (period grouping works on every pandas version, unlike the 'M'/'ME' resample aliases)
+    me = s.groupby(s.index.to_period("M")).last().dropna()
+    me.index = me.index.to_timestamp(how="end").normalize()
+    n = max(2, int(sma_months))
+    if len(me) < n:
+        return out
+    sma = me.rolling(n).mean()
+    above = (me > sma).where(sma.notna())
+    last_close, last_sma = float(me.iloc[-1]), float(sma.iloc[-1])
+    regime = REGIME_RISK_ON if last_close > last_sma else REGIME_RISK_OFF
+    streak = 0
+    for flag in reversed(above.dropna().tolist()):
+        if bool(flag) == (regime == REGIME_RISK_ON):
+            streak += 1
+        else:
+            break
+    out.update({
+        "regime": regime,
+        "as_of_month_end": me.index[-1].date().isoformat(),
+        "close": round(last_close, 4),
+        "sma": round(last_sma, 4),
+        "pct_vs_sma": round((last_close / last_sma - 1.0) * 100.0, 1) if last_sma > 0 else None,
+        "months_in_regime": streak,
+    })
+    return out
+
+
+def compute_tech_regime(as_of: Optional[date] = None, sma_months: Optional[int] = None) -> Dict[str, Any]:
+    """Live tech crash circuit-breaker signal (Nasdaq-100 vs its 10-month average), cached per process.
+
+    Tries the GBP-quoted Nasdaq-100 line first (CNX1.L), then CNDX.L and QQQ. Returns REGIME_UNKNOWN when no proxy
+    has enough history; callers then never trigger trims from it.
+    """
+    n = int(sma_months or _allocation_cfg()["regime_sma_months"])
+    key = f"{as_of}|{n}"
+    if key in _CACHED_TECH_REGIME:
+        return dict(_CACHED_TECH_REGIME[key])
+    result: Dict[str, Any] = tech_regime_from_closes(None, as_of, n)
+    for proxy in TECH_REGIME_PROXIES:
+        try:
+            hist = yf.Ticker(proxy).history(period="2y", interval="1d", auto_adjust=True)
+            closes = hist["Close"] if hist is not None and not hist.empty else None
+            candidate = tech_regime_from_closes(closes, as_of, n, proxy=proxy)
+        except Exception as e:  # network / parsing failure: try the next proxy
+            logger.warning("Tech regime proxy %s unavailable: %s", proxy, e)
+            continue
+        if candidate.get("regime") != REGIME_UNKNOWN:
+            result = candidate
+            break
+    if result.get("regime") == REGIME_UNKNOWN:
+        logger.warning("Tech crash circuit-breaker: no Nasdaq-100 proxy had %d months of data; regime UNKNOWN.", n)
+    _CACHED_TECH_REGIME[key] = dict(result)
+    return result
+
+
+def describe_tech_regime(regime: Optional[Dict[str, Any]], policy: str = "advisory") -> str:
+    """One plain-English line for the email/console, e.g. '🟢 Tech trend UP: Nasdaq-100 +2.3% above its 10-month average'."""
+    r = regime if isinstance(regime, dict) else {}
+    state = r.get("regime")
+    n = int(_num(r.get("sma_months"), 10))
+    pct = _num(r.get("pct_vs_sma"), None)
+    when = r.get("as_of_month_end") or "last month-end"
+    pct_txt = f"{pct:+.1f}% vs its {n}-month average" if pct is not None else f"vs its {n}-month average"
+    if state == REGIME_RISK_ON:
+        return (
+            f"🟢 Tech trend UP (circuit-breaker off): Nasdaq-100 closed {when} {pct_txt}. "
+            f"It trips if a month ends below that average."
+        )
+    if state == REGIME_RISK_OFF:
+        action = (
+            "satellites above plan are trimmed to cash and new money waits in cash"
+            if policy == "active"
+            else "no new tech/semiconductor buys; trimming the satellites above plan to cash is recommended"
+        )
+        return f"🔴 Tech trend DOWN (circuit-breaker ON): Nasdaq-100 closed {when} {pct_txt} — {action}."
+    return "⚪ Tech trend unknown (no Nasdaq-100 data): the circuit-breaker cannot trigger today."
 
 
 def compute_big_tech_exposure(
@@ -3586,6 +3949,17 @@ def build_consolidated_portfolio_view(
         sell_orders=sim_sells if plans_given else None,
         buy_orders=sim_buys if plans_given else None,
     )
+    # Historical crash replays on the whole household (both ISAs + vested outside holdings), vs the target mix
+    crash_holdings = [
+        {
+            "ticker": p.get("ticker", ""),
+            "value_gbp": p.get("value_gbp"),
+            "macro_cluster": p.get("macro_cluster") or (p.get("research") or {}).get("macro_cluster"),
+        }
+        for p in combined_analyses
+        if not is_earmarked(p.get("ticker", ""), earmarked_set)
+    ]
+    crash_scenarios = compute_crash_scenarios(crash_holdings, hh_cash, outside_rows)
 
     return {
         "total_net_worth_gbp": total_net_worth_gbp,
@@ -3620,6 +3994,7 @@ def build_consolidated_portfolio_view(
         "post_trade_orders_simulated": {"sells": len(sim_sells), "buys": len(sim_buys)},
         "household_mix": household_mix,
         "big_tech": big_tech,
+        "crash_scenarios": crash_scenarios,
         "model_version": _model_version(),
     }
 
@@ -3628,6 +4003,231 @@ def _infer_account_name(analyses: List[Dict[str, Any]]) -> Optional[str]:
     """Infers the owning account from the 'account' tag stamped by build_consolidated_portfolio_view."""
     names = {str(p.get("account")) for p in (analyses or []) if isinstance(p, dict) and p.get("account")}
     return names.pop() if len(names) == 1 else None
+
+
+def build_glide_path_trims(
+    analyses: List[Dict[str, Any]],
+    account_name: Optional[str],
+    household: Dict[str, Any],
+    hh_outside_rows: Optional[List[Dict[str, Any]]] = None,
+    global_context: Optional[Dict[str, Any]] = None,
+    existing_sell_orders: Optional[List[Dict[str, Any]]] = None,
+    pending_sells: Optional[Dict[str, Any]] = None,
+    as_of: Optional[date] = None,
+    data_degraded: bool = False,
+    household_value_of: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Sizes this account's share of the household satellite trim (glide path + tech crash circuit-breaker).
+
+    When household satellites sit above target + band, the excess over the TARGET is trimmed:
+      * tech trend DOWN (RISK_OFF): the whole excess, now (circuit-breaker);
+      * tech trend UP: glide_fraction of it, on the monthly buy day only (glide path).
+    Each account trims in proportion to its share of the household's Trading 212 satellites, ranked by risk: broken
+    weekly trend first, then tech/semiconductor exposure while the circuit-breaker is on, single names above the
+    household single-stock cap, overlapping thematic funds, then size. Vested outside holdings are left out of the
+    sizing unless glide_count_outside is set (they cannot be sold in Trading 212). Orders are only returned when the
+    policy is 'active', the account is an ISA and the data is not degraded; otherwise they are proposals.
+    """
+    cfg = _allocation_cfg()
+    policy = cfg["rebalance_policy"]
+    regime = (global_context or {}).get("tech_regime") if isinstance(global_context, dict) else None
+    regime = regime if isinstance(regime, dict) else {"regime": REGIME_UNKNOWN}
+    risk_off = regime.get("regime") == REGIME_RISK_OFF
+    if as_of is None:
+        try:
+            as_of = config.london_date()
+        except Exception:  # pragma: no cover - config always provides london_date
+            as_of = datetime.now().date()
+    is_buy_day = as_of == first_london_business_day(as_of.year, as_of.month)
+    wrapper = str((getattr(config, "ACCOUNT_WRAPPERS", {}) or {}).get(account_name or "", "ISA") or "ISA").upper()
+    min_order = max(300.0, _num(REBALANCE_CONFIG.get("min_order_gbp"), 300.0))
+
+    result: Dict[str, Any] = {
+        "policy": policy, "regime": regime, "regime_text": describe_tech_regime(regime, policy),
+        "active": False, "wrapper": wrapper, "is_buy_day": is_buy_day, "out_of_band": False,
+        "basis_gbp": 0.0, "satellite_now_gbp": 0.0, "satellite_now_pct": 0.0, "target_pct": 0.0, "band_pp": 0.0,
+        "excess_to_target_gbp": 0.0, "tranche_household_gbp": 0.0, "account_share_gbp": 0.0,
+        "proposals": [], "orders": [], "notes": [], "trigger": None,
+    }
+    if policy == "off" or not isinstance(household, dict):
+        return result
+
+    targets = household.get("targets") if isinstance(household.get("targets"), dict) else cfg["targets"]
+    target_sat = _num(targets.get(BUCKET_SATELLITE), cfg["targets"][BUCKET_SATELLITE])
+    band_pp = _num(household.get("band_pp"), cfg["band_pp"])
+    hh_basis = max(0.0, _num(household.get("basis_gbp"), 0.0))
+    hh_sat = max(0.0, _num((household.get("values_gbp") or {}).get(BUCKET_SATELLITE), 0.0))
+    outside_total = sum(max(0.0, _num(h.get("vested_gbp"), 0.0)) for h in (hh_outside_rows or []) if isinstance(h, dict))
+    outside_sat = sum(
+        max(0.0, _num(h.get("vested_gbp"), 0.0)) for h in (hh_outside_rows or [])
+        if isinstance(h, dict) and classify_bucket(str(h.get("ticker", ""))) == BUCKET_SATELLITE
+    )
+    t212_sat = max(0.0, hh_sat - outside_sat)
+    if cfg["glide_count_outside"]:
+        basis, sat_now = hh_basis, hh_sat
+    else:
+        basis, sat_now = max(0.0, hh_basis - outside_total), t212_sat
+    if basis <= 0 or t212_sat <= 0:
+        return result
+    upper = (target_sat + band_pp / 100.0) * basis
+    excess = max(0.0, sat_now - target_sat * basis)
+    out_of_band = sat_now > upper + 0.5
+    result.update({
+        "basis_gbp": round(basis, 2), "satellite_now_gbp": round(sat_now, 2),
+        "satellite_now_pct": round(sat_now / basis * 100.0, 1), "target_pct": round(target_sat * 100.0, 1),
+        "band_pp": band_pp, "out_of_band": out_of_band, "excess_to_target_gbp": round(excess, 2),
+        "counts_outside": bool(cfg["glide_count_outside"]),
+    })
+    if not out_of_band:
+        return result
+
+    if risk_off:
+        tranche = excess
+        result["trigger"] = "circuit_breaker"
+    elif is_buy_day:
+        tranche = min(excess, max(min_order, cfg["glide_fraction"] * excess))
+        result["trigger"] = "glide_path"
+    else:
+        tranche = 0.0
+        result["notes"].append(
+            f"Satellites are {sat_now / basis * 100.0:.0f}% vs the {target_sat * 100.0:.0f}% target (±{band_pp:g}pp band); "
+            "the next glide-path trim is sized on the monthly buy day."
+        )
+    result["tranche_household_gbp"] = round(tranche, 2)
+    if tranche <= 0:
+        return result
+
+    def _is_sat(pos: Dict[str, Any]) -> bool:
+        return (
+            not pos.get("is_earmarked")
+            and classify_bucket(str(pos.get("ticker", ""))) == BUCKET_SATELLITE
+            and _num(pos.get("quantity"), 0.0) > 0
+        )
+
+    acc_sat = sum(max(0.0, _num(p.get("value_gbp"), 0.0)) for p in analyses if isinstance(p, dict) and _is_sat(p))
+    share = tranche * min(1.0, acc_sat / t212_sat) if t212_sat > 0 else 0.0
+    already = sum(
+        max(0.0, _num(s.get("estimated_gbp"), 0.0)) for s in (existing_sell_orders or [])
+        if isinstance(s, dict) and classify_bucket(str(s.get("ticker", ""))) == BUCKET_SATELLITE
+    )
+    remaining = max(0.0, share - already)
+    result["account_share_gbp"] = round(share, 2)
+    if remaining < min_order:
+        return result
+
+    sat_single_cap = cfg["satellite_max_single_pct"]
+    sold_tickers = {_sym(s.get("ticker", "")) for s in (existing_sell_orders or []) if isinstance(s, dict)}
+    ranked = []
+    for pos in analyses:
+        if not isinstance(pos, dict) or not _is_sat(pos):
+            continue
+        t = str(pos.get("ticker", ""))
+        if _sym(t) in sold_tickers or any(tickers_match(k, t) for k in (pending_sells or {})):
+            continue
+        val = max(0.0, _num(pos.get("value_gbp"), 0.0))
+        px = max(0.0, _num(pos.get("price_gbp"), 0.0))
+        if val < min_order or px <= 0:
+            continue
+        cluster = pos.get("macro_cluster") or (pos.get("research") or {}).get("macro_cluster")
+        sleeve = crash_sleeve(t, cluster)
+        stage_txt = str(pos.get("stage_label") or pos.get("stage") or "")
+        trend_broken = pos.get("signal") == TREND_REVIEW_SIGNAL or "Stage 4" in stage_txt or "Stage 3" in stage_txt
+        below_ref_stop = pos.get("signal") == STOP_REVIEW_SIGNAL or bool(pos.get("stop_breached"))
+        hh_w = 0.0
+        if callable(household_value_of) and hh_basis > 0:
+            try:
+                hh_w = household_value_of(t) / hh_basis
+            except Exception:
+                hh_w = 0.0
+        is_fund = any(k in _sym(t) for k in NASDAQ100_ETF_KEYS + _SEMIS_FUND_KEYS + SECTOR_ETF_KEYS)
+        factors = []
+        score = 0.0
+        if trend_broken:
+            score += 3.0
+            factors.append("weekly trend broken")
+        elif below_ref_stop:
+            score += 1.0
+            factors.append("below its short-term reference stop")
+        if sleeve in ("tech", "semis") and risk_off:
+            score += 2.0
+            factors.append("tech/semiconductor exposure while the circuit-breaker is on")
+        elif sleeve in ("tech", "semis"):
+            score += 1.0
+            factors.append("adds to the household's tech concentration")
+        if hh_w > sat_single_cap + 1e-9:
+            score += 2.0
+            factors.append(f"{hh_w * 100.0:.1f}% of the household, above the {sat_single_cap * 100.0:.0f}% single-name cap")
+        if is_fund:
+            score += 1.0
+            factors.append("thematic fund overlapping single stocks you already own")
+        score += min(1.0, val / max(1.0, acc_sat))
+        ranked.append((score, val, pos, px, sleeve, factors))
+    ranked.sort(key=lambda r: (r[0], r[1]), reverse=True)
+
+    active = policy == "active" and wrapper == "ISA" and not data_degraded
+    result["active"] = active
+    kind = "circuit_breaker" if risk_off else "glide_rebalance"
+    action = "TRIM (TECH CIRCUIT-BREAKER — BACK TO PLAN)" if risk_off else "TRIM (GLIDE PATH — BACK TO PLAN)"
+    for score, val, pos, px, sleeve, factors in ranked:
+        if remaining < min_order:
+            break
+        # Glide steps trim at most half of any one position per month (spreads the de-risking across names);
+        # the circuit-breaker has no such limit
+        per_name_cap = val if risk_off else val * 0.5
+        amount = min(remaining, per_name_cap)
+        if val - amount < min_order:
+            amount = val  # no stub positions below the minimum order size
+        if amount < min_order:
+            continue
+        qty_held = max(0.0, _num(pos.get("quantity"), 0.0))
+        shares = qty_held if amount >= val - 0.01 else min(qty_held, math.floor(amount / px * 10000.0) / 10000.0)
+        amount = min(val, shares * px)
+        if shares <= 0 or amount < min_order * 0.98:
+            continue
+        name = pos.get("name", pos.get("ticker", ""))
+        sym = pos.get("search_symbol", clean_search_symbol(str(pos.get("ticker", ""))))
+        why = (
+            f"Household satellites are {sat_now / basis * 100.0:.0f}% vs your {target_sat * 100.0:.0f}% plan "
+            f"(£{excess:,.0f} above target). "
+            + ("The Nasdaq-100 closed the month below its 10-month average, so the excess moves to cash now. "
+               if risk_off else f"This month's glide-path step trims {cfg['glide_fraction'] * 100.0:.0f}% of the excess. ")
+            + (f"{name} ranks first because: {'; '.join(factors)}." if factors else "")
+            + " ISA: no capital gains tax; proceeds stay as cash for the next buy day."
+        )
+        order = {
+            "ticker": pos.get("ticker", ""),
+            "search_symbol": sym,
+            "name": name,
+            "action": action,
+            "is_pending": False,
+            "shares": round(shares, 4),
+            "price": pos.get("price", 0.0),
+            "currency": pos.get("currency", "USD"),
+            "estimated_gbp": round(amount, 2),
+            "plain_english_why": why,
+            "app_instruction": (
+                f"Open Trading 212 ➔ Search '{sym}' ➔ Tap Sell ➔ Sell {_fmt_shares(shares)} shares (or ~£{amount:,.0f})"
+            ),
+            "badge_color": "#f59e0b",
+            "order_reason": kind,
+            "bucket": BUCKET_SATELLITE,
+            "sleeve": sleeve,
+            "rank_factors": factors,
+            "is_profit": _num(pos.get("unrealized_pnl"), 0.0) > 0,
+        }
+        if account_name:
+            order["account"] = account_name
+        result["proposals"].append(order)
+        remaining -= amount
+    if active:
+        result["orders"] = [dict(o) for o in result["proposals"]]
+    elif result["proposals"]:
+        why_not = (
+            "not an ISA (capital gains tax would apply)" if wrapper != "ISA"
+            else ("data degraded today" if data_degraded else "REBALANCE_POLICY is 'advisory'")
+        )
+        result["notes"].append(f"Proposed only ({why_not}): no order is placed until you switch the policy to 'active'.")
+    return result
 
 
 def build_rebalancing_plan(
@@ -3907,11 +4507,14 @@ def build_rebalancing_plan(
                 (order_type == "MARKET") or (limit_p <= 0) or (curr_p > 0 and limit_p <= curr_p * 1.02)
             )
 
-            # A partial order is valued at its own quantity x GBP price, not at the whole position
-            order_qty = _num(p_sell_info.get("quantity"), 0.0)
-            if order_qty <= 0 or (qty > 0 and order_qty > qty):
-                order_qty = qty
-            pending_val_gbp = (order_qty * price_gbp) if price_gbp > 0 else val_gbp
+            # A partial order is valued at its own size (shares, or the £ value of a VALUE order), not the whole position
+            p_sell_sized = dict(p_sell_info)
+            p_sell_sized.setdefault("side", "SELL")
+            order_qty, pending_val_gbp, _size_known = size_pending_order(
+                p_sell_sized, price_gbp, held_qty=qty, held_value_gbp=val_gbp, gbp_rate=gbp_rate,
+            )
+            if pending_val_gbp <= 0:
+                pending_val_gbp = val_gbp
 
             limit_txt = f" @ limit ${limit_p:,.2f}" if limit_p > 0 else ""
             stop_txt = f" @ stop {stop_p:,.2f}" if stop_p > 0 else ""
@@ -3949,8 +4552,10 @@ def build_rebalancing_plan(
                 if _sym(ticker):
                     cap_trimmed_ledger[_sym(ticker)] = _num(cap_trimmed_ledger.get(_sym(ticker)), 0.0) + pending_val_gbp
             if breach is not None:
-                breach["actioned"] = True
+                # A queued sell only resolves the breach when it is at least as large as the excess over the cap
                 breach["pending_order"] = True
+                breach["pending_sell_gbp"] = round(pending_val_gbp, 2)
+                breach["actioned"] = bool(is_immediate_fill and pending_val_gbp >= cap_excess_gbp - 1.0)
             continue
 
         # Earmarked money is never traded; degraded data never produces orders
@@ -4094,6 +4699,37 @@ def build_rebalancing_plan(
             pos["plain_english_why"] = trim_why
             pos["app_instruction"] = order["app_instruction"]
 
+    # 2b. Glide path back to the household plan + tech crash circuit-breaker (config.ALLOCATION_CONFIG / REBALANCE_POLICY)
+    #     Evidence (survivorship-free 1928-2026 study, GBP, after costs): a tech-concentrated satellite sleeve of ~70%
+    #     had ~73% worst drawdowns for little extra long-run return; trimming the excess to cash while the Nasdaq-100
+    #     is below its 10-month average cut the 2000-02 loss from ~67% to ~22%. Trims are ISA-only (no CGT), never touch
+    #     earmarked money, core or defensive funds, and are only PROPOSED unless the policy is 'active'.
+    glide = build_glide_path_trims(
+        analyses=analyses,
+        account_name=acc_name,
+        household=household,
+        hh_outside_rows=hh_outside_rows,
+        global_context=global_context,
+        existing_sell_orders=sell_orders,
+        pending_sells=pending_sells,
+        as_of=as_of,
+        data_degraded=bool(data_degraded_reason),
+        household_value_of=_household_value_of,
+    )
+    if glide.get("active"):
+        for order in glide.get("orders") or []:
+            sell_orders.append(order)
+            cash_from_sells += _num(order.get("estimated_gbp"), 0.0)
+            for pos in analyses:
+                if tickers_match(pos.get("ticker", ""), order.get("ticker", "")) and str(pos.get("account") or acc_name or "") == str(order.get("account") or acc_name or ""):
+                    pos["signal"] = f"🟠 {order['action']}"
+                    pos["action_short"] = "TRIM"
+                    pos["badge_color"] = "#f59e0b"
+                    pos["reason"] = order["plain_english_why"]
+                    pos["plain_english_why"] = order["plain_english_why"]
+                    pos["app_instruction"] = order["app_instruction"]
+                    break
+
     # 3. Calculate Deployable Funds (Enforcing Protected Cash Withdrawal Floor)
     if min_cash_reserve_gbp is None:
         min_cash_reserve_gbp = REBALANCE_CONFIG.get("min_cash_reserve_gbp", 1500.0)
@@ -4187,6 +4823,21 @@ def build_rebalancing_plan(
             if b != largest_bucket and 0.0 < bucket_budget[b] < min_ord_gbp:
                 bucket_budget[largest_bucket] += bucket_budget[b]
                 bucket_budget[b] = 0.0
+    # Tech crash circuit-breaker ('active' policy): while the Nasdaq-100 is below its 10-month average, new money for
+    # core and satellites waits in cash (earning interest) and is invested on the first buy day after the trend recovers
+    regime_notes: List[str] = []
+    if (
+        ((glide or {}).get("regime") or {}).get("regime") == REGIME_RISK_OFF
+        and (glide or {}).get("policy") == "active"
+        and (bucket_budget[BUCKET_CORE] > 0 or bucket_budget[BUCKET_SATELLITE] > 0)
+    ):
+        parked = bucket_budget[BUCKET_CORE] + bucket_budget[BUCKET_SATELLITE]
+        bucket_budget[BUCKET_CORE] = 0.0
+        bucket_budget[BUCKET_SATELLITE] = 0.0
+        regime_notes.append(
+            f"Tech crash circuit-breaker on: £{parked:,.0f} of new money for core/satellites waits in cash until the "
+            "Nasdaq-100 closes a month back above its 10-month average."
+        )
     planned_bucket_budget = {b: round(bucket_budget[b], 2) for b in BUCKETS}
 
     # US big-tech cap (household basis, fund look-through + vested outside shares). Instruments whose own big-tech
@@ -4403,6 +5054,21 @@ def build_rebalancing_plan(
         scored_candidates.append(dict(pos))
         seen_tickers.add(t)
 
+    # Tech crash circuit-breaker: while the Nasdaq-100 trend is down, no new tech / semiconductor satellite buys
+    regime_state = ((glide or {}).get("regime") or {}).get("regime")
+    if regime_state == REGIME_RISK_OFF and (glide or {}).get("policy") != "off":
+        kept = []
+        for cand in scored_candidates:
+            c_sleeve = crash_sleeve(
+                cand.get("ticker", ""),
+                (cand.get("research") or {}).get("macro_cluster") or cand.get("macro_cluster"),
+            )
+            if c_sleeve in ("tech", "semis"):
+                logger.info("Skipping %s as buy candidate: tech crash circuit-breaker is on (Nasdaq-100 below its 10-month average).", cand.get("ticker"))
+                continue
+            kept.append(cand)
+        scored_candidates = kept
+
     # Apply Institutional 5-Year Horizon Risk Gatekeepers, Sortino, Forward 5Y Compounding & Pullback-to-Value Scoring
     for cand in scored_candidates:
         c_ticker_u = cand.get("ticker", "").upper()
@@ -4528,7 +5194,8 @@ def build_rebalancing_plan(
                 cand["rebalance_score"] -= 10
         fip_cand = _num(cand.get("fip_pos_weeks_pct"), None)
         if fip_cand is not None:
-            if fip_cand >= 58.0:
+            # Frog-in-the-pan smoothness only rewards a steady RISE: it is conditioned on positive 12-1m momentum
+            if fip_cand >= 58.0 and (mom_12_1_cand is not None and mom_12_1_cand > 0):
                 cand["rebalance_score"] += 5
             elif fip_cand < 45.0:
                 cand["rebalance_score"] -= 5
@@ -4611,19 +5278,30 @@ def build_rebalancing_plan(
 
         # (The old 'crash-shield completion' slot swap is gone: crash protection is now the defensive bucket's job.)
 
-        # Conviction over tempered downside volatility (fractional-Kelly style). The forward 5Y CAGR estimate no longer scales sizes.
+        # Conviction over daily volatility (fractional-Kelly style), then a tempered inverse 1-year downside-volatility
+        # scalar clamped to [0.80, 1.25] around the selected candidates' median (steadier names get modestly more).
+        # The forward 5Y CAGR estimate no longer scales sizes.
+        dvols = sorted(
+            float(_num(c.get("downside_vol_1y_pct"), 0.0)) for c in selected_candidates
+            if _num(c.get("downside_vol_1y_pct"), None) is not None and _num(c.get("downside_vol_1y_pct"), 0.0) > 0
+        )
+        med_dvol = (
+            (dvols[len(dvols) // 2] if len(dvols) % 2 else (dvols[len(dvols) // 2 - 1] + dvols[len(dvols) // 2]) / 2.0)
+            if dvols else None
+        )
         for cand in selected_candidates:
             c_t = cand["ticker"]
             vcp = _num(cand.get("vcp_pct"), None)
             if vcp is None or vcp <= 0:
                 vcp = 2.0
+            vol_risk = max(1.2, float(vcp))
             dvol_1y = _num(cand.get("downside_vol_1y_pct"), None)
-            if dvol_1y is not None and dvol_1y > 0:
-                vol_risk = max(1.2, 0.5 * float(vcp) + 0.5 * (math.sqrt(float(dvol_1y)) * 0.45))
-            else:
-                vol_risk = max(1.2, float(vcp))
+            dv_scalar = 1.0
+            if med_dvol and dvol_1y is not None and dvol_1y > 0:
+                dv_scalar = min(1.25, max(0.80, med_dvol / float(dvol_1y)))
+            cand["downside_vol_size_scalar"] = round(dv_scalar, 3)
             score_factor = max(15.0, float(cand.get("rebalance_score", 50)))
-            candidate_weights[c_t] = score_factor / vol_risk
+            candidate_weights[c_t] = (score_factor / vol_risk) * dv_scalar
 
         total_w = sum(candidate_weights.values()) or 1.0
         # Guarantee every selected candidate meets effective_floor_gbp and distribute surplus by Kelly-adjusted weight
@@ -4959,6 +5637,8 @@ def build_rebalancing_plan(
                 f"big-tech stocks or tech-heavy funds (fund look-through and outside shares included)."
             )
     alloc_notes.extend(bucket_notes)
+    alloc_notes.extend(regime_notes)
+    alloc_notes.extend(n for n in (glide.get("notes") or []) if n not in alloc_notes)
     household_allocation = {
         "scope": household_scope,
         "buys_allowed": buys_allowed,
@@ -4993,13 +5673,21 @@ def build_rebalancing_plan(
         matching_bo = next((v for k, v in bought_dict.items() if tickers_match(k, t)), None)
 
         if matching_ps:
-            p_sell = pending_sells[matching_ps] or {}
-            pending_qty = _num(p_sell.get("quantity"), 0.0)
-            if pending_qty <= 0:
-                pending_qty = _num(pos.get("quantity"), 0.0)
+            p_sell = dict(pending_sells[matching_ps] or {})
+            p_sell.setdefault("side", "SELL")
+            pending_qty, pending_gbp_disp, _known = size_pending_order(
+                p_sell,
+                _num(pos.get("price_gbp"), 0.0),
+                held_qty=_num(pos.get("quantity"), 0.0),
+                held_value_gbp=_num(pos.get("value_gbp"), 0.0),
+                gbp_rate=gbp_rate,
+            )
             pos["plan_status"] = "⏳ PENDING SELL"
             pos["plan_badge_color"] = "#f59e0b"
-            pos["plan_summary"] = f"Sell order of {_fmt_shares(pending_qty)} shares is currently pending execution in Trading 212."
+            pos["plan_summary"] = (
+                f"Sell order of {_fmt_shares(pending_qty)} shares (~£{pending_gbp_disp:,.0f}) is currently pending "
+                "execution in Trading 212."
+            )
         elif matching_pb:
             p_buy = pending_buys[matching_pb] or {}
             pos["plan_status"] = "⏳ PENDING BUY"
@@ -5123,6 +5811,16 @@ def build_rebalancing_plan(
                 "cap_pct": round(cluster_cap_pct, 1),
                 "actioned": False,
             })
+    # Household US big-tech exposure above its cap (fund look-through + vested outside shares): reported, never traded
+    bt_pct = _num((big_tech_ctx or {}).get("exposure_pct"), 0.0)
+    if bt_cap > 0 and bt_pct > bt_cap * 100.0 + 0.05:
+        cap_breaches.append({
+            "kind": "big_tech",
+            "name": "US big tech",
+            "weight_pct": round(bt_pct, 1),
+            "cap_pct": round(bt_cap * 100.0, 1),
+            "actioned": False,
+        })
 
     # 7. Compute 5-Year Risk-Adjusted Return & 2022 Crash Stress-Test Profile for this Account
     risk_profile_5y = compute_portfolio_5y_risk_profile(
@@ -5167,9 +5865,13 @@ def build_rebalancing_plan(
         "earmarked_gbp": round(earmarked_gbp, 2),
         "earmarked_tickers": earmarked_held,
         "investable_total_gbp": investable_total_gbp,
+        # Free cash that is ring-fenced for withdrawal (unwithdrawn earmarked sale proceeds / temporary top-up)
+        "ring_fenced_cash_gbp": round(excluded_topup_cash_gbp, 2),
         "outside_vested_gbp": round(outside_vested_gbp, 2),
         "cap_breaches": cap_breaches,
         "household_allocation": household_allocation,
+        # Glide path back to the household plan + tech crash circuit-breaker (proposals; orders only when 'active')
+        "rebalance_glide": glide,
         "limits": {
             "max_position_pct": pos_cap,
             "max_leveraged_etf_pct": lev_cap,
@@ -5222,6 +5924,10 @@ def generate_tldr_summary(results_by_account: Dict[str, Dict[str, Any]]) -> Dict
             if is_trim:
                 if s.get("order_reason") in ("leverage_cap", "position_cap"):
                     inst_text = f"Sell {shares_txt} shares (cap rebalance)"
+                elif s.get("order_reason") == "circuit_breaker":
+                    inst_text = f"Sell {shares_txt} shares (tech circuit-breaker: back to plan, keep as cash)"
+                elif s.get("order_reason") == "glide_rebalance":
+                    inst_text = f"Sell {shares_txt} shares (glide path back to your target mix)"
                 elif s.get("is_profit", True):
                     inst_text = f"Sell {shares_txt} shares (take profits)"
                 else:
@@ -5282,7 +5988,8 @@ def generate_tldr_summary(results_by_account: Dict[str, Dict[str, Any]]) -> Dict
 
         all_trims = bool(sells_to_place and all(s.get("is_trim", False) for s in sells_to_place))
         trims_are_profit_taking = all_trims and all(
-            (s.get("order_reason") not in ("leverage_cap", "position_cap")) and s.get("is_profit", True)
+            (s.get("order_reason") not in ("leverage_cap", "position_cap", "glide_rebalance", "circuit_breaker"))
+            and s.get("is_profit", True)
             for s in actionable_sells
         )
         open_breaches = [b for b in (plan.get("cap_breaches") or []) if isinstance(b, dict) and not b.get("actioned")]
@@ -5343,12 +6050,35 @@ def generate_tldr_summary(results_by_account: Dict[str, Dict[str, Any]]) -> Dict
             if hh_alloc.get("buys_allowed") is False and _num(hh_alloc.get("deployable_gbp"), 0.0) > 0:
                 phase_desc = f"{phase_desc} {hh_alloc.get('cadence_note')}"
 
+        ring_fenced_cash = max(0.0, _num(plan.get("ring_fenced_cash_gbp"), 0.0))
         if reserve_shortfall > 0.005:
-            reserve_note = f"⚠️ Cash reserve unfunded: £{avail_cash:,.0f} free cash vs £{reserve_floor:,.0f} floor (shortfall £{reserve_shortfall:,.0f})."
+            if ring_fenced_cash > 0.5:
+                reserve_note = (
+                    f"🔒 £{ring_fenced_cash:,.0f} of your £{avail_cash:,.0f} free cash is ring-fenced sale money awaiting "
+                    f"withdrawal (safe to withdraw now). The rest of the £{reserve_floor:,.0f} floor is unfunded "
+                    f"(£{reserve_shortfall:,.0f} short), so buys stay blocked."
+                )
+            else:
+                reserve_note = f"⚠️ Cash reserve unfunded: £{avail_cash:,.0f} free cash vs £{reserve_floor:,.0f} floor (shortfall £{reserve_shortfall:,.0f})."
             if phase == "ALL_SET":
                 phase_desc = f"{phase_desc} {reserve_note}"
         else:
             reserve_note = f"🛡️ Cash reserve funded: £{reserve_floor:,.0f} floor covered by £{avail_cash:,.0f} free cash."
+
+        # Glide path / tech crash circuit-breaker: proposals are surfaced (orders only when the policy is 'active')
+        glide = plan.get("rebalance_glide") if isinstance(plan.get("rebalance_glide"), dict) else {}
+        glide_note = ""
+        proposals = glide.get("proposals") or []
+        if proposals and not glide.get("active"):
+            total_prop = sum(_num(p.get("estimated_gbp"), 0.0) for p in proposals)
+            names = ", ".join(f"{p.get('search_symbol') or p.get('ticker')} £{_num(p.get('estimated_gbp'), 0.0):,.0f}" for p in proposals[:4])
+            label = "Circuit-breaker" if glide.get("trigger") == "circuit_breaker" else "Glide path"
+            glide_note = (
+                f"📉 {label} proposal (not active): trim £{total_prop:,.0f} of satellites back towards your plan "
+                f"({names}). Household satellites {glide.get('satellite_now_pct', 0):.0f}% vs {glide.get('target_pct', 0):.0f}% target."
+            )
+            if phase == "ALL_SET":
+                phase_desc = f"{phase_desc} {glide_note}"
 
         tldr[acc_name] = {
             "account_name": acc_name,
@@ -5363,6 +6093,8 @@ def generate_tldr_summary(results_by_account: Dict[str, Dict[str, Any]]) -> Dict
             "reserve_funded": reserve_funded,
             "reserve_shortfall": reserve_shortfall,
             "reserve_note": reserve_note,
+            "glide_note": glide_note,
+            "regime_text": glide.get("regime_text", ""),
             "data_degraded_reason": degraded_reason,
             "cap_breaches": open_breaches,
             "sells_to_place": sells_to_place,

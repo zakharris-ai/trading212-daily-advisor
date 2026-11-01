@@ -365,12 +365,29 @@ class Trading212Client:
                     limit_price = float(o.get("limitPrice", 0.0) or 0.0)
                     stop_price = float(o.get("stopPrice", 0.0) or 0.0)
                     order_val = float(o.get("value", 0.0) or 0.0)
+                    strategy = str(o.get("strategy") or "QUANTITY").upper()
 
-                    # Determine buy vs sell
-                    is_buy = (side == "BUY") or (raw_qty > 0)
+                    # Determine buy vs sell: an explicit side wins; otherwise the sign of quantity (or of value for VALUE orders)
+                    if side in ("BUY", "SELL"):
+                        is_buy = side == "BUY"
+                    elif raw_qty != 0:
+                        is_buy = raw_qty > 0
+                    else:
+                        is_buy = order_val > 0
                     qty = abs(raw_qty)
+                    # Partially filled orders: only the unfilled remainder is still pending
+                    filled_qty = abs(float(o.get("filledQuantity", 0.0) or 0.0))
+                    filled_val = abs(float(o.get("filledValue", 0.0) or 0.0))
+                    if qty > 0 and filled_qty > 0:
+                        qty = max(0.0, qty - filled_qty)
 
-                    est_val = order_val if order_val > 0 else (qty * limit_price)
+                    # VALUE orders ("sell/buy £500 of X") carry quantity 0 and a signed value in the order currency
+                    # (negative for sells). Size them by abs(value), never by the whole position.
+                    value_abs = abs(order_val)
+                    if value_abs > 0 and filled_val > 0:
+                        value_abs = max(0.0, value_abs - filled_val)
+                    order_currency = str(o.get("currency") or "").upper() or None
+                    est_val = value_abs if value_abs > 0 else (qty * limit_price)
 
                     order_item = {
                         "id": o.get("id"),
@@ -382,18 +399,32 @@ class Trading212Client:
                         "limit_price": limit_price,
                         "stop_price": stop_price,
                         "value": order_val,
-                        "strategy": o.get("strategy", "QUANTITY"),
+                        "value_abs": value_abs,
+                        "order_currency": order_currency,
+                        "strategy": strategy,
                         "order_type": o.get("type", "MARKET"),
                         "status": status,
                         "date_created": o.get("createdAt", o.get("dateCreated", "")),
                         "estimated_value": est_val,
+                        "order_count": 1,
                     }
 
+                    book = result["pending_buys"] if is_buy else result["pending_sells"]
+                    existing = book.get(yf_ticker)
+                    if isinstance(existing, dict):
+                        # Several open orders on the same instrument and side: keep one combined entry (sizes add up)
+                        existing["quantity"] = float(existing.get("quantity", 0.0) or 0.0) + qty
+                        existing["value_abs"] = float(existing.get("value_abs", 0.0) or 0.0) + value_abs
+                        existing["value"] = float(existing.get("value", 0.0) or 0.0) + order_val
+                        existing["estimated_value"] = float(existing.get("estimated_value", 0.0) or 0.0) + est_val
+                        existing["order_count"] = int(existing.get("order_count", 1) or 1) + 1
+                        if existing.get("strategy") != strategy:
+                            existing["strategy"] = "MIXED"
+                    else:
+                        book[yf_ticker] = order_item
                     if is_buy:
-                        result["pending_buys"][yf_ticker] = order_item
                         result["total_pending_buy_value"] += est_val
                     else:
-                        result["pending_sells"][yf_ticker] = order_item
                         result["total_pending_sell_value"] += est_val
 
                 logger.info(

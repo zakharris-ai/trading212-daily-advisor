@@ -198,7 +198,13 @@ Fixed limits in `config.py` (`REBALANCE_CONFIG`):
 - **Satellites**: single stocks, Nasdaq-100, sector and thematic funds.
 - **Defensive**: cash, money-market funds, gold and short gilts.
 
-The default target is **75 / 20 / 5** (Gold-only new defensive buys by default via `DEFENSIVE_GOLD_SHARE=1.0`). New money goes to whichever bucket is furthest below target; buckets more than ±5pp below target go first. Nothing profitable is ever sold to rebalance.
+The default target is **75 / 20 / 5** (Gold-only new defensive buys by default via `DEFENSIVE_GOLD_SHARE=1.0`). New money goes to whichever bucket is furthest below target; buckets more than ±5pp below target go first. Satellites above target + band are trimmed back according to `REBALANCE_POLICY` (below).
+
+**Crash protection (`REBALANCE_POLICY`, default `advisory`).**
+- **Historical crash replays:** every digest replays the 2000–02 tech crash, the 2007–09 financial crisis and the 2022 rate shock on today's household (sector-level GBP returns from survivorship-free data) and compares the loss with the target mix.
+- **Tech crash circuit-breaker:** when the Nasdaq-100 (`CNX1.L`, falling back to `CNDX.L` / `QQQ`) closes a month below its 10-month average, no new tech/semiconductor satellites are bought, and trimming all satellites above target to cash is recommended.
+- **Glide path:** while the trend is up, a quarter of the remaining satellite excess is proposed for trimming on each monthly buy day (ISA accounts only; never earmarked, core or defensive funds; riskiest first).
+- `advisory` shows these trims as proposals only; `active` turns them into sell orders and, while the breaker is on, keeps new core/satellite money in cash until the trend recovers; `off` restores the legacy behaviour.
 
 How new money is invested:
 - **Core money** buys `VWRP.L`.
@@ -226,6 +232,10 @@ Optional env overrides (all parsed safely):
 | `CORE_BUY_TICKER` | `VWRP.L` |
 | `GOLD_BUY_TICKER` | `SGLN.L` |
 | `SHORT_GILT_BUY_TICKER` | `IGLS.L` |
+| `REBALANCE_POLICY` | `advisory` (or `active` / `off`) |
+| `GLIDE_FRACTION` | `0.25` |
+| `GLIDE_COUNT_OUTSIDE` | `false` |
+| `REGIME_SMA_MONTHS` | `10` |
 
 Targets that don't sum to 1 are normalised. The research model's forward-CAGR estimate is shown for information only and never affects scores or sizes.
 
@@ -277,6 +287,11 @@ Results for Apr 2008 – Sep 2026:
 - Momentum sector selection added nothing over the control (t-stat −0.2).
 - A 15% defensive sleeve cut the worst fall from −33% to −23% for about 0.3 pp a year.
 - The weekly trend rule cost about 2.8 pp a year at index level, which is why core and defensive buys ignore trend signals.
+
+**Crash study (`scripts/crash_study.py`).** Survivorship-free data (Kenneth French Data Library portfolios that include delisted firms, Bank of England USD/GBP and Bank Rate, London gold spliced with GLD, PHLX Semiconductor index), GBP, after costs, monthly, no look-ahead:
+- It reproduces `CRASH_SCENARIOS`, the sector returns behind the digest's crash replays.
+- Over 1976–2026 a ~70% tech-concentrated satellite sleeve earned about the market's return (13.3% vs 12.8% a year) with a −73% worst fall; diversified quality+momentum satellites beat the market with shallower falls in every window.
+- A 10-month trend exit to cash cut the 2000–02 loss on a 70% tech sleeve from about −71% to −24%, which is the basis for the glide path and the tech crash circuit-breaker.
 
 Past results on one historical path are not a forecast.
 
