@@ -100,7 +100,7 @@ GitHub's own `schedule:` trigger is best-effort and can start runs hours late. F
 **Other behaviour:**
 - **Starting a late digest:** after 09:00 the watcher starts the digest with `workflow_dispatch` if GitHub's timer hasn't sent it yet (the once-a-day dedupe still applies).
 - **Unplaced glide-path sells carry forward:** on the monthly buy day the digest saves that month's glide-path trims to `data/glide_plan.json`, and later digests in the month repeat any part not yet placed.
-- **On time:** GitHub's own schedule is often hours late. Add a second cron-job.org job (same token as below) that POSTs `{"ref":"main"}` to `https://api.github.com/repos/<owner>/<repo>/actions/workflows/intraday_watch.yml/dispatches`. Schedule it at minutes `0` and `30`, hours `8–20`, Monday–Friday, time zone `Europe/London`.
+- **On time:** GitHub's own schedule is often hours late. Add a second cron-job.org job (same token as below) that POSTs `{"ref":"main"}` to `https://api.github.com/repos/<owner>/<repo>/actions/workflows/intraday_watch.yml/dispatches`. Schedule it at minutes `0` and `30`, hours `8–20`, Monday–Friday, time zone `Europe/London` — or put `GITHUB_DISPATCH_TOKEN` and `CRONJOB_API_KEY` in `.env` and run `python scripts/setup_cronjobs.py` to create/update both jobs via the cron-job.org REST API.
 - **Cost and testing:** each run takes about a minute of Actions time. Locally, `python watch.py --dry-run` prints what it would send. Logs show only trigger keys, never amounts.
 
 ## ⏰ Reliable 09:00 Delivery (External Scheduler)
