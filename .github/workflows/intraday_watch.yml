@@ -1,0 +1,112 @@
+name: Intraday Watch (alerts only when action is needed)
+
+# Emails ONLY when the plan says to act (or a heads-up threshold is crossed), at most once per trigger per day.
+# It never sends the daily digest and never trades. Best run by an external scheduler (cron-job.org dispatching
+# this workflow every 30 minutes, 08:00-21:00 Europe/London, Mon-Fri; see README "Intraday alerts"), because
+# GitHub's own schedule has been running hours late. The cron below is a best-effort fallback; watch.py exits
+# immediately outside weekdays 08:00-21:00 UK time.
+on:
+  schedule:
+    - cron: '7,37 7-20 * * 1-5'   # every 30 min, 07:07-20:37 UTC (covers 08:00-21:00 UK in both GMT and BST)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Ignore the market-hours window and today's dedupe (sends any current alerts again)"
+        type: boolean
+        required: false
+        default: false
+
+# Own group: a newer tick replaces an older queued one, and the daily digest's group is never touched.
+concurrency:
+  group: intraday-watch
+  cancel-in-progress: true
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: write   # commit data/alert_state.json when an alert was sent
+      actions: write    # dispatch today's digest after 09:00 if GitHub's timer hasn't sent it yet
+
+    steps:
+      - name: Quick window check (skip the rest outside weekdays 08:00-21:00 UK)
+        id: window
+        env:
+          FORCE_INPUT: ${{ github.event.inputs.force }}
+        run: |
+          HM=$(TZ=Europe/London date +%H%M)
+          DOW=$(TZ=Europe/London date +%u)
+          if [ "$FORCE_INPUT" = "true" ] || { [ "$DOW" -le 5 ] && [ "$HM" -ge 0800 ] && [ "$HM" -lt 2100 ]; }; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Outside the watch window (London $HM, day $DOW). Skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out repository
+        if: steps.window.outputs.proceed == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        if: steps.window.outputs.proceed == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        if: steps.window.outputs.proceed == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Watch (email only if something needs attention)
+        if: steps.window.outputs.proceed == 'true'
+        env:
+          ACCOUNT_NAME: ${{ secrets.ACCOUNT_NAME }}
+          T212_KEY_ID: ${{ secrets.T212_KEY_ID }}
+          T212_SECRET: ${{ secrets.T212_SECRET }}
+          T212_ENV: ${{ secrets.T212_ENV }}
+          SECOND_ACCOUNT_NAME: ${{ secrets.SECOND_ACCOUNT_NAME }}
+          T212_KEY_ID_2: ${{ secrets.T212_KEY_ID_2 }}
+          T212_SECRET_2: ${{ secrets.T212_SECRET_2 }}
+          EARMARKED_TICKERS: ${{ secrets.EARMARKED_TICKERS }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_EMAILS: ${{ secrets.ALERT_EMAILS }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_INPUT: ${{ github.event.inputs.force }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          if [ "$FORCE_INPUT" = "true" ]; then
+            python watch.py --force
+          else
+            python watch.py
+          fi
+
+      - name: Commit alert state (only when an alert was sent)
+        if: steps.window.outputs.proceed == 'true'
+        run: |
+          if [ -z "$(git status --porcelain -- data/alert_state.json)" ]; then
+            echo "No new alerts; nothing to commit."
+            exit 0
+          fi
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/alert_state.json
+          git commit -m "chore: intraday alert state [skip ci]"
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push origin main; then
+              echo "Pushed alert state on attempt $attempt."
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            sleep $((attempt * 5))
+          done
+          echo "Could not push the alert state; the next run may repeat today's alert once."
+          exit 0

@@ -85,6 +85,24 @@ GitHub's own `schedule:` trigger is best-effort and can start runs hours late. F
 
 ---
 
+## 🚨 Intraday alerts (told as soon as you should act)
+
+`.github/workflows/intraday_watch.yml` runs `watch.py` every 30 minutes on weekdays, 08:00–21:00 UK time. It is read-only and advisory: it never places orders and never sends the daily digest itself. It emails **only when something needs your attention**, at most once per trigger per day (`data/alert_state.json`).
+
+**🚨 Action alerts:**
+- **Unplaced sells.** A sell from the latest digest hasn't been placed and its market is open. The digest often lands after the London close, so London-listed sells get reminded at the next open.
+- **Circuit-breaker tripped.** The tech circuit-breaker tripped at a month-end close.
+
+**⚠️ Heads-up alerts:**
+- **Close to the breaker.** The Nasdaq-100 is trading below the level that would trip the breaker at month-end, plus a "today's close decides" message on the month's last trading day.
+- **Big falls.** A holding is down **10%+** on the day (funds **6%+**), or open positions have lost **3%+** of the household since the last digest. Each comes with what the plan says, usually no action.
+
+**Other behaviour:**
+- **Starting a late digest:** after 09:00 the watcher starts the digest with `workflow_dispatch` if GitHub's timer hasn't sent it yet (the once-a-day dedupe still applies).
+- **Unplaced glide-path sells carry forward:** on the monthly buy day the digest saves that month's glide-path trims to `data/glide_plan.json`, and later digests in the month repeat any part not yet placed.
+- **On time:** GitHub's own schedule is often hours late. Add a second cron-job.org job (same token as below) that POSTs `{"ref":"main"}` to `https://api.github.com/repos/<owner>/<repo>/actions/workflows/intraday_watch.yml/dispatches`. Schedule it at minutes `0` and `30`, hours `8–20`, Monday–Friday, time zone `Europe/London`.
+- **Cost and testing:** each run takes about a minute of Actions time. Locally, `python watch.py --dry-run` prints what it would send. Logs show only trigger keys, never amounts.
+
 ## ⏰ Reliable 09:00 Delivery (External Scheduler)
 
 The workflow's cron ticks stay in place as a fallback, but GitHub's `schedule:` trigger is best-effort: in practice scheduled runs are often several hours late, and on some days they don't happen at all. An external scheduler such as [cron-job.org](https://cron-job.org) (free) can start the workflow through GitHub's `workflow_dispatch` API at **09:00 Europe/London** every day. Whichever trigger runs first sends the email; every later run reads the sent-marker (`data/last_email_sent.json` on `origin/main`) and skips, so you still get **exactly one email per day**.

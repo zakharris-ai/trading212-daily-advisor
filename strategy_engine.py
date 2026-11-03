@@ -4046,6 +4046,77 @@ def _infer_account_name(analyses: List[Dict[str, Any]]) -> Optional[str]:
     return names.pop() if len(names) == 1 else None
 
 
+def _glide_carryover_orders(
+    global_context: Optional[Dict[str, Any]],
+    account_name: Optional[str],
+    as_of: date,
+    analyses: List[Dict[str, Any]],
+    min_order: float,
+    existing_sell_orders: Optional[List[Dict[str, Any]]],
+    pending_sells: Optional[Dict[str, Any]],
+    sat_now: float = 0.0,
+    basis: float = 0.0,
+    target_sat: float = 0.0,
+    excess: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """This month's buy-day glide trims that have not been placed yet (global_context['glide_plan'], written by
+    main.py on the buy day as data/glide_plan.json), re-sized to the shares still to sell at today's price.
+
+    A trim counts as placed to the extent the holding fell below its buy-day share count, so a partly placed trim
+    carries only the remainder. Nothing carries into a new month (the next buy day sizes a fresh step).
+    """
+    plan = (global_context or {}).get("glide_plan") if isinstance(global_context, dict) else None
+    if not isinstance(plan, dict) or not account_name:
+        return []
+    if str(plan.get("month") or "") != as_of.strftime("%Y-%m") or str(plan.get("buy_day") or "") >= as_of.isoformat():
+        return []
+    rows = (plan.get("accounts") or {}).get(account_name) if isinstance(plan.get("accounts"), dict) else None
+    sold = {_sym(s.get("ticker", "")) for s in (existing_sell_orders or []) if isinstance(s, dict)}
+    out: List[Dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        t = str(row.get("ticker") or "")
+        if not t or _sym(t) in sold or any(tickers_match(k, t) for k in (pending_sells or {})):
+            continue
+        pos = next((p for p in analyses or [] if isinstance(p, dict) and not p.get("is_earmarked")
+                    and tickers_match(str(p.get("ticker", "")), t) and _num(p.get("quantity"), 0.0) > 0), None)
+        if pos is None:
+            continue
+        qty_now = _num(pos.get("quantity"), 0.0)
+        placed = max(0.0, _num(row.get("qty_before"), qty_now) - qty_now)
+        remaining = min(qty_now, max(0.0, _num(row.get("shares"), 0.0) - placed))
+        remaining = math.floor(remaining * 10000.0) / 10000.0
+        px = max(0.0, _num(pos.get("price_gbp"), 0.0))
+        amount = remaining * px
+        if remaining <= 0 or px <= 0 or amount < min_order * 0.98:
+            continue
+        name = pos.get("name", t)
+        sym = pos.get("search_symbol", clean_search_symbol(t))
+        why = (
+            f"Carried over from the {plan.get('buy_day')} buy-day plan: this month's glide-path trim hasn't been placed "
+            f"yet (the buy-day email can land after the London close). Household satellites are "
+            f"{(sat_now / basis * 100.0) if basis > 0 else 0.0:.0f}% vs your {target_sat * 100.0:.0f}% plan"
+            + (f" (£{excess:,.0f} above target). " if excess >= 0.5 else ". ")
+            + "ISA: no capital gains tax; proceeds stay as cash for the next buy day."
+        )
+        order = {
+            "ticker": pos.get("ticker", t), "search_symbol": sym, "name": name,
+            "action": "TRIM (GLIDE PATH — BACK TO PLAN)", "is_pending": False,
+            "shares": round(remaining, 4), "price": pos.get("price", 0.0), "currency": pos.get("currency", "USD"),
+            "estimated_gbp": round(amount, 2), "plain_english_why": why,
+            "app_instruction": f"Open Trading 212 ➔ Search '{sym}' ➔ Tap Sell ➔ Sell {_fmt_shares(remaining)} shares (or ~£{amount:,.0f})",
+            "badge_color": "#f59e0b", "order_reason": "glide_rebalance", "bucket": BUCKET_SATELLITE,
+            "sleeve": crash_sleeve(t, pos.get("macro_cluster") or (pos.get("research") or {}).get("macro_cluster")),
+            "rank_factors": ["carried over: not placed since the buy day"], "carried_over": True,
+            "is_profit": _num(pos.get("unrealized_pnl"), 0.0) > 0,
+        }
+        if account_name:
+            order["account"] = account_name
+        out.append(order)
+    return out
+
+
 def build_glide_path_trims(
     analyses: List[Dict[str, Any]],
     account_name: Optional[str],
@@ -4138,6 +4209,24 @@ def build_glide_path_trims(
         tranche = min(excess, max(min_order, cfg["glide_fraction"] * excess))
         result["trigger"] = "glide_path"
     else:
+        carried = _glide_carryover_orders(
+            global_context, account_name, as_of, analyses, min_order, existing_sell_orders, pending_sells,
+            sat_now=sat_now, basis=basis, target_sat=target_sat, excess=excess,
+        )
+        if carried:
+            active = policy == "active" and wrapper == "ISA" and not data_degraded
+            result.update({"trigger": "glide_path", "carried_over": True, "active": active, "proposals": carried,
+                           "tranche_household_gbp": round(sum(o["estimated_gbp"] for o in carried), 2),
+                           "account_share_gbp": round(sum(o["estimated_gbp"] for o in carried), 2)})
+            if active:
+                result["orders"] = [dict(o) for o in carried]
+            else:
+                why_not = (
+                    "not an ISA (capital gains tax would apply)" if wrapper != "ISA"
+                    else ("data degraded today" if data_degraded else "REBALANCE_POLICY is 'advisory'")
+                )
+                result["notes"].append(f"Proposed only ({why_not}): no order is placed until you switch the policy to 'active'.")
+            return result
         tranche = 0.0
         result["notes"].append(
             f"Satellites are {sat_now / basis * 100.0:.0f}% vs the {target_sat * 100.0:.0f}% target (±{band_pp:g}pp band); "

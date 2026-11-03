@@ -324,7 +324,11 @@ def circuit_breaker_event(as_of: date, tech_regime: Optional[Dict[str, Any]]) ->
     level_txt = ""
     if trip and latest and dist is not None:
         fmt = (lambda v: f"{v:,.0f}") if max(trip, latest) >= 1000 else (lambda v: f"{v:,.2f}")
-        level_txt = f" (about {fmt(trip)} on {proxy}, {dist:+.1f}% from the latest close of {fmt(latest)})"
+        if state == "RISK_ON" and dist > 0:
+            level_txt = (f" (about {fmt(trip)} on {proxy}; it is already {dist:.1f}% below that, at "
+                         f"{fmt(latest)})")
+        else:
+            level_txt = f" (about {fmt(trip)} on {proxy}, {dist:+.1f}% from the latest close of {fmt(latest)})"
     if state == "RISK_ON":
         what = (f"Nothing now. If the Nasdaq-100 closes {day_label(check, as_of)} below its 10-month average"
                 f"{level_txt}, the {day_label(next_email, as_of)} email will tell you to {cut or 'act'}.")
@@ -334,7 +338,10 @@ def circuit_breaker_event(as_of: date, tech_regime: Optional[Dict[str, Any]]) ->
                 f"average{level_txt}, it switches off and the cash is reinvested by the normal buy rules.")
         impact = "high"
     why = "The only scheduled moment the plan can switch to crash-protection mode; intra-month swings don't count."
-    if state == "RISK_ON" and dist is not None and dist > -3.0:
+    if state == "RISK_ON" and dist is not None and dist > 0:
+        why += (f" It is below the line today: if it stays there until the {day_label(check, as_of)} close, that "
+                f"email will contain large sell instructions.")
+    elif state == "RISK_ON" and dist is not None and dist > -3.0:
         why += (f" It is close: a fall of about {abs(dist):.1f}% by {day_label(check, as_of)} would trip it, and that "
                 f"email would then contain large sell instructions.")
     return {

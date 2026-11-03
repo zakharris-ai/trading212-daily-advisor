@@ -2207,6 +2207,48 @@ class TestCrashProtectionUpgrade(EngineTestCase):
         same = self._glide_custom(se.REGIME_RISK_OFF, self.off_day, hh, book=book, risk_off_satellite_pct=0.80)
         self.assertEqual(same["proposals"], [])
 
+    # ---- glide-path carry-over (a buy-day trim that wasn't placed is carried forward within the month) -----------
+    def _carry(self, as_of, plan, regime=None, policy="advisory", book=None):
+        cfg = dict(self.allocation_cfg, rebalance_policy=policy)
+        with mock.patch.object(config, "ALLOCATION_CONFIG", cfg, create=True), \
+             mock.patch.object(config, "ACCOUNT_WRAPPERS", {"Main": "ISA"}, create=True):
+            return se.build_glide_path_trims(
+                analyses=book if book is not None else self._glide_book(), account_name="Main",
+                household=self._household(), hh_outside_rows=[],
+                global_context={"tech_regime": {"regime": regime or se.REGIME_RISK_ON, "sma_months": 10},
+                                "glide_plan": plan},
+                existing_sell_orders=[], pending_sells={}, as_of=as_of,
+            )
+
+    def _plan(self, shares=30.0, qty_before=200.0, month="2026-11", buy_day="2026-11-02"):
+        return {"month": month, "buy_day": buy_day,
+                "accounts": {"Main": [{"ticker": "SMGB.L", "shares": shares, "qty_before": qty_before}]}}
+
+    def test_unplaced_glide_trim_is_carried_forward_and_partial_fills_count(self):
+        g = self._carry(self.off_day, self._plan())                     # SMGB still 200 shares (nothing placed)
+        self.assertTrue(g.get("carried_over"))
+        self.assertEqual([(p["ticker"], p["shares"]) for p in g["proposals"]], [("SMGB.L", 30.0)])
+        self.assertAlmostEqual(g["proposals"][0]["estimated_gbp"], 3000.0)
+        self.assertIn("Carried over from the 2026-11-02 buy-day plan", g["proposals"][0]["plain_english_why"])
+        self.assertEqual(g["orders"], [])                                # advisory: proposal only
+        active = self._carry(self.off_day, self._plan(), policy="active")
+        self.assertEqual(len(active["orders"]), 1)
+        partial = self._carry(self.off_day, self._plan(qty_before=210.0))  # 10 of 30 already sold
+        self.assertEqual(partial["proposals"][0]["shares"], 20.0)
+        done = self._carry(self.off_day, self._plan(qty_before=230.0))     # all 30 sold
+        self.assertEqual(done["proposals"], [])
+        self.assertFalse(done.get("carried_over"))
+
+    def test_carry_forward_stops_at_month_end_on_buy_day_and_under_the_breaker(self):
+        from datetime import date
+        self.assertEqual(self._carry(date(2026, 12, 3), self._plan())["proposals"], [])           # new month
+        buy = self._carry(self.buy_day, self._plan())                                             # buy day sizes afresh
+        self.assertFalse(buy.get("carried_over"))
+        self.assertAlmostEqual(buy["tranche_household_gbp"], 12500.0)
+        cb = self._carry(self.off_day, self._plan(), regime=se.REGIME_RISK_OFF)                   # breaker supersedes
+        self.assertEqual(cb["trigger"], "circuit_breaker")
+        self.assertFalse(cb.get("carried_over"))
+
     def test_regime_line_mentions_the_risk_off_level(self):
         cfg = dict(self.allocation_cfg, targets=dict(self.TARGETS_55), risk_off_satellite_pct=0.20)
         with mock.patch.object(config, "ALLOCATION_CONFIG", cfg, create=True):

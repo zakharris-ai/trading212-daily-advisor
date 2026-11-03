@@ -36,6 +36,7 @@ from dashboard_generator import (
 )
 from research_agent import DeepResearchAgent
 from event_calendar import build_event_radar, radar_text_lines
+from action_state import load_glide_plan, save_glide_plan, save_latest_actions
 from strategy_engine import (
     analyze_position,
     build_rebalancing_plan,
@@ -635,6 +636,12 @@ def run_pipeline(
     tech_regime = {"regime": "UNKNOWN"}
   consolidated_view["tech_regime"] = tech_regime
   logger.info("Tech crash circuit-breaker: %s", describe_tech_regime(tech_regime))
+  # 1c. This month's buy-day glide plan, so a trim that wasn't placed yet is carried forward (read-only here)
+  if not use_mock:
+    try:
+      consolidated_view["glide_plan"] = load_glide_plan()
+    except Exception as e:
+      logger.warning("Glide-path plan unavailable for carry-forward: %s", e)
 
   # 2. Deep Research Watchlist Scan for High-Alpha Opportunities
   logger.info("Scanning watchlist for high-conviction alpha...")
@@ -755,6 +762,14 @@ def run_pipeline(
         external_flows=external_flows,
     )
     logger.info("Persisted daily snapshot to %s", snapshot_file)
+    # 6b. Today's actionable orders (the intraday watcher reminds you of any not yet placed) and, on the monthly buy
+    #     day, the glide-path trims (carried forward on later days of the month until placed)
+    try:
+      save_latest_actions(results_by_account, run_date)
+      if save_glide_plan(results_by_account, run_date):
+        logger.info("Saved this month's glide-path plan (carried forward until placed).")
+    except Exception as e:
+      logger.warning("Could not persist today's actions for the intraday watcher: %s", e)
 
   # 7. Generate and persist interactive Web Dashboard
   history_data = load_portfolio_history()
